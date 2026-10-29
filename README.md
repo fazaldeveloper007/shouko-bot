@@ -5,7 +5,7 @@ She chats when you @her, reply to her, or say her name, remembers the last few
 messages in each channel, and throws GIFs for greetings, hype moments and gacha pain.
 
 Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
-[Groq](https://console.groq.com) API (free tier).
+[Groq](https://console.groq.com) API (free tier, called directly over HTTPS - no SDK needed).
 
 ## What she does
 
@@ -32,10 +32,17 @@ Runs great on a spare Android phone plugged into the charger. Free forever, no c
 2. In Termux:
 
 ```bash
-pkg update && pkg install python git -y
+pkg update && pkg install python git clang -y
 git clone https://github.com/fazaldeveloper007/shouko-bot.git
 cd shouko-bot
+
+# Termux has no prebuilt wheels, so pip would try to compile a few
+# packages. These flags keep them 100% pure Python - no compiling needed:
+export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1
+export FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
+
 pip install -r requirements.txt
+
 export DISCORD_TOKEN="your-bot-token"
 export GROQ_API_KEY="your-groq-key"
 python bot.py
@@ -43,6 +50,26 @@ python bot.py
 
    You should see `Shouko is online` in a few seconds. Keep the Termux
    window open (you can switch apps, just don't swipe Termux away).
+
+   Notes:
+   - **clang** is only used to build `audioop-lts`, a tiny audio helper that
+     discord.py requires on Python 3.13+. Everything else stays pure Python
+     thanks to the `NO_EXTENSIONS` flags above.
+   - The bot calls Groq's API directly over HTTPS instead of using the `groq`
+     package on purpose: the SDK pulls in `pydantic-core`, which needs a Rust
+     toolchain that does not build on Termux.
+   - **Already cloned and `pip install` died with `pydantic-core` / `Rust not
+     found` errors?** Fix it with:
+
+```bash
+pkg update && pkg install clang -y
+cd ~/shouko-bot
+git pull
+export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1
+export FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
+pip install -r requirements.txt
+python bot.py
+```
 
 3. **Keep her alive 24/7:**
    - Run `termux-wake-lock` so Android doesn't freeze the process when the
