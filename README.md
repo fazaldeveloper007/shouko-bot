@@ -5,12 +5,13 @@ She chats when you @her, reply to her, or say her name, remembers the last few
 messages in each channel, and throws GIFs for greetings, hype moments and gacha pain.
 
 Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
-[Groq](https://console.groq.com) API (free tier, called directly over HTTPS - no SDK needed).
+[Gemini](https://aistudio.google.com) API (free tier, called directly over HTTPS - no SDK needed).
+[Groq](https://console.groq.com) still works as an optional fallback brain.
 
 ## What she does
 
 - Replies when someone **@mentions her**, **replies to her message**, or says "**kristy**"
-- Remembers the last 10 messages per channel, so conversations feel continuous
+- Remembers the last 20 messages per channel, so conversations feel continuous
 - Sends a random GIF for: hi/hello, good morning, good night, hype/pog, sad, lol, and gacha/pulls/luck
 - Knows Genshin Impact (characters, banners, resin, artifacts, 50/50 pain) and talks like a player
 
@@ -21,7 +22,8 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
    - Same page, scroll down -> switch ON **Message Content Intent** (required!)
    - **OAuth2** -> scope `bot`, permissions `Send Messages` + `Read Message History`
      -> open the generated URL to invite her to your server
-2. **Groq**: make a free API key at https://console.groq.com -> API Keys
+2. **Gemini** (main brain): make a free API key at https://aistudio.google.com -> Get API key.
+   (Optional fallback: a Groq key from https://console.groq.com is only used if `GEMINI_API_KEY` is not set.)
 
 ## Run on Android with Termux (free, your spare phone)
 
@@ -38,7 +40,7 @@ cd shouko-bot
 export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
 pip install -r requirements.txt
 export DISCORD_TOKEN="your-bot-token"
-export GROQ_API_KEY="your-groq-key"
+export GEMINI_API_KEY="your-gemini-key"
 termux-wake-lock
 python bot.py
 ```
@@ -60,7 +62,7 @@ Notes:
 #!/data/data/com.termux/files/usr/bin/sh
 export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
 export DISCORD_TOKEN="your-bot-token"
-export GROQ_API_KEY="your-groq-key"
+export GEMINI_API_KEY="your-gemini-key"
 cd ~/shouko-bot && python bot.py >> ~/shouko.log 2>&1
 ```
 
@@ -85,14 +87,14 @@ python bot.py
 ## Deploy with Docker (any Docker host)
 
 The included `Dockerfile` works on any Docker host or container platform
-(Railway, Fly.io, a VPS, etc.): set `DISCORD_TOKEN` and `GROQ_API_KEY` as
+(Railway, Fly.io, a VPS, etc.): set `DISCORD_TOKEN` and `GEMINI_API_KEY` as
 environment variables and deploy.
 
 ## Make her yours
 
 - **Personality**: edit `persona.py` (it's plain English, no code)
 - **GIFs**: add/remove URLs in `gifs.py`, or add new keyword triggers in `bot.py` (`GIF_TRIGGERS`)
-- **Model**: set `GROQ_MODEL` (default `openai/gpt-oss-120b`; `openai/gpt-oss-20b` is faster and lighter)
+- **Model**: set `GEMINI_MODEL` (default `gemini-3.8-flash`). Only on the Groq fallback: `GROQ_MODEL` (default `openai/gpt-oss-120b`)
 - **Name**: set `BOT_NAME` and she responds to the new name instead
 
 ## Files
