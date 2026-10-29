@@ -5,10 +5,10 @@ She chats when you @her, reply to one of her messages, or say her name,
 and throws GIFs for greetings, hype moments and gacha pain.
 
 Config (environment variables):
-    DISCORD_TOKEN   bot token from the Discord developer portal (required)
-    GROQ_API_KEY    API key from console.groq.com (required)
-    GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
-    BOT_NAME        (optional) her name, default "Shouko"
+  DISCORD_TOKEN   bot token from the Discord developer portal (required)
+  GROQ_API_KEY    API key from console.groq.com (required)
+  GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
+  BOT_NAME        (optional) her name, default "Shouko"
 """
 
 import os
@@ -17,13 +17,13 @@ import random
 import logging
 from collections import defaultdict, deque
 
+import aiohttp
 import discord
-from groq import AsyncGroq
 
 from persona import SYSTEM_PROMPT
 from gifs import GIFS
 
-# Local dev convenience: load a .env file if one exists (not needed on Northflank)
+# Local dev convenience: load a .env file if one exists
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -38,6 +38,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Shouko")
 
+# Groq's OpenAI-compatible endpoint. We call it directly instead of using the
+# groq SDK: the SDK drags in pydantic v2 -> pydantic-core, which needs a Rust
+# toolchain that does not build on Termux/Android.
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 if not DISCORD_TOKEN or not GROQ_API_KEY:
     raise SystemExit("Missing DISCORD_TOKEN or GROQ_API_KEY. Set them as env vars (see .env.example).")
 
@@ -47,7 +52,15 @@ MAX_REPLY_CHARS = 1800  # Discord's limit is 2000; leave some margin
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
 client = discord.Client(intents=intents)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+
+# One shared HTTP session for Groq calls
+_groq_session = None
+
+async def groq_session():
+    global _groq_session
+    if _groq_session is None or _groq_session.closed:
+        _groq_session = aiohttp.ClientSession()
+    return _groq_session
 
 # Short memory per channel so conversations feel continuous
 history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
@@ -74,14 +87,12 @@ GIF_TRIGGERS = [
 ]
 GIF_RES = [(re.compile(pat, re.IGNORECASE), cat) for pat, cat in GIF_TRIGGERS]
 
-
 def detect_gif_category(text):
     """Return the GIF category matching a message, or None."""
     for rx, category in GIF_RES:
         if rx.search(text):
             return category
     return None
-
 
 def should_respond(message):
     """Reply when @mentioned, replied to, or name-dropped."""
@@ -94,7 +105,6 @@ def should_respond(message):
         return True
     return False
 
-
 async def think(channel_id):
     """Ask Groq for Shouko's next line using the channel's recent history."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -104,20 +114,26 @@ async def think(channel_id):
         else:
             # fold the speaker's name in so she knows who said what
             messages.append({"role": "user", "content": f"{author}: {content}"})
-    resp = await groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        max_tokens=500,
-        temperature=0.9,
-    )
-    return resp.choices[0].message.content.strip()
 
+    session = await groq_session()
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": 500,
+        "temperature": 0.9,
+    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with session.post(GROQ_CHAT_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise RuntimeError(f"Groq API {resp.status}: {data}")
+        return data["choices"][0]["message"]["content"].strip()
 
 @client.event
 async def on_ready():
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
-
 
 @client.event
 async def on_message(message):
@@ -147,6 +163,5 @@ async def on_message(message):
     await message.reply(reply, mention_author=False)
     if gif_url:
         await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
-
 
 client.run(DISCORD_TOKEN)
