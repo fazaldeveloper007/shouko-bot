@@ -1,6 +1,6 @@
-# Shouko
+# Kristy
 
-A playful, slightly sassy Genshin Impact chat bot for your Discord server.
+A sweet, affectionate Genshin Impact chat bot for your Discord server.
 She chats when you @her, reply to her, or say her name, remembers the last few
 messages in each channel, and throws GIFs for greetings, hype moments and gacha pain.
 
@@ -9,7 +9,7 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
 
 ## What she does
 
-- Replies when someone **@mentions her**, **replies to her message**, or says "**shouko**"
+- Replies when someone **@mentions her**, **replies to her message**, or says "**kristy**"
 - Remembers the last 10 messages per channel, so conversations feel continuous
 - Sends a random GIF for: hi/hello, good morning, good night, hype/pog, sad, lol, and gacha/pulls/luck
 - Knows Genshin Impact (characters, banners, resin, artifacts, 50/50 pain) and talks like a player
@@ -48,7 +48,7 @@ export GROQ_API_KEY="your-groq-key"
 python bot.py
 ```
 
-   You should see `Shouko is online` in a few seconds. Keep the Termux
+   You should see `Kristy is online` in a few seconds. Keep the Termux
    window open (you can switch apps, just don't swipe Termux away).
 
    Notes:
