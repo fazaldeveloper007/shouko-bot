@@ -1,5 +1,5 @@
 """
-Shouko's GIF library. Every URL below was verified to return a real GIF (HTTP 200).
+Kristy's GIF library. Every URL below was verified to return a real GIF (HTTP 200).
 Add or remove URLs freely - she picks one at random per category. Discord
 auto-embeds direct GIF links, so no extra API key is needed.
 
