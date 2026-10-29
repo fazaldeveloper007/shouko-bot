@@ -1,5 +1,5 @@
 """
-Shouko - a playful Genshin Impact Discord chat bot.
+Kristy - a Genshin Impact Discord chat bot.
 
 She chats when you @her, reply to one of her messages, or say her name,
 and throws GIFs for greetings, hype moments and gacha pain.
@@ -8,7 +8,7 @@ Config (environment variables):
   DISCORD_TOKEN   bot token from the Discord developer portal (required)
   GROQ_API_KEY    API key from console.groq.com (required)
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
-  BOT_NAME        (optional) her name, default "Shouko"
+  BOT_NAME        (optional) her name, default "Kristy"
 """
 
 import os
@@ -31,12 +31,12 @@ except ImportError:
     pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("shouko")
+log = logging.getLogger("kristy")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-BOT_NAME = os.getenv("BOT_NAME", "Shouko")
+BOT_NAME = os.getenv("BOT_NAME", "Kristy")
 
 # Groq's OpenAI-compatible endpoint. We call it directly instead of using the
 # groq SDK: the SDK drags in pydantic v2 -> pydantic-core, which needs a Rust
@@ -106,7 +106,7 @@ def should_respond(message):
     return False
 
 async def think(channel_id):
-    """Ask Groq for Shouko's next line using the channel's recent history."""
+    """Ask Groq for Kristy's next line using the channel's recent history."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
