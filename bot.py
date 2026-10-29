@@ -6,7 +6,10 @@ and throws GIFs for greetings, hype moments and gacha pain.
 
 Config (environment variables):
   DISCORD_TOKEN   bot token from the Discord developer portal (required)
-  GROQ_API_KEY    API key from console.groq.com (required)
+  GEMINI_API_KEY  API key from aistudio.google.com (main brain, free tier)
+  GEMINI_MODEL    (optional) Gemini model id, default gemini-3.8-flash
+  GROQ_API_KEY    (optional fallback) API key from console.groq.com, used
+                  only when GEMINI_API_KEY is not set
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
   BOT_NAME        (optional) her name, default "Kristy"
 """
@@ -34,6 +37,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("kristy")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
@@ -43,17 +48,21 @@ BOT_NAME = os.getenv("BOT_NAME", "Kristy")
 # toolchain that does not build on Termux/Android.
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-if not DISCORD_TOKEN or not GROQ_API_KEY:
-    raise SystemExit("Missing DISCORD_TOKEN or GROQ_API_KEY. Set them as env vars (see .env.example).")
+# Gemini generateContent REST endpoint, also called directly with aiohttp (no
+# google SDK, so the Termux install stays pure-Python).
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-HISTORY_LEN = 10        # messages she remembers per channel
+if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
+    raise SystemExit("Missing DISCORD_TOKEN or GEMINI_API_KEY (or GROQ_API_KEY). Set them as env vars (see .env.example).")
+
+HISTORY_LEN = 20        # messages she remembers per channel
 MAX_REPLY_CHARS = 1800  # Discord's limit is 2000; leave some margin
 
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
 client = discord.Client(intents=intents)
 
-# One shared HTTP session for Groq calls
+# One shared HTTP session for AI API calls
 _groq_session = None
 
 async def groq_session():
@@ -108,8 +117,8 @@ def should_respond(message):
         return True
     return False
 
-async def think(channel_id):
-    """Ask Groq for Kristy's next line using the channel's recent history."""
+async def think_groq(channel_id):
+    """Fallback brain: ask Groq for Kristy's next line from the channel history."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
@@ -135,6 +144,58 @@ async def think(channel_id):
         if not reply_text:
             log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
         return reply_text
+
+async def think_gemini(channel_id):
+    """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
+    contents = []
+    for author, content in history[channel_id]:
+        if author == BOT_NAME:
+            role, text = "model", content
+        else:
+            # fold the speaker's name in so she knows who said what
+            role, text = "user", f"{author}: {content}"
+        if contents and contents[-1]["role"] == role:
+            # Gemini prefers alternating turns: merge consecutive same-role messages
+            contents[-1]["parts"][0]["text"] += "\n" + text
+        else:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    while contents and contents[0]["role"] != "user":
+        contents.pop(0)  # a conversation must start with a user turn
+    if not contents:
+        return ""
+
+    session = await groq_session()
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 500, "temperature": 0.9},
+    }
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with session.post(GEMINI_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise RuntimeError(f"Gemini API {resp.status}: {data}")
+        try:
+            candidate = data["candidates"][0]
+            parts = (candidate.get("content") or {}).get("parts") or []
+            reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+        except (KeyError, IndexError, TypeError, AttributeError):
+            candidate = None
+            reply_text = ""
+        if not reply_text:
+            # blocked prompt (promptFeedback), safety finishReason, empty parts, etc.
+            log.warning(
+                "Gemini returned no text (HTTP %s, finishReason=%s): %s",
+                resp.status, (candidate or {}).get("finishReason"), data,
+            )
+        return reply_text
+
+async def think(channel_id):
+    """Gemini is the main brain; Groq is used only if no GEMINI_API_KEY is set."""
+    if GEMINI_API_KEY:
+        return await think_gemini(channel_id)
+    return await think_groq(channel_id)
 
 @client.event
 async def on_ready():
@@ -163,7 +224,7 @@ async def on_message(message):
             if not reply:
                 reply = EMPTY_REPLY_FALLBACK
         except Exception as e:
-            log.warning("Groq error: %s", e)
+            log.warning("AI brain error: %s", e)
             reply = random.choice(FALLBACK_LINES)
 
     reply = reply[:MAX_REPLY_CHARS]
