@@ -24,7 +24,7 @@ import aiohttp
 import discord
 
 from persona import SYSTEM_PROMPT
-from gifs import GIFS
+from gifs import GIFS, CHARACTER_GIFS
 
 # Local dev convenience: load a .env file if one exists
 try:
@@ -104,6 +104,33 @@ def detect_gif_category(text):
     for rx, category in GIF_RES:
         if rx.search(text):
             return category
+    return None
+
+# Someone asking for a specific character's gif ("send a neuvillette gif")
+GIF_WORD_RE = re.compile(r"\b(gif|gifs|jif)\b", re.IGNORECASE)
+
+# alias (lowercase) -> canonical character key, longest aliases first so
+# "the tsaritsa" wins over a shorter overlapping alias
+_CHAR_ALIAS_PAIRS = sorted(
+    (
+        (alias.lower(), name)
+        for name, info in CHARACTER_GIFS.items()
+        for alias in info["aliases"]
+    ),
+    key=lambda pair: -len(pair[0]),
+)
+_CHAR_ALIAS_RES = [
+    (re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE), name)
+    for alias, name in _CHAR_ALIAS_PAIRS
+]
+
+def detect_character_gif(text):
+    """Return the character key when the message asks for that character's gif, else None."""
+    if not GIF_WORD_RE.search(text):
+        return None
+    for rx, name in _CHAR_ALIAS_RES:
+        if rx.search(text):
+            return name
     return None
 
 def should_respond(message):
@@ -215,8 +242,12 @@ async def on_message(message):
     if not should_respond(message):
         return
 
-    category = detect_gif_category(content)
-    gif_url = random.choice(GIFS[category]) if category and GIFS.get(category) else None
+    character = detect_character_gif(content)
+    if character:
+        gif_url = random.choice(CHARACTER_GIFS[character]["gifs"])
+    else:
+        category = detect_gif_category(content)
+        gif_url = random.choice(GIFS[category]) if category and GIFS.get(category) else None
 
     async with message.channel.typing():
         try:
