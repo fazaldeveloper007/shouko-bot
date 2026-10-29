@@ -23,18 +23,47 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
      -> open the generated URL to invite her to your server
 2. **Groq**: make a free API key at https://console.groq.com -> API Keys
 
-## Deploy on Northflank (free, always on, no card)
+## Run on Android with Termux (free, your spare phone)
 
-1. Push this repo to GitHub.
-2. Sign up at https://northflank.com (email or GitHub login, no card needed).
-3. Create a **project**, then **Add Service** -> **Deployment** -> pick this Git repo.
-4. Select the smallest compute plan (nf-compute-20, 0.2 vCPU / 512 MB is plenty;
-   the free Sandbox covers up to $20/mo of resources and this uses about $5.50/mo).
-5. Add two **environment variables**:
-   - `DISCORD_TOKEN` = your bot token
-   - `GROQ_API_KEY` = your Groq key
-6. Deploy. Northflank builds from the included `Dockerfile`, runs her 24/7
-   (no sleeping on the Sandbox plan) and restarts her if she crashes.
+Runs great on a spare Android phone plugged into the charger. Free forever, no card.
+
+1. Install **Termux from F-Droid** (https://f-droid.org/en/packages/com.termux/).
+   Do NOT use the Play Store version - it is outdated and broken.
+2. In Termux:
+
+```bash
+pkg update && pkg install python git -y
+git clone https://github.com/fazaldeveloper007/shouko-bot.git
+cd shouko-bot
+pip install -r requirements.txt
+export DISCORD_TOKEN="your-bot-token"
+export GROQ_API_KEY="your-groq-key"
+python bot.py
+```
+
+   You should see `Shouko is online` in a few seconds. Keep the Termux
+   window open (you can switch apps, just don't swipe Termux away).
+
+3. **Keep her alive 24/7:**
+   - Run `termux-wake-lock` so Android doesn't freeze the process when the
+     screen is off (needs the free **Termux:API** companion app from F-Droid).
+   - Android Settings -> Apps -> Termux -> Battery -> **Unrestricted**
+     (skips battery optimization that would otherwise kill her).
+   - For autostart after a reboot, install **Termux:Boot** from F-Droid and
+     add `~/.termux/boot/start-shouko.sh`:
+
+```bash
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+cd ~/shouko-bot
+export DISCORD_TOKEN="your-bot-token"
+export GROQ_API_KEY="your-groq-key"
+python bot.py >> shouko.log 2>&1
+```
+
+   Tip: instead of `export` lines you can also drop a `.env` file next to
+   `bot.py` (copy `.env.example` and fill in your two keys) - she reads it
+   automatically.
 
 ## Run locally (optional)
 
@@ -43,6 +72,12 @@ pip install -r requirements.txt
 cp .env.example .env   # fill in your two keys
 python bot.py
 ```
+
+## Deploy with Docker (any Docker host)
+
+The included `Dockerfile` works on any Docker host or container platform
+(Railway, Fly.io, a VPS, etc.): set `DISCORD_TOKEN` and `GROQ_API_KEY` as
+environment variables and deploy.
 
 ## Make her yours
 
@@ -59,5 +94,5 @@ python bot.py
 | `persona.py` | her personality (edit this to change who she is) |
 | `gifs.py` | the GIF library (every URL verified working) |
 | `requirements.txt` | Python dependencies |
-| `Dockerfile` | how Northflank builds and runs her |
+| `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
 | `.env.example` | which environment variables she needs |
