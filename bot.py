@@ -75,6 +75,9 @@ FALLBACK_LINES = [
     "lagging harder than 300 ping in the Abyss, one more time?",
 ]
 
+# What she says when the AI brain answers with nothing at all (empty completion)
+EMPTY_REPLY_FALLBACK = "umm mera dimaag ek second ke liye blank ho gaya 🥺 phir se bologe?"
+
 # Keyword -> GIF category. First match wins, so order matters.
 GIF_TRIGGERS = [
     (r"\b(good\s*morning|gm|ohayo|mornings)\b", "good_morning"),
@@ -128,7 +131,10 @@ async def think(channel_id):
         data = await resp.json(content_type=None)
         if resp.status != 200:
             raise RuntimeError(f"Groq API {resp.status}: {data}")
-        return data["choices"][0]["message"]["content"].strip()
+        reply_text = (data["choices"][0]["message"]["content"] or "").strip()
+        if not reply_text:
+            log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
+        return reply_text
 
 @client.event
 async def on_ready():
@@ -154,14 +160,19 @@ async def on_message(message):
     async with message.channel.typing():
         try:
             reply = await think(message.channel.id)
+            if not reply:
+                reply = EMPTY_REPLY_FALLBACK
         except Exception as e:
             log.warning("Groq error: %s", e)
             reply = random.choice(FALLBACK_LINES)
 
     reply = reply[:MAX_REPLY_CHARS]
     history[message.channel.id].append((BOT_NAME, reply))
-    await message.reply(reply, mention_author=False)
-    if gif_url:
-        await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
+    try:
+        await message.reply(reply, mention_author=False)
+        if gif_url:
+            await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
+    except Exception:
+        log.exception("Failed to send reply in channel %s", message.channel.id)
 
 client.run(DISCORD_TOKEN)
