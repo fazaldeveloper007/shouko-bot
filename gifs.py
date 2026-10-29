@@ -80,3 +80,193 @@ GIFS = {
         "https://media.tenor.com/x8BnLOgYuygAAAAM/furina-approves.gif",  # Furina
     ],
 }
+
+
+# Character GIFs: when someone asks for a specific character's gif
+# ("send a neuvillette gif"), she pulls from these lists. Aliases cover
+# common spellings/nicknames; matching is case-insensitive whole-word.
+CHARACTER_GIFS = {
+    "neuvillette": {
+        "aliases": ["neuvillette", "neuvi", "neuvilette", "neuvillete"],
+        "gifs": [
+            "https://media.tenor.com/GasP8hnRRGAAAAAM/neuvillette-neuvi.gif",
+            "https://media.tenor.com/ewVSHH9T-JYAAAAM/neuvillette-genshin.gif",
+            "https://media.tenor.com/LnMY5x202u4AAAAM/neuvillette.gif",
+            "https://media.tenor.com/wmdYNgWaob0AAAAM/neuvillette.gif",
+            "https://media.tenor.com/jXSbfea8U0gAAAAM/neuvillette-genshin-impact.gif",
+            "https://media.tenor.com/hlzTnCXThPAAAAAM/neuvillette-genshin-impact.gif",
+            "https://media.tenor.com/UobmA8MKy9sAAAAM/neuvillette-neuvilette.gif",
+            "https://media.tenor.com/QRj9tXh8E_0AAAAM/neuvillette-genshin-impact.gif",
+            "https://media.tenor.com/o63cmVMjmf8AAAAM/neuvillette-neuvillette-genshin.gif",
+            "https://media.tenor.com/XfXyNkKlCyUAAAAM/neuvillette-chief-justice.gif",
+            "https://media.tenor.com/2MLdo22wNK8AAAAM/neuvillette-neuvi.gif",
+            "https://media.tenor.com/WHan5J0Nhd4AAAAM/neuvillette-genshin-impact.gif",
+        ],
+    },
+    "vodyanitsa": {
+        "aliases": ["vodyanitsa", "vodya", "vodyanista"],
+        "gifs": [
+            "https://media.tenor.com/Gk0vwwP9GBEAAAAC/vodyanitsa-genshin.gif",
+            "https://media.tenor.com/Gk0vwwP9GBEAAAAM/vodyanitsa-genshin.gif",
+            "https://media.tenor.com/CHCe7gt5UbgAAAAM/mitya-vodyanitsa.gif",
+            "https://media.tenor.com/85BRnAUeFw0AAAAM/vodyanitsa-mem.gif",
+            "https://media.tenor.com/QhR1iJG0UgEAAAAM/vodyanitsa-head-tilt.gif",
+            "https://media.tenor.com/eM-vXVy-k-UAAAAM/vodyanitsa-genshinimpact.gif",
+            "https://media.tenor.com/_edyYnDIBF0AAAAM/vodyanitsa-wow.gif",
+            "https://media.tenor.com/GdlBRe7x-MAAAAAM/vodyanitsa-genshin-impact.gif",
+        ],
+    },
+    "lohen": {
+        "aliases": ["lohen"],
+        "gifs": [
+            "https://media.tenor.com/v9wWjETnRx0AAAAC/genshin-impact-lohen.gif",
+            "https://media.tenor.com/v9wWjETnRx0AAAAd/genshin-impact-lohen.gif",
+            "https://media.tenor.com/v9wWjETnRx0AAAAM/genshin-impact-lohen.gif",
+            "https://media.tenor.com/PIjvQ7qDfO8AAAAM/lohen-genshin-lohen.gif",
+            "https://media.tenor.com/Sp56maIVxWwAAAAM/lohen-upset-lohen-down.gif",
+            "https://media.tenor.com/FHNTX3K1-OEAAAAM/loop-lohen.gif",
+        ],
+    },
+    "mitya": {
+        "aliases": ["mitya"],
+        "gifs": [
+            "https://media.tenor.com/26PjfxCH4W0AAAAC/mitya-genshin-impact-genshin-impact-mitya.gif",
+            "https://media.tenor.com/26PjfxCH4W0AAAAM/mitya-genshin-impact-genshin-impact-mitya.gif",
+            "https://media.tenor.com/wK9mtvLnGpEAAAAM/mitya-genshin-impact.gif",
+            "https://media.tenor.com/_42L9fjMY-8AAAAM/mitya-genshin.gif",
+            "https://media.tenor.com/jUMwp4ZqJmIAAAAM/mitya-genshin-impact-genshin-impact-mitya.gif",
+            "https://media.tenor.com/S_lY1dwkjowAAAAM/mitya-genshin-impact-genshin-impact-mitya.gif",
+        ],
+    },
+    "tsaritsa": {
+        "aliases": ["tsaritsa", "the tsaritsa", "cryo archon"],
+        "gifs": [
+            "https://media.tenor.com/9J4GdsIn0qsAAAAM/tsaritsa-genshin-impact.gif",
+            "https://media.tenor.com/bqeAMP7klZUAAAAM/genshin-impact-tsaritsa.gif",
+            "https://media.tenor.com/UQvOQe01IgkAAAAM/the-tsaritsa-genshin-impact.gif",
+            "https://media.tenor.com/5UTyuWspnccAAAAM/tsaritsa-genshin-impact.gif",
+            "https://media.tenor.com/PyqbIX5_I00AAAAM/tsaritsa-tsaritsa-genshin-impact.gif",
+            "https://media.tenor.com/IRzHqo-RzdAAAAAM/tsaritsa-genshin-impact.gif",
+            "https://media.tenor.com/7m6GA6nBAZkAAAAM/tsaritsa-tsaritsa-genshin-impact.gif",
+        ],
+    },
+    "ronova": {
+        "aliases": ["ronova", "ruler of death"],
+        "gifs": [
+            "https://media.tenor.com/nqfXo4vd2kAAAAAC/ronova-genshin.gif",
+            "https://media.tenor.com/nqfXo4vd2kAAAAAd/ronova-genshin.gif",
+            "https://media.tenor.com/nqfXo4vd2kAAAAAM/ronova-genshin.gif",
+            "https://media.tenor.com/xEK9wPLBtAcAAAAM/ronova-ronova-closeup.gif",
+            "https://media.tenor.com/0RE8mQI9Zk0AAAAM/ronova-ruler-of-death.gif",
+            "https://media.tenor.com/0YZjLOG9Uw8AAAAM/ronova-ruler-of-death.gif",
+        ],
+    },
+    "pierro": {
+        "aliases": ["pierro", "the jester", "jester"],
+        "gifs": [
+            "https://media.tenor.com/B6krPor0_isAAAAC/ronova-pierro.gif",
+            "https://media.tenor.com/B6krPor0_isAAAAM/ronova-pierro.gif",
+            "https://media.tenor.com/3QBXSQrIkqQAAAAM/pierro-genshin-meme.gif",
+            "https://media.tenor.com/dnCN3b2uXRMAAAAM/pierro-genshin-impact.gif",
+            "https://media.tenor.com/OgdFSE1d0akAAAAM/pierro-genshin-impact.gif",
+            "https://media.tenor.com/hjwiijvPlQsAAAAM/pierro-jester-genshin.gif",
+            "https://media.tenor.com/Mwl6VxBneOIAAAAM/pierro-genshin-impact.gif",
+        ],
+    },
+    "dainsleif": {
+        "aliases": ["dainsleif", "dain", "dainslief", "bough keeper"],
+        "gifs": [
+            "https://media.tenor.com/qYKJRk8wB_cAAAAC/dainsleif.gif",
+            "https://media.tenor.com/qYKJRk8wB_cAAAAM/dainsleif.gif",
+            "https://media.tenor.com/tmNCZwaWG7EAAAAM/dain-dainsleif.gif",
+            "https://media.tenor.com/qj-odRviYa0AAAAM/dainsleif-genshin-impact.gif",
+            "https://media.tenor.com/z8MHO46s4DEAAAAM/dainsleif-dainsleif-rerir.gif",
+            "https://media.tenor.com/QOBwGkvJyS8AAAAM/dainsleif-genshin-impact.gif",
+            "https://media.tenor.com/4iSAvval8FQAAAAM/dainsleif-kaveh.gif",
+        ],
+    },
+    "odette": {
+        "aliases": ["odette"],
+        "gifs": [
+            "https://media.tenor.com/cv1uAmhqJAgAAAAC/odette-odette-genshin.gif",
+            "https://media.tenor.com/cv1uAmhqJAgAAAAM/odette-odette-genshin.gif",
+            "https://media.tenor.com/MEpWtg_J5n8AAAAM/odette-odette-genshin-impact.gif",
+            "https://media.tenor.com/p8HosUHS3mAAAAAM/odette-odette-genshin-impact.gif",
+            "https://media.tenor.com/A5B1mOA3nywAAAAM/odette-odette-genshin.gif",
+            "https://media.tenor.com/8izwgjHsJuAAAAAM/odette-spessiva-genshin-impact.gif",
+        ],
+    },
+    "vesna": {
+        "aliases": ["vesna"],
+        "gifs": [
+            "https://media.tenor.com/b2iYdyEl7IcAAAAC/vesna-genshin.gif",
+            "https://media.tenor.com/b2iYdyEl7IcAAAAM/vesna-genshin.gif",
+            "https://media.tenor.com/jbWhCz2KbVUAAAAM/vesna-amazed-shocked-angry.gif",
+            "https://media.tenor.com/v6Xjskl_Wr8AAAAM/vesna-genshin-impact.gif",
+            "https://media.tenor.com/36VFPzjcCHUAAAAM/vesna-shocked.gif",
+            "https://media.tenor.com/9K1KPO4HAEQAAAAM/vesna-hi.gif",
+        ],
+    },
+    "columbina": {
+        "aliases": ["columbina", "damselette"],
+        "gifs": [
+            "https://media.tenor.com/C8pktlj70HMAAAAC/columbina-columbina-genshin.gif",
+            "https://media.tenor.com/C8pktlj70HMAAAAd/columbina-columbina-genshin.gif",
+            "https://media.tenor.com/C8pktlj70HMAAAAM/columbina-columbina-genshin.gif",
+            "https://media.tenor.com/n7tMq8K4dXQAAAAM/columbina-sandrone.gif",
+            "https://media.tenor.com/iYOypqhLfToAAAAM/columbina-genshin-impact-columbina.gif",
+            "https://media.tenor.com/SI8prMumrJwAAAAM/columbina-sad-columbina.gif",
+            "https://media.tenor.com/ya9w2l46i40AAAAM/genshin-columbina.gif",
+            "https://media.tenor.com/fqN6zLZAYcYAAAAM/columbina-columbina-hyposelenia.gif",
+        ],
+    },
+    "noelle": {
+        "aliases": ["noelle"],
+        "gifs": [
+            "https://media.tenor.com/lhLY6bukItgAAAAC/noelle-genshin-impact.gif",
+            "https://media.tenor.com/lhLY6bukItgAAAAM/noelle-genshin-impact.gif",
+            "https://media.tenor.com/sCdOeCFDO7wAAAAM/noelle-genshin-genshin-impact.gif",
+            "https://media.tenor.com/wKgVf83UlBoAAAAM/genshin-impact-noelle.gif",
+            "https://media.tenor.com/lm-zHXJ7AL8AAAAM/noelle-genshin.gif",
+            "https://media.tenor.com/WOWlzXlEh8QAAAAM/genshin-impact-noelle.gif",
+            "https://media.tenor.com/mE1pOJuDAgYAAAAM/genshin-noelle.gif",
+        ],
+    },
+    "flins": {
+        "aliases": ["flins"],
+        "gifs": [
+            "https://media.tenor.com/_PLxkddta2MAAAAC/flins-genshin.gif",
+            "https://media.tenor.com/_PLxkddta2MAAAAM/flins-genshin.gif",
+            "https://media.tenor.com/q8Zy9iFE3mcAAAAM/flins-genshin.gif",
+            "https://media.tenor.com/vU0S_OQcWjgAAAAM/flins-flins-genshin.gif",
+            "https://media.tenor.com/vJetSafjHwgAAAAM/flins-genshin.gif",
+            "https://media.tenor.com/dMc-zhoewUoAAAAM/flins-flins-genshin.gif",
+            "https://media.tenor.com/GFd_1rVL1acAAAAM/flins-flins-genshin.gif",
+        ],
+    },
+    "lauma": {
+        "aliases": ["lauma"],
+        "gifs": [
+            "https://media.tenor.com/dTfz322mwBsAAAAC/lauma-genshin.gif",
+            "https://media.tenor.com/dTfz322mwBsAAAAM/lauma-genshin.gif",
+            "https://media.tenor.com/Mq9aCQiGSaQAAAAM/lauma-genshin.gif",
+            "https://media.tenor.com/QpZHmORC_boAAAAM/lauma-genshin.gif",
+            "https://media.tenor.com/bzcvcCAfS80AAAAM/nod-krai-ellie-loves-lauma.gif",
+            "https://media.tenor.com/bQ5t5SNCBa8AAAAM/lauma-lauma-genshin.gif",
+            "https://media.tenor.com/ZmJzCz4gtqAAAAAM/lauma-lauma-genshin.gif",
+        ],
+    },
+    "ganyu": {
+        "aliases": ["ganyu"],
+        "gifs": [
+            "https://media.tenor.com/7w7p34lFW2oAAAAM/ganyu-genshin-impact.gif",
+            "https://media.tenor.com/gxJZ15y0a44AAAAM/ganyu-genshin.gif",
+            "https://media.tenor.com/O19b_FO_OIQAAAAM/ganyuanhoa.gif",
+            "https://media.tenor.com/IZGGMcuI2K4AAAAM/ganyu-genshin.gif",
+            "https://media.tenor.com/C1AbcbS5dywAAAAM/yazyu-ganyu.gif",
+            "https://media.tenor.com/8ERjVliRQEIAAAAM/ganyu-gachapon.gif",
+            "https://media.tenor.com/p9JZiVfI4AQAAAAM/ganyu-de-nana-ganyu-genshin-impact.gif",
+            "https://media.tenor.com/1MbVPEKBQsAAAAAM/ganyu-genshin.gif",
+        ],
+    },
+}
