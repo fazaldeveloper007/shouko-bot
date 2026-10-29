@@ -29,68 +29,50 @@ Runs great on a spare Android phone plugged into the charger. Free forever, no c
 
 1. Install **Termux from F-Droid** (https://f-droid.org/en/packages/com.termux/).
    Do NOT use the Play Store version - it is outdated and broken.
-2. In Termux:
+2. In Termux, run:
 
 ```bash
-pkg update && pkg install python git clang -y
+pkg update && pkg install python git clang nano -y
 git clone https://github.com/fazaldeveloper007/shouko-bot.git
 cd shouko-bot
-
-# Termux has no prebuilt wheels, so pip would try to compile a few
-# packages. These flags keep them 100% pure Python - no compiling needed:
-export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1
-export FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
-
+export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
 pip install -r requirements.txt
-
 export DISCORD_TOKEN="your-bot-token"
 export GROQ_API_KEY="your-groq-key"
+termux-wake-lock
 python bot.py
 ```
 
-   You should see `Kristy is online` in a few seconds. Keep the Termux
-   window open (you can switch apps, just don't swipe Termux away).
+You should see `Kristy is online` in a few seconds. Keep the Termux
+window open (you can switch apps, just don't swipe Termux away).
 
-   Notes:
-   - **clang** is only used to build `audioop-lts`, a tiny audio helper that
-     discord.py requires on Python 3.13+. Everything else stays pure Python
-     thanks to the `NO_EXTENSIONS` flags above.
-   - The bot calls Groq's API directly over HTTPS instead of using the `groq`
-     package on purpose: the SDK pulls in `pydantic-core`, which needs a Rust
-     toolchain that does not build on Termux.
-   - **Already cloned and `pip install` died with `pydantic-core` / `Rust not
-     found` errors?** Fix it with:
-
-```bash
-pkg update && pkg install clang -y
-cd ~/shouko-bot
-git pull
-export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1
-export FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
-pip install -r requirements.txt
-python bot.py
-```
-
-3. **Keep her alive 24/7:**
-   - Run `termux-wake-lock` so Android doesn't freeze the process when the
-     screen is off (needs the free **Termux:API** companion app from F-Droid).
-   - Android Settings -> Apps -> Termux -> Battery -> **Unrestricted**
-     (skips battery optimization that would otherwise kill her).
-   - For autostart after a reboot, install **Termux:Boot** from F-Droid and
-     add `~/.termux/boot/start-shouko.sh`:
+Notes:
+- PyPI has no Android wheels for these packages, so the `NO_EXTENSIONS` exports
+  above are required for the pip install.
+- **clang** is needed to build `audioop-lts` on Python 3.14.
+- `termux-wake-lock` is built into Termux; it does **not** need Termux:API.
+- Android Settings -> Apps -> Termux -> Battery -> **Unrestricted** helps keep
+  Android from killing the bot in the background.
+- For autostart after a reboot, install **Termux:Boot** from F-Droid, open it
+  once, then create `~/.termux/boot/start-shouko.sh` with:
 
 ```bash
 #!/data/data/com.termux/files/usr/bin/sh
-termux-wake-lock
-cd ~/shouko-bot
+export AIOHTTP_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 MULTIDICT_NO_EXTENSIONS=1 FROZENLIST_NO_EXTENSIONS=1 PROPCACHE_NO_EXTENSIONS=1
 export DISCORD_TOKEN="your-bot-token"
 export GROQ_API_KEY="your-groq-key"
-python bot.py >> shouko.log 2>&1
+cd ~/shouko-bot && python bot.py >> ~/shouko.log 2>&1
 ```
 
-   Tip: instead of `export` lines you can also drop a `.env` file next to
-   `bot.py` (copy `.env.example` and fill in your two keys) - she reads it
-   automatically.
+Then make the script executable:
+
+```bash
+chmod +x ~/.termux/boot/start-shouko.sh
+```
+
+Tip: instead of `export` lines you can also drop a `.env` file next to
+`bot.py` (copy `.env.example` and fill in your two keys) - she reads it
+automatically.
 
 ## Run locally (optional)
 
@@ -118,7 +100,7 @@ environment variables and deploy.
 | File | What it's for |
 |---|---|
 | `bot.py` | all the logic: when to reply, memory, GIF triggers |
-| `persona.py` | her personality (edit this to change who she is) |
+| `persona.py` | her personality (edit this to change it) |
 | `gifs.py` | the GIF library (every URL verified working) |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
