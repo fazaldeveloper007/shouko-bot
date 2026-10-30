@@ -137,13 +137,22 @@ history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 # Matches her name as a whole word, case-insensitive
 NAME_RE = re.compile(rf"\b{re.escape(BOT_NAME.lower())}\b")
 
-# Questions that need live info (banners, codes, meta, news, weather...).
-# Deliberately conservative: casual banter must never trigger a search call,
-# because every search spends from the search model's daily quota.
+# Search routing is code-driven: explicit requests always win; likely-current
+# Genshin topics (especially future version/leak questions) also prefer live
+# sources. Ordinary chat stays on the normal brain to conserve search quota.
 SEARCH_RE = re.compile(
-    r"(\b(search|google)\s+(kar|karo|karke|kar\s+do)\b|\bpata\s+kar(o|ke|na)?\b"
+    r"(\b(search(?:ing)?|google)\b|\blook\s+(?:it|that|this)\s+up\b"
+    r"|\b(?:try|please|can\s+you|could\s+you)\s+(?:search|google|look\s+up)\b"
+    r"|\bpata\s+kar(o|ke|na)?\b|\bsearch\s+(?:kar|karo|karke|kar\s+do)\b"
     r"|\b(latest|current|new|next|upcoming)\s+(news|updates?|patch|version|banners?|"
     r"characters?|regions?|events?|codes?|meta|leaks?|livestream)\b"
+    r"|\b(latest|current|new|next|upcoming)\s+(genshin\s+)?(version|patch|banner|update|leak|news)\b"
+    r"|\b(?:upcoming|future|next|coming|leaks?)\b.{0,50}\b(?:genshin|version|v?\d+\.\d+|patch|banner|update)\b"
+    r"|\b(?:upcoming|future|next|coming)\b.{0,40}\b(?:v?\d+\.\d+(?:\.\d+)?|version|patch)\b"
+    r"|\b(?:leaks?|rumors?)\b.{0,30}\b(?:for|about|of|on)?\s*v?\d+\.\d+(?:\.\d+)?\b"
+    r"|\b(?:upcoming|future|next)\s+in\s+v?\d+\.\d+(?:\.\d+)?\b"
+    r"|\b(?:genshin\s+)?(?:version|patch)\s*v?\d+\.\d+(?:\.\d+)?\b"
+    r"|\b(?:in|for)\s+v?\d+\.\d+(?:\.\d+)?\b"
     r"|\bbanners?\s+(schedule|kab|kb)\b|\bmeta\s+(rn|right\s+now|abhi)\b"
     r"|\b(genshin\s+)?(news|leaks?|updates?)\s+(bata|batao|kya|suna|suno|dikha)\b"
     r"|\bkab\s+(release|launch|aayega|aayegi|ayega|ayegi|hoga|hogi|aa\s+raha|aa\s+rahi)\b"
@@ -155,6 +164,18 @@ SEARCH_RE = re.compile(
 
 def looks_like_search(text):
     return bool(SEARCH_RE.search(text or ""))
+
+# Always tell both supported brains that live search exists and how the
+# runtime activates it. This prevents the model from denying the capability.
+SEARCH_CAPABILITY = (
+    "\n\nLIVE WEB SEARCH: You can use live web search when the member explicitly "
+    "asks you to search, Google, or look something up, and the bot runtime will "
+    "provide successful search results below. It also searches likely-current "
+    "questions such as upcoming Genshin versions, patches, banners, updates, "
+    "news, and leaks. Do not say you cannot search. Only say you searched when "
+    "actual results are provided; if a note says the search failed or the daily "
+    "limit was reached, be transparent and do not guess current/future facts."
+)
 
 # Extra instruction appended only for grounded (web-search) replies
 SEARCH_HINT = (
@@ -614,7 +635,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + PING_GUIDANCE}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -664,7 +685,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + PING_GUIDANCE}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -734,21 +755,15 @@ def latest_question(channel_id):
             return content
     return ""
 
-async def think_search(channel_id, diary_block="", extra_system=""):
-    """Web-informed brain for questions about current events.
-
-    Searches the web with the configured provider (Tavily by default), then
-    lets the normal chat model answer from those results in persona - so a
-    search costs one provider call plus one ordinary chat-model call, and no
-    special grounded model is needed. Raises on any failure; the caller falls
-    back to the normal brain.
-    """
+async def think_search(channel_id, diary_block="", extra_system="", image_parts=None):
+    """Use live web results, then answer in persona; errors are handled by caller."""
     query = latest_question(channel_id)
     if not query:
         raise RuntimeError("nothing to search for")
     digest = await fetch_search_results(query)
     search_block = f"{SEARCH_HINT}\n\nWeb search results for \"{query}\":\n{digest}"
-    return await think(channel_id, diary_block, extra_system=extra_system + search_block)
+    return await think(channel_id, diary_block, image_parts=image_parts,
+                       extra_system=extra_system + search_block)
 
 async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
@@ -866,18 +881,30 @@ async def on_message(message):
                         log.warning("Image collection failed: %s", e)
                         image_parts = []
                 try:
-                    if not has_image and looks_like_search(content) and search_quota_left():
-                        # current-info question: answer from a live web search; any
-                        # problem (error, quota, empty) just falls back to the
-                        # normal brain, so search can never break replying
-                        try:
-                            mark_search_used()
-                            reply = await think_search(message.channel.id, diary_block, extra)
-                            if not reply:
-                                raise RuntimeError("search returned no text")
-                        except Exception as e:
-                            log.warning("Web search failed, replying without it: %s", e)
-                            reply = await think(message.channel.id, diary_block, image_parts, extra)
+                    if looks_like_search(content):
+                        search_error = None
+                        if not search_quota_left():
+                            search_error = "daily search limit reached"
+                        else:
+                            try:
+                                mark_search_used()
+                                reply = await think_search(message.channel.id, diary_block, extra,
+                                                           image_parts=image_parts)
+                                if not reply:
+                                    raise RuntimeError("search returned no text")
+                            except Exception as e:
+                                search_error = "web search failed"
+                                log.warning("Web search failed: %s", e)
+                        if search_error:
+                            # Never silently fall back to an answer that could be
+                            # mistaken for researched current information.
+                            if re.search(r"\b(search|google|look\s+up)\b", content, re.I):
+                                reply = "i couldn't search just now, so i don't want to guess about that."
+                            elif re.search(r"\b(karo|kar|batao|bata|kya|hai|hain|mein|ka|ki)\b", content, re.I):
+                                reply = "abhi search nahi ho paya, isliye current info guess nahi karungi."
+                            else:
+                                reply = "i couldn't search just now, so i don't want to guess about current info."
+                            log.warning("Replying transparently: %s", search_error)
                     else:
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
                 except Exception as e:
@@ -912,4 +939,3 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
-
