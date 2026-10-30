@@ -286,6 +286,70 @@ def gif_note(desc):
         "you cannot send gifs.]"
     )
 
+# --- Emoji reactions -------------------------------------------------------
+# The brain may start its reply with an optional marker, [[react:<emoji>]],
+# which is stripped from the visible reply and applied as a real reaction on
+# the member's message. persona.py keeps it rare (genuinely shocking, dark,
+# hilarious or heartwarming messages only); the per-channel cooldown below is
+# a hard backstop, and on the zero-API gif paths a small random heuristic
+# reacts instead. Costs no extra AI calls, and a missing "Add Reactions"
+# permission only logs once - replying never breaks over a reaction.
+REACTION_RE = re.compile(r"^\s*\[\[react:\s*(.+?)\s*\]\]\s*", re.DOTALL)
+REACTION_COOLDOWN = 120   # seconds between her reactions per channel
+REACTION_CHANCE = 0.3     # on the zero-API gif paths only; the AI path self-regulates
+_last_reaction = {}       # channel_id -> monotonic time of her last reaction
+_reaction_warned = False
+
+# kind -> emojis she may react with on the zero-API gif paths
+GIF_REACTIONS = {
+    "character": ["\U0001f60d", "\u2728", "\u2764\ufe0f", "\U0001faf6"],
+    "good_morning": ["\U0001f305", "\u2600\ufe0f", "\u2615"],
+    "good_night": ["\U0001f319", "\U0001f634", "\U0001f4a4"],
+    "hello": ["\U0001f44b", "\U0001f497", "\u2728"],
+    "hype": ["\U0001f525", "\U0001f389", "\u26a1"],
+    "sad": ["\U0001fac2", "\U0001f499", "\U0001f622"],
+    "laugh": ["\U0001f602", "\U0001f480", "\U0001f923"],
+    "luck": ["\U0001f340", "\u2728", "\U0001f64f"],
+}
+
+def extract_reaction(reply):
+    """Split an optional leading [[react:emoji]] marker off a reply.
+
+    Returns (emoji_or_None, clean_reply). A junk marker (ascii words, urls,
+    anything long) is still stripped so it never leaks into chat.
+    """
+    m = REACTION_RE.match(reply or "")
+    if not m:
+        return None, reply
+    emoji = m.group(1).strip()
+    clean = reply[m.end():].lstrip()
+    if not emoji or len(emoji) > 12 or re.search(r"[a-z0-9:/\[\]]", emoji, re.IGNORECASE):
+        return None, clean
+    return emoji, clean
+
+def heuristic_reaction(kind):
+    """Small random chance of a fitting reaction on the zero-API gif paths."""
+    if random.random() >= REACTION_CHANCE:
+        return None
+    return random.choice(GIF_REACTIONS.get(kind) or GIF_REACTIONS["character"])
+
+async def try_reaction(message, emoji):
+    """Fail-open: missing Add Reactions permission or a rejected emoji logs
+    once and never breaks replying."""
+    global _reaction_warned
+    if not emoji or not reaction_allowed(message.channel.id):
+        return
+    try:
+        await message.add_reaction(emoji)
+        _last_reaction[message.channel.id] = time.monotonic()
+    except Exception as e:
+        if not _reaction_warned:
+            _reaction_warned = True
+            log.warning("Could not add reaction (bot may lack the Add Reactions permission): %s", e)
+
+def reaction_allowed(channel_id):
+    return time.monotonic() - _last_reaction.get(channel_id, -1e9) >= REACTION_COOLDOWN
+
 def message_has_image(message):
     """True when the message carries an image attachment or an embedded image."""
     for att in message.attachments:
@@ -727,6 +791,7 @@ async def on_message(message):
         gif_url = random.choice(CHARACTER_GIFS[character]["gifs"])
         gif_desc = f"{character} character"
         reply = random.choice(CHARACTER_GIF_LINES)
+        reaction = heuristic_reaction("character")
     else:
         mention = detect_character_mention(content)
         if mention and short_hype_message(content):
@@ -735,6 +800,7 @@ async def on_message(message):
             gif_url = random.choice(CHARACTER_GIFS[mention]["gifs"])
             gif_desc = f"{mention} character"
             reply = random.choice(CHARACTER_GIF_LINES)
+            reaction = heuristic_reaction("character")
         else:
             # a plain name mention earns that character's gif (one per message,
             # with a per-channel cooldown so multi-character chatter does not
@@ -777,11 +843,12 @@ async def on_message(message):
                             reply = await think(message.channel.id, diary_block, image_parts, extra)
                     else:
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
-                    if not reply:
-                        reply = EMPTY_REPLY_FALLBACK
                 except Exception as e:
                     log.warning("AI brain error: %s", e)
                     reply = random.choice(FALLBACK_LINES)
+                reaction, reply = extract_reaction(reply)
+                if not reply:
+                    reply = EMPTY_REPLY_FALLBACK
 
     reply = reply[:MAX_REPLY_CHARS]
     stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
@@ -790,6 +857,7 @@ async def on_message(message):
         await message.reply(reply, mention_author=False)
         if gif_url:
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
+        await try_reaction(message, reaction)
     except Exception:
         log.exception("Failed to send reply in channel %s", message.channel.id)
 
