@@ -80,6 +80,17 @@ if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
 HISTORY_LEN = 20        # messages she remembers per channel
 MAX_REPLY_CHARS = 1800  # Discord's limit is 2000; leave some margin
 
+PING_GUIDANCE = """
+OPTIONAL DISCORD PING:
+Only when notifying the person would materially help, add [[ping]] at the very
+end of your reply. Use it sparingly: for example, when calling this person into
+a group discussion, distinguishing who you are addressing in a busy channel,
+or when they explicitly asked to be pinged. Do not add it just because you are
+replying to them, answering an ordinary question, or mentioning their name.
+When in doubt, omit it. Never write Discord mention syntax yourself.
+"""
+PING_MARKER_RE = re.compile(r"\[\[ping\]\]", re.IGNORECASE)
+
 # Image vision (Gemini path only; the Groq fallback stays text-only)
 MAX_IMAGE_BYTES = 8 * 1024 * 1024     # skip images bigger than ~8MB
 MAX_IMAGES = 3                        # most she will look at per message
@@ -410,14 +421,19 @@ async def collect_image_parts(message):
             log.warning("Image download failed for %s: %s", url, e)
     return parts
 
-def ping_reply_text(user_id, text):
-    """Add exactly one explicit ping for the member this reply is for.
+def extract_ping_request(text):
+    """Remove the model-only opt-in marker and return whether it was present."""
+    text = text or ""
+    requested = bool(PING_MARKER_RE.search(text))
+    return requested, PING_MARKER_RE.sub("", text).strip()
 
-    Strip mention syntax from generated/canned text first, so a reply cannot
-    accidentally ping someone else or duplicate the intended member mention.
-    """
+
+def ping_reply_text(user_id, text, ping=False):
+    """Sanitize mention syntax; optionally ping only the addressed member."""
     text = re.sub(r"<@!?\d+>|<@&\d+>|@everyone|@here", "", text or "", flags=re.IGNORECASE).strip()
-    return f"<@{user_id}>" + (f" {text}" if text else "")
+    if ping:
+        return f"<@{user_id}>" + (f" {text}" if text else "")
+    return text
 
 
 def reply_mentions(message):
@@ -598,7 +614,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + extra_system}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + PING_GUIDANCE}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -648,7 +664,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + PING_GUIDANCE}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -871,12 +887,13 @@ async def on_message(message):
                 if not reply:
                     reply = EMPTY_REPLY_FALLBACK
 
+    ping_requested, reply = extract_ping_request(reply)
     reply = reply[:MAX_REPLY_CHARS]
     stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
     history[message.channel.id].append((BOT_NAME, stored_reply))
     try:
         await message.reply(
-            ping_reply_text(message.author.id, reply),
+            ping_reply_text(message.author.id, reply, ping_requested),
             mention_author=False,
             allowed_mentions=reply_mentions(message),
         )
@@ -895,5 +912,4 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
-
 
