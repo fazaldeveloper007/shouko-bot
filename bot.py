@@ -3,6 +3,8 @@ Kristy - a Genshin Impact Discord chat bot.
 
 She chats when you @her, reply to one of her messages, or say her name,
 and throws GIFs for greetings, hype moments and gacha pain.
+When Gemini is the brain she can also SEE images sent to her (attachments
+or pasted image links) and reacts to memes, screenshots and fanart.
 
 Config (environment variables):
   DISCORD_TOKEN   bot token from the Discord developer portal (required)
@@ -17,6 +19,7 @@ Config (environment variables):
 
 import os
 import re
+import base64
 import random
 import asyncio
 import logging
@@ -61,6 +64,12 @@ if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
 
 HISTORY_LEN = 20        # messages she remembers per channel
 MAX_REPLY_CHARS = 1800  # Discord's limit is 2000; leave some margin
+
+# Image vision (Gemini path only; the Groq fallback stays text-only)
+MAX_IMAGE_BYTES = 8 * 1024 * 1024     # skip images bigger than ~8MB
+MAX_IMAGES = 3                        # most she will look at per message
+IMAGE_TIMEOUT = 25                    # seconds to download one image
+IMAGE_ONLY_PROMPT = "Reply naturally to this image as Kristy."
 
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
@@ -152,6 +161,66 @@ def detect_character_gif(text):
         if rx.search(text):
             return name
     return None
+
+def message_has_image(message):
+    """True when the message carries an image attachment or an embedded image."""
+    for att in message.attachments:
+        if (att.content_type or "").lower().startswith("image/"):
+            return True
+    for embed in message.embeds:
+        if getattr(embed.image, "url", None) or getattr(embed.thumbnail, "url", None):
+            return True
+    return False
+
+async def collect_image_parts(message):
+    """Download the message's images and return Gemini inline_data parts.
+
+    Fail-open: every problem (bad status, non-image, oversized, network) is
+    logged and that image is skipped, so replying never breaks over an image.
+    """
+    urls = []  # (url, known mime type or None)
+    seen = set()
+    for att in message.attachments:
+        mime = (att.content_type or "").split(";")[0].strip().lower()
+        if not mime.startswith("image/"):
+            continue
+        if att.size and att.size > MAX_IMAGE_BYTES:
+            log.warning("Skipping oversized attachment (%d bytes): %s", att.size, att.url)
+            continue
+        if att.url not in seen:
+            seen.add(att.url)
+            urls.append((att.url, mime))
+    for embed in message.embeds:  # pasted image links show up as embeds
+        for media in (embed.image, embed.thumbnail):
+            url = getattr(media, "url", None)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append((url, None))
+
+    parts = []
+    if not urls:
+        return parts
+    session = await groq_session()
+    timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT)
+    for url, mime in urls[:MAX_IMAGES]:
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    log.warning("Image download failed (HTTP %s): %s", resp.status, url)
+                    continue
+                mime = mime or (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if not mime.startswith("image/"):
+                    log.warning("Skipping non-image embed (%s): %s", mime or "unknown type", url)
+                    continue
+                data = await resp.read()
+                if len(data) > MAX_IMAGE_BYTES:
+                    log.warning("Skipping oversized image (%d bytes): %s", len(data), url)
+                    continue
+                parts.append({"inline_data": {"mime_type": mime,
+                                              "data": base64.b64encode(data).decode("ascii")}})
+        except Exception as e:
+            log.warning("Image download failed for %s: %s", url, e)
+    return parts
 
 def should_respond(message):
     """Reply when @mentioned, replied to, or name-dropped."""
@@ -276,7 +345,7 @@ async def think_groq(channel_id, diary_block=""):
             log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
         return reply_text
 
-async def think_gemini(channel_id, diary_block=""):
+async def think_gemini(channel_id, diary_block="", image_parts=None):
     """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
     contents = []
     for author, content in history[channel_id]:
@@ -294,6 +363,10 @@ async def think_gemini(channel_id, diary_block=""):
         contents.pop(0)  # a conversation must start with a user turn
     if not contents:
         return ""
+    if image_parts and contents[-1]["role"] == "user":
+        # images ride along with the CURRENT turn only; the history deque
+        # keeps text only, so old turns never carry image tokens
+        contents[-1]["parts"].extend(image_parts)
 
     session = await groq_session()
     payload = {
@@ -322,10 +395,14 @@ async def think_gemini(channel_id, diary_block=""):
             )
         return reply_text
 
-async def think(channel_id, diary_block=""):
-    """Gemini is the main brain; Groq is used only if no GEMINI_API_KEY is set."""
+async def think(channel_id, diary_block="", image_parts=None):
+    """Gemini is the main brain; Groq is used only if no GEMINI_API_KEY is set.
+
+    image_parts (Gemini only) are inline_data parts for the current turn;
+    the Groq fallback ignores them and replies text-only.
+    """
     if GEMINI_API_KEY:
-        return await think_gemini(channel_id, diary_block)
+        return await think_gemini(channel_id, diary_block, image_parts)
     return await think_groq(channel_id, diary_block)
 
 @client.event
@@ -348,6 +425,12 @@ async def on_message(message):
 
     user_id = message.author.id
     speaker = message.author.display_name
+
+    has_image = message_has_image(message)
+    if has_image and not content:
+        # image-only message: give her something to react to
+        content = IMAGE_ONLY_PROMPT
+        history[message.channel.id].append((speaker, content))
 
     # "forget me": delete this member's diary file, no AI call needed
     if diary.wants_forget(content):
@@ -376,8 +459,15 @@ async def on_message(message):
         gif_url = random.choice(GIFS[category]) if category and GIFS.get(category) else None
 
     async with message.channel.typing():
+        image_parts = []
+        if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
+            try:
+                image_parts = await collect_image_parts(message)
+            except Exception as e:
+                log.warning("Image collection failed: %s", e)
+                image_parts = []
         try:
-            reply = await think(message.channel.id, diary_block)
+            reply = await think(message.channel.id, diary_block, image_parts)
             if not reply:
                 reply = EMPTY_REPLY_FALLBACK
         except Exception as e:
