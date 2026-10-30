@@ -10,11 +10,15 @@ Config (environment variables):
   DISCORD_TOKEN   bot token from the Discord developer portal (required)
   GEMINI_API_KEY  API key from aistudio.google.com (main brain, free tier)
   GEMINI_MODEL    (optional) Gemini model id, default gemini-3.8-flash
-  GROQ_API_KEY    (optional fallback) API key from console.groq.com, used
-                  only when GEMINI_API_KEY is not set
+  GROQ_API_KEY    (optional fallback) API key from console.groq.com, used when
+                  GEMINI_API_KEY is not set or the Gemini call itself fails
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
   BOT_NAME        (optional) her name, default "Kristy"
   MEMORY_DIR      (optional) where member diaries live, default ./memory
+  GEMINI_SEARCH_MODEL (optional) model for web-search answers, default
+                  gemini-2.5-flash (Google Search grounding is free-tier here,
+                  unlike the Gemini 3 models, and uses its own daily quota)
+  SEARCH_MAX_PER_DAY  (optional) client-side cap on search calls, default 25
 """
 
 import os
@@ -49,6 +53,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
+GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-2.5-flash")
+try:
+    SEARCH_MAX_PER_DAY = max(0, int(os.getenv("SEARCH_MAX_PER_DAY", "25")))
+except ValueError:
+    SEARCH_MAX_PER_DAY = 25
 
 # Groq's OpenAI-compatible endpoint. We call it directly instead of using the
 # groq SDK: the SDK drags in pydantic v2 -> pydantic-core, which needs a Rust
@@ -58,6 +67,7 @@ GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 # Gemini generateContent REST endpoint, also called directly with aiohttp (no
 # google SDK, so the Termux install stays pure-Python).
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_SEARCH_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent"
 
 if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
     raise SystemExit("Missing DISCORD_TOKEN or GEMINI_API_KEY (or GROQ_API_KEY). Set them as env vars (see .env.example).")
@@ -90,12 +100,17 @@ async def groq_session():
 EXTRACT_EVERY = 6          # addressed messages per member between routine extractions
 EXTRACT_MEMBER_GAP = 90    # seconds: min gap between extractions for one member
 EXTRACT_GLOBAL_GAP = 15    # seconds: min gap between any two extractions
+SAVE_RETRY_DELAY = 45      # seconds before retrying a failed explicit save
 FORGET_REPLY = "done 🥺 maine tumhari diary band karke hata di, ab mujhe tumhare baare mein kuch yaad nahi. chahoge toh phir se shuru kar sakte hain 💗"
+# Sent in the channel once an explicit "yaad rakhna / remember this" is
+# actually saved to the diary file - never before the fact is on disk.
+SAVE_CONFIRM_REPLY = "likh liya 📔 tumhari diary mein save kar diya, ab yaad rahega 💗"
 
 _pending = {}        # user_id -> list of (speaker, text) since last extraction
 _since_extract = {}  # user_id -> addressed messages since last extraction
 _last_extract = {}   # user_id -> time of last extraction
 _forget_epoch = {}   # user_id -> bumped on "forget me" so in-flight extractions don't re-save
+_save_pending = set()  # user_ids with an explicit save request not yet confirmed
 _extract_busy = False
 _last_global_extract = 0.0
 _bg_tasks = set()
@@ -105,6 +120,48 @@ history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 
 # Matches her name as a whole word, case-insensitive
 NAME_RE = re.compile(rf"\b{re.escape(BOT_NAME.lower())}\b")
+
+# Questions that need live info (banners, codes, meta, news, weather...).
+# Deliberately conservative: casual banter must never trigger a search call,
+# because every search spends from the search model's daily quota.
+SEARCH_RE = re.compile(
+    r"(\b(search|google)\s+(kar|karo|karke|kar\s+do)\b|\bpata\s+kar(o|ke|na)?\b"
+    r"|\b(latest|current|new|next|upcoming)\s+(news|updates?|patch|version|banners?|"
+    r"characters?|regions?|events?|codes?|meta|leaks?|livestream)\b"
+    r"|\bbanners?\s+(schedule|kab|kb)\b|\bmeta\s+(rn|right\s+now|abhi)\b"
+    r"|\b(genshin\s+)?(news|leaks?|updates?)\s+(bata|batao|kya|suna|suno|dikha)\b"
+    r"|\bkab\s+(release|launch|aayega|aayegi|ayega|ayegi|hoga|hogi|aa\s+raha|aa\s+rahi)\b"
+    r"|\brelease\s+date\b|\bredeem\s+codes?\b|\bpromo\s+codes?\b"
+    r"|\blivestream\b|\bspecial\s+program\b|\bmaintenance\b"
+    r"|\bserver\s+(down|status)\b|\bweather\b|\bmausam\b)",
+    re.IGNORECASE,
+)
+
+def looks_like_search(text):
+    return bool(SEARCH_RE.search(text or ""))
+
+# Extra instruction appended only for grounded (web-search) replies
+SEARCH_HINT = (
+    "\n\nThe member is asking about something current or time-sensitive. "
+    "Use the google_search tool to look it up before answering, then reply in "
+    "your normal voice with the latest accurate info. If the search finds "
+    "nothing useful, say so honestly instead of guessing."
+)
+
+_search_day = ""
+_search_count = 0
+
+def search_quota_left():
+    """Client-side daily cap on search calls (resets at UTC midnight)."""
+    global _search_day, _search_count
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if _search_day != today:
+        _search_day, _search_count = today, 0
+    return _search_count < SEARCH_MAX_PER_DAY
+
+def mark_search_used():
+    global _search_count
+    _search_count += 1
 
 # What she says if the AI brain hiccups (rate limit, network, etc.)
 FALLBACK_LINES = [
@@ -236,6 +293,37 @@ def should_respond(message):
 def with_diary(prompt, diary_block):
     return f"{prompt}\n\n{diary_block}" if diary_block else prompt
 
+async def gemini_generate(payload, url=GEMINI_URL):
+    """One generateContent call, returning the decoded response.
+
+    Different models accept different generationConfig knobs (the Gemini 3
+    models disagree on which thinkingLevel values are valid, and a lite model
+    may reject responseMimeType). If the model rejects an optional field
+    (HTTP 400 naming it), drop that field and retry, so a GEMINI_MODEL switch
+    never silently breaks her. Anything else raises.
+    """
+    session = await groq_session()
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {"x-goog-api-key": GEMINI_API_KEY}
+    generation = payload.get("generationConfig")
+    for _attempt in range(3):
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status == 200:
+                return data
+            if resp.status == 400 and generation:
+                err = str(data)
+                for field in ("thinkingConfig", "responseMimeType"):
+                    if field in generation and field in err:
+                        log.warning("Model rejected generationConfig.%s; retrying without it", field)
+                        generation.pop(field)
+                        break
+                else:
+                    raise RuntimeError(f"Gemini API {resp.status}: {data}")
+                continue
+            raise RuntimeError(f"Gemini API {resp.status}: {data}")
+    raise RuntimeError("Gemini API: model rejected all optional config fields")
+
 async def call_extractor(prompt):
     """One small, low-temperature AI call that returns raw text (JSON expected)."""
     session = await groq_session()
@@ -246,13 +334,9 @@ async def call_extractor(prompt):
             "generationConfig": {"maxOutputTokens": 600, "temperature": 0.2,
                                  "responseMimeType": "application/json"},
         }
-        async with session.post(GEMINI_URL, json=payload,
-                                headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=timeout) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status != 200:
-                raise RuntimeError(f"Gemini API {resp.status}: {data}")
-            parts = ((data["candidates"][0].get("content") or {}).get("parts")) or []
-            return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+        data = await gemini_generate(payload)
+        parts = ((data["candidates"][0].get("content") or {}).get("parts")) or []
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -266,37 +350,84 @@ async def call_extractor(prompt):
             raise RuntimeError(f"Groq API {resp.status}: {data}")
         return data["choices"][0]["message"]["content"] or ""
 
-async def update_diary(user_id, display_name, exchanges, epoch):
-    """Background: extract durable facts from recent exchanges and merge them. Never raises."""
+def _requeue_exchanges(user_id, exchanges):
+    """Put failed-extraction exchanges back on the pending buffer so a later
+    extraction can still pick them up (they were consumed optimistically)."""
+    buf = _pending.setdefault(user_id, [])
+    merged = exchanges + buf
+    seen = set()
+    deduped = [ex for ex in merged if not (ex in seen or seen.add(ex))]
+    _pending[user_id] = deduped[-12:]
+    _last_extract.pop(user_id, None)  # the failure must not start the cooldown
+
+async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None):
+    """Background: extract durable facts from recent exchanges and merge them.
+
+    An explicit "yaad rakhna / remember this" request is retried once after a
+    pause when the extraction fails, and she confirms in the channel once the
+    fact is actually on disk. Never raises; never touches the reply path.
+    """
     global _extract_busy
+    confirming = user_id in _save_pending
+    attempts = 2 if confirming else 1
+    ok = False
     try:
-        mem = diary.load(user_id)
-        raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
-        name, facts = diary.parse_extraction(raw)
-        if _forget_epoch.get(user_id, 0) != epoch:
-            return  # member asked to be forgotten while we were thinking
-        if not facts and not name:
-            return
-        mem = diary.load(user_id)  # re-read: it may have changed meanwhile
-        diary.merge(mem, facts, name=name)
-        if diary.save(user_id, mem):
-            log.info("Diary updated for %s (+%d facts, %d total)", user_id, len(facts), len(mem["facts"]))
-    except Exception as e:
-        log.warning("Diary extraction failed for %s: %s", user_id, e)
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(SAVE_RETRY_DELAY)
+            try:
+                mem = diary.load(user_id)
+                raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
+                name, facts, parsed = diary.parse_extraction(raw)
+                if not parsed:
+                    raise ValueError(f"extractor returned unusable output: {raw[:160]!r}")
+                if _forget_epoch.get(user_id, 0) != epoch:
+                    _save_pending.discard(user_id)
+                    return  # member asked to be forgotten while we were thinking
+                if facts or name:
+                    mem = diary.load(user_id)  # re-read: it may have changed meanwhile
+                    diary.merge(mem, facts, name=name)
+                    if not diary.save(user_id, mem):
+                        raise IOError("diary.save() returned False")
+                    log.info("Diary updated for %s (+%d facts, %d total)", user_id, len(facts), len(mem["facts"]))
+                ok = True
+                break
+            except Exception as e:
+                log.warning("Diary extraction attempt %d/%d failed for %s: %s",
+                            attempt + 1, attempts, user_id, e)
+        if ok:
+            if confirming:
+                _save_pending.discard(user_id)
+                if channel is not None:
+                    try:
+                        await channel.send(SAVE_CONFIRM_REPLY)
+                    except Exception:
+                        log.warning("Could not send save confirmation in channel %s",
+                                    getattr(channel, "id", channel))
+        else:
+            _requeue_exchanges(user_id, exchanges)
     finally:
         _extract_busy = False
 
-def maybe_schedule_extraction(user_id, display_name, text):
-    """Decide (cheaply, no AI call) whether to run an extraction now. Never raises."""
+def maybe_schedule_extraction(user_id, display_name, text, channel=None):
+    """Decide (cheaply, no AI call) whether to run an extraction now. Never raises.
+
+    An explicit save request ("yaad rakhna...", "remember this", "likh lo")
+    bypasses the per-member cooldown so the save happens right away; it still
+    respects the global gap and the one-at-a-time guard (a skipped request
+    stays owed in _save_pending and fires on the member's next message).
+    """
     global _extract_busy, _last_global_extract
     try:
         _since_extract[user_id] = _since_extract.get(user_id, 0) + 1
         now = time.monotonic()
-        personal = diary.looks_like_self_info(text)
-        due = personal or _since_extract[user_id] >= EXTRACT_EVERY
+        if diary.looks_like_save_request(text):
+            _save_pending.add(user_id)
+        explicit = user_id in _save_pending
+        due = explicit or diary.looks_like_self_info(text) or _since_extract[user_id] >= EXTRACT_EVERY
         if not due or _extract_busy:
             return
-        if now - _last_extract.get(user_id, -1e9) < EXTRACT_MEMBER_GAP:
+        if not explicit and now - _last_extract.get(user_id, -1e9) < EXTRACT_MEMBER_GAP:
             return
         if now - _last_global_extract < EXTRACT_GLOBAL_GAP:
             return
@@ -309,7 +440,7 @@ def maybe_schedule_extraction(user_id, display_name, text):
         _last_global_extract = now
         _extract_busy = True
         task = asyncio.create_task(
-            update_diary(user_id, display_name, exchanges, _forget_epoch.get(user_id, 0))
+            extract_and_save(user_id, display_name, exchanges, _forget_epoch.get(user_id, 0), channel)
         )
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
@@ -368,41 +499,82 @@ async def think_gemini(channel_id, diary_block="", image_parts=None):
         # keeps text only, so old turns never carry image tokens
         contents[-1]["parts"].extend(image_parts)
 
-    session = await groq_session()
     payload = {
         "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block)}]},
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": 2048, "thinkingConfig": {"thinkingLevel": "minimal"}, "temperature": 0.9},
+        # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
+        # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
+        # gemini_generate() drops the field entirely if a model rejects it.
+        "generationConfig": {"maxOutputTokens": 2048, "thinkingConfig": {"thinkingLevel": "low"}, "temperature": 0.9},
     }
-    headers = {"x-goog-api-key": GEMINI_API_KEY}
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with session.post(GEMINI_URL, json=payload, headers=headers, timeout=timeout) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(f"Gemini API {resp.status}: {data}")
-        try:
-            candidate = data["candidates"][0]
-            parts = (candidate.get("content") or {}).get("parts") or []
-            reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
-        except (KeyError, IndexError, TypeError, AttributeError):
-            candidate = None
-            reply_text = ""
-        if not reply_text:
-            # blocked prompt (promptFeedback), safety finishReason, empty parts, etc.
-            log.warning(
-                "Gemini returned no text (HTTP %s, finishReason=%s): %s",
-                resp.status, (candidate or {}).get("finishReason"), data,
-            )
-        return reply_text
+    data = await gemini_generate(payload)
+    try:
+        candidate = data["candidates"][0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
+        candidate = None
+        reply_text = ""
+    if not reply_text:
+        # blocked prompt (promptFeedback), safety finishReason, empty parts, etc.
+        log.warning(
+            "Gemini returned no text (finishReason=%s): %s",
+            (candidate or {}).get("finishReason"), data,
+        )
+    return reply_text
+
+async def think_search(channel_id, diary_block=""):
+    """Web-grounded brain for questions about current events.
+
+    Uses GEMINI_SEARCH_MODEL (default gemini-2.5-flash): Google Search
+    grounding is free-tier on that model with its own daily quota, while the
+    Gemini 3 models only ground on the paid tier - so searches never eat the
+    chat model's quota. Raises on any failure; the caller falls back to the
+    normal brain.
+    """
+    contents = []
+    for author, content in history[channel_id]:
+        if author == BOT_NAME:
+            role, text = "model", content
+        else:
+            role, text = "user", f"{author}: {content}"
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n" + text
+        else:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    while contents and contents[0]["role"] != "user":
+        contents.pop(0)
+    if not contents:
+        return ""
+    payload = {
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_HINT}]},
+        "contents": contents,
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.9},
+    }
+    data = await gemini_generate(payload, url=GEMINI_SEARCH_URL)
+    try:
+        candidate = data["candidates"][0]
+        parts = (candidate.get("content") or {}).get("parts") or []
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
 
 async def think(channel_id, diary_block="", image_parts=None):
-    """Gemini is the main brain; Groq is used only if no GEMINI_API_KEY is set.
+    """Gemini is the main brain; Groq is the fallback.
 
-    image_parts (Gemini only) are inline_data parts for the current turn;
-    the Groq fallback ignores them and replies text-only.
+    Groq is used when no GEMINI_API_KEY is set, or when the Gemini call itself
+    fails (429/503/network) and a GROQ_API_KEY is available. An empty Gemini
+    answer is not retried on Groq (usually a safety block, which Groq would
+    likely also block). image_parts (Gemini only) are ignored by the Groq
+    fallback, which replies text-only.
     """
     if GEMINI_API_KEY:
-        return await think_gemini(channel_id, diary_block, image_parts)
+        try:
+            return await think_gemini(channel_id, diary_block, image_parts)
+        except Exception as e:
+            if not GROQ_API_KEY:
+                raise
+            log.warning("Gemini brain failed, falling back to Groq: %s", e)
     return await think_groq(channel_id, diary_block)
 
 @client.event
@@ -437,6 +609,7 @@ async def on_message(message):
         _forget_epoch[user_id] = _forget_epoch.get(user_id, 0) + 1
         _pending.pop(user_id, None)
         _since_extract.pop(user_id, None)
+        _save_pending.discard(user_id)
         diary.forget(user_id)
         try:
             await message.reply(FORGET_REPLY, mention_author=False)
@@ -467,7 +640,20 @@ async def on_message(message):
                 log.warning("Image collection failed: %s", e)
                 image_parts = []
         try:
-            reply = await think(message.channel.id, diary_block, image_parts)
+            if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
+                # current-info question: answer from a live web search; any
+                # problem (error, quota, empty) just falls back to the
+                # normal brain, so search can never break replying
+                try:
+                    mark_search_used()
+                    reply = await think_search(message.channel.id, diary_block)
+                    if not reply:
+                        raise RuntimeError("grounded search returned no text")
+                except Exception as e:
+                    log.warning("Grounded search failed, replying without it: %s", e)
+                    reply = await think(message.channel.id, diary_block, image_parts)
+            else:
+                reply = await think(message.channel.id, diary_block, image_parts)
             if not reply:
                 reply = EMPTY_REPLY_FALLBACK
         except Exception as e:
@@ -489,7 +675,7 @@ async def on_message(message):
         buf.append((speaker, content[:300]))
         buf.append((BOT_NAME, reply[:300]))
         del buf[:-12]  # keep at most the last 6 exchanges
-        maybe_schedule_extraction(user_id, speaker, content)
+        maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
 
