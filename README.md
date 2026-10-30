@@ -13,6 +13,11 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
 - Replies when someone **@mentions her**, **replies to her message**, or says "**kristy**"
 - Remembers the last 20 messages per channel, so conversations feel continuous
 - Sends a random GIF for: hi/hello, good morning, good night, hype/pog, sad, lol, and gacha/pulls/luck
+- Has GIFs for **every playable Genshin character (124 total)**: ask "send a furina gif",
+  or just mention a character by name and she may drop one (one per message, with a
+  cooldown so it never spams). Short "NEUVILLETTE!!" hype gets a gif instantly, no AI call
+- Adds an **emoji reaction** to genuinely shocking, dark, hilarious or wholesome messages -
+  rarely, never on routine chat (needs the **Add Reactions** permission)
 - Knows Genshin Impact (characters, banners, resin, artifacts, 50/50 pain) and talks like a player
 
 ## Setup (one time)
@@ -21,7 +26,11 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
    - Your application -> **Bot** -> copy the **token** (Reset Token if needed)
    - Same page, scroll down -> switch ON **Message Content Intent** (required!)
    - **OAuth2** -> scope `bot`, permissions `Send Messages` + `Read Message History`
-     -> open the generated URL to invite her to your server
+     + `Add Reactions` -> open the generated URL to invite her to your server
+     (already invited her without `Add Reactions`? No re-invite needed - that permission
+     is on for everyone by default. Only if your server disabled it for @everyone,
+     re-invite with the new URL or allow it for her role. Without it she just skips
+     reacting and keeps working.)
 2. **Gemini** (main brain): make a free API key at https://aistudio.google.com -> Get API key.
    (Optional fallback: a Groq key from https://console.groq.com - used if `GEMINI_API_KEY`
    is not set, or if the Gemini call itself fails, so a rate limit never leaves her speechless.)
@@ -113,12 +122,17 @@ likes, running jokes and things they asked her to remember. She uses it naturall
 ## Web search (live answers)
 
 When a message clearly asks about something current - next/upcoming banner, redeem codes,
-maintenance, release dates, "search kar...", "pata kar...", weather, etc. - she answers from a
-live Google Search instead of guessing. Casual chatting never triggers a search.
+maintenance, release dates, "search kar...", "pata kar...", weather, etc. - she searches the
+web and answers from fresh results instead of guessing. Casual chatting never triggers a search.
 
-- Searches run on a separate model, `GEMINI_SEARCH_MODEL` (default `gemini-2.5-flash`). Google
-  Search grounding is free-tier on gemini-2.5-flash (500 grounded requests/day) but NOT on the
-  Gemini 3 models, so searches never eat your chat model's daily quota.
+- Searches go through **Tavily** (`SEARCH_PROVIDER=tavily`, the default): free, no credit card,
+  plain HTTPS. It works **out of the box with no key** (Tavily's keyless mode). For higher,
+  more reliable limits, make a free key at https://tavily.com (1,000 searches/month free,
+  no card) and set `SEARCH_API_KEY`.
+- The search results are summarized by her normal chat model in her normal voice - a search
+  costs one Tavily call plus one ordinary chat-model call. No special grounded model needed
+  (Google retired free-tier Gemini grounding, and gemini-2.5-flash is no longer served to
+  new projects).
 - A client-side cap (`SEARCH_MAX_PER_DAY`, default 25) limits search calls per day, resetting at
   UTC midnight. Past the cap she just answers normally.
 - Fully fail-open: if the search call errors, is over quota, or returns nothing, she replies
@@ -128,9 +142,9 @@ live Google Search instead of guessing. Casual chatting never triggers a search.
 
 - **Personality**: edit `persona.py` (it's plain English, no code)
 - **GIFs**: add/remove URLs in `gifs.py`, or add new keyword triggers in `bot.py` (`GIF_TRIGGERS`)
-- **Model**: set `GEMINI_MODEL` (default `gemini-3.8-flash`; the request config adapts if a model
+- **Model**: set `GEMINI_MODEL` (default `gemini-3.5-flash-lite`; the request config adapts if a model
   rejects an option, so switching models can't silently break her). Only on the Groq fallback:
-  `GROQ_MODEL` (default `openai/gpt-oss-120b`). Web search uses `GEMINI_SEARCH_MODEL` (see above)
+  `GROQ_MODEL` (default `openai/gpt-oss-120b`). Web search uses Tavily (see above)
 - **Name**: set `BOT_NAME` and she responds to the new name instead
 
 ## Files
@@ -140,7 +154,8 @@ live Google Search instead of guessing. Casual chatting never triggers a search.
 | `bot.py` | all the logic: when to reply, memory, GIF triggers |
 | `persona.py` | her personality (edit this to change it) |
 | `diary.py` | per-member memory (diary files, merge, forget) |
-| `gifs.py` | the GIF library (every URL verified working) |
+| `gifs.py` | the GIF library (1037 URLs, every one verified working) |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
 | `.env.example` | which environment variables she needs |
+
