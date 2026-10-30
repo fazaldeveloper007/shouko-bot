@@ -173,6 +173,18 @@ FALLBACK_LINES = [
 # What she says when the AI brain answers with nothing at all (empty completion)
 EMPTY_REPLY_FALLBACK = "umm mera dimaag ek second ke liye blank ho gaya 🥺 phir se bologe?"
 
+# What she says when someone asks for a character's gif. Canned lines, not an
+# AI call: a gif request costs zero API calls, and she can never claim she
+# "can't send gifs" while literally sending one.
+CHARACTER_GIF_LINES = [
+    "ye le 📦",
+    "lo ji, specially tumhare liye 💗",
+    "yahan, pakdo 🎁",
+    "ek gif aa gaya, enjoy karo ✨",
+    "here you go~ 💕",
+    "lijo, tumhara favourite 😌",
+]
+
 # Keyword -> GIF category. First match wins, so order matters.
 GIF_TRIGGERS = [
     (r"\b(good\s*morning|gm|ohayo|mornings)\b", "good_morning"),
@@ -627,39 +639,43 @@ async def on_message(message):
 
     character = detect_character_gif(content)
     if character:
+        # gif request: send the gif with a short canned line and skip the AI
+        # brain entirely - zero API calls, and no chance of a hallucinated
+        # "I can't send gifs" paragraph alongside the gif
         gif_url = random.choice(CHARACTER_GIFS[character]["gifs"])
+        reply = random.choice(CHARACTER_GIF_LINES)
     else:
         category = detect_gif_category(content)
         gif_url = random.choice(GIFS[category]) if category and GIFS.get(category) else None
 
-    async with message.channel.typing():
-        image_parts = []
-        if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
-            try:
-                image_parts = await collect_image_parts(message)
-            except Exception as e:
-                log.warning("Image collection failed: %s", e)
-                image_parts = []
-        try:
-            if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
-                # current-info question: answer from a live web search; any
-                # problem (error, quota, empty) just falls back to the
-                # normal brain, so search can never break replying
+        async with message.channel.typing():
+            image_parts = []
+            if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
                 try:
-                    mark_search_used()
-                    reply = await think_search(message.channel.id, diary_block)
-                    if not reply:
-                        raise RuntimeError("grounded search returned no text")
+                    image_parts = await collect_image_parts(message)
                 except Exception as e:
-                    log.warning("Grounded search failed, replying without it: %s", e)
+                    log.warning("Image collection failed: %s", e)
+                    image_parts = []
+            try:
+                if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
+                    # current-info question: answer from a live web search; any
+                    # problem (error, quota, empty) just falls back to the
+                    # normal brain, so search can never break replying
+                    try:
+                        mark_search_used()
+                        reply = await think_search(message.channel.id, diary_block)
+                        if not reply:
+                            raise RuntimeError("grounded search returned no text")
+                    except Exception as e:
+                        log.warning("Grounded search failed, replying without it: %s", e)
+                        reply = await think(message.channel.id, diary_block, image_parts)
+                else:
                     reply = await think(message.channel.id, diary_block, image_parts)
-            else:
-                reply = await think(message.channel.id, diary_block, image_parts)
-            if not reply:
-                reply = EMPTY_REPLY_FALLBACK
-        except Exception as e:
-            log.warning("AI brain error: %s", e)
-            reply = random.choice(FALLBACK_LINES)
+                if not reply:
+                    reply = EMPTY_REPLY_FALLBACK
+            except Exception as e:
+                log.warning("AI brain error: %s", e)
+                reply = random.choice(FALLBACK_LINES)
 
     reply = reply[:MAX_REPLY_CHARS]
     history[message.channel.id].append((BOT_NAME, reply))
@@ -679,4 +695,5 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
+
 
