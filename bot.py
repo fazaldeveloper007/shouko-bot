@@ -410,6 +410,23 @@ async def collect_image_parts(message):
             log.warning("Image download failed for %s: %s", url, e)
     return parts
 
+def ping_reply_text(user_id, text):
+    """Add exactly one explicit ping for the member this reply is for.
+
+    Strip mention syntax from generated/canned text first, so a reply cannot
+    accidentally ping someone else or duplicate the intended member mention.
+    """
+    text = re.sub(r"<@!?\d+>|<@&\d+>|@everyone|@here", "", text or "", flags=re.IGNORECASE).strip()
+    return f"<@{user_id}>" + (f" {text}" if text else "")
+
+
+def reply_mentions(message):
+    """Allow only the addressed member to be pinged, never roles/everyone."""
+    return discord.AllowedMentions(
+        users=[message.author], roles=False, everyone=False, replied_user=False
+    )
+
+
 def should_respond(message):
     """Reply when @mentioned, replied to, or name-dropped."""
     if client.user in message.mentions:
@@ -770,7 +787,11 @@ async def on_message(message):
         _save_pending.discard(user_id)
         diary.forget(user_id)
         try:
-            await message.reply(FORGET_REPLY, mention_author=False)
+            await message.reply(
+                ping_reply_text(message.author.id, FORGET_REPLY),
+                mention_author=False,
+                allowed_mentions=reply_mentions(message),
+            )
         except Exception:
             log.exception("Failed to send forget reply in channel %s", message.channel.id)
         return
@@ -854,7 +875,11 @@ async def on_message(message):
     stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
     history[message.channel.id].append((BOT_NAME, stored_reply))
     try:
-        await message.reply(reply, mention_author=False)
+        await message.reply(
+            ping_reply_text(message.author.id, reply),
+            mention_author=False,
+            allowed_mentions=reply_mentions(message),
+        )
         if gif_url:
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
         await try_reaction(message, reaction)
@@ -870,6 +895,5 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
-
 
 
