@@ -138,6 +138,19 @@ CHARACTER_GIFS = {
             "https://media.tenor.com/S_lY1dwkjowAAAAM/mitya-genshin-impact-genshin-impact-mitya.gif",
         ],
     },
+    "zibai": {
+        "aliases": ["zibai", "zi bai", "zybau", "white horse adeptus", "white horse"],
+        "gifs": [
+            "https://media.tenor.com/-g_rDJ4Eu0cAAAAM/zibai-zibai-genshin.gif",
+            "https://media.tenor.com/Kb3A8kAH5UcAAAAM/zibai-zibai-genshin-impact.gif",
+            "https://media.tenor.com/-kf6-PojorcAAAAM/genshin-impact-genshin.gif",
+            "https://media.tenor.com/Tx8poY5aqksAAAAM/genshin-impact-genshin.gif",
+            "https://media.tenor.com/6n4RXpHPAwUAAAAM/zybau-zibai.gif",
+            "https://media.tenor.com/FeGKzImQsx8AAAAM/zibai-genshin-impact.gif",
+            "https://media.tenor.com/TDDhqrtD5_sAAAAM/low-cortisol-zibai.gif",
+            "https://media.tenor.com/HjsQ-c0q_2IAAAAM/zibai.gif",
+        ],
+    },
     "tsaritsa": {
         "aliases": ["tsaritsa", "the tsaritsa", "cryo archon"],
         "gifs": [
@@ -270,3 +283,4 @@ CHARACTER_GIFS = {
         ],
     },
 }
+
