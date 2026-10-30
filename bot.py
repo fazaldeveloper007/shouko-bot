@@ -150,6 +150,8 @@ SEARCH_RE = re.compile(
     r"|\b(?:upcoming|future|next|coming|leaks?)\b.{0,50}\b(?:genshin|version|v?\d+\.\d+|patch|banner|update)\b"
     r"|\b(?:upcoming|future|next|coming)\b.{0,40}\b(?:v?\d+\.\d+(?:\.\d+)?|version|patch)\b"
     r"|\b(?:leaks?|rumors?)\b.{0,30}\b(?:for|about|of|on)?\s*v?\d+\.\d+(?:\.\d+)?\b"
+    r"|\bv?\d+\.\d+(?:\.\d+)?\s*(?:leaks?|rumors?|updates?|patch|banners?|release|news)\b"
+    r"|\b(?:genshin|gi|hsr|honkai|star\s*rail|wuwa|wuthering|zzz|zenless)\b.{0,25}\bv?\d+\.\d+(?:\.\d+)?\b"
     r"|\b(?:upcoming|future|next)\s+in\s+v?\d+\.\d+(?:\.\d+)?\b"
     r"|\b(?:genshin\s+)?(?:version|patch)\s*v?\d+\.\d+(?:\.\d+)?\b"
     r"|\b(?:in|for)\s+v?\d+\.\d+(?:\.\d+)?\b"
@@ -165,6 +167,100 @@ SEARCH_RE = re.compile(
 def looks_like_search(text):
     return bool(SEARCH_RE.search(text or ""))
 
+# --- Search query construction -------------------------------------------
+# Members write things like "Ek baat batao 7.2 mei kya kya aa rha hai? Kristy
+# search karo". Sending that whole sentence to the search API returns junk
+# (NCERT solutions, random reels). So the query is rebuilt from topical
+# tokens only: function words, politeness and search-command phrasing are
+# dropped, version numbers are preserved, and a "Genshin Impact" anchor is
+# prepended when the topic is clearly the game but no game is named.
+_QUERY_STOPWORDS = frozenset(
+    # Hinglish function words / phrasing (they poison web queries)
+    "kya hai hain ho hoga hogi honge hun hu mein mei me mai ka ki ke ko se pe "
+    "par tak aur ya toh to bhi hi nahi na mat ek baat abhi ab kab kaha kahan "
+    "kyu kyun kaun kitna kitni kitne bata batao bataiye batao bol bolo suna "
+    "suno sunao dikha dikhao dikha do dekh dekho dekha jaa jao ja rha rahi "
+    "raha rahe rhe aa aayi aaya aayega aayegi aane wala wali wale gaya gai "
+    "tha thi the karo kar karke kardo karna karna kare krega kregi dena do "
+    "diya chahiye chahta chahti chahata mujhe meri mera hum humein apna apni "
+    "tum tumhe tumhari tumhara please plz pliss yar yaar bhai bro "
+    # English function words / politeness
+    "a an the is are was were be been being am what whats which who whom when "
+    "where why how can could should would will shall may might do does did "
+    "done please plz try tell me show give find check about of on in at for "
+    "to from with by and or not no yes you your ya u it its this that these "
+    "those there here out up just really very much some any all ek "
+    # search-command vocabulary itself (never part of the query)
+    "search searching searched google googling browse browsing internet net "
+    "web online pata dhundh dhundo dhundho lookup look lookup".split()
+)
+
+_GENSHIN_TOPIC_RE = re.compile(
+    r"(genshin|hoyoverse|mihoyo|banner|leaks?|primogems?|redeem|patch|"
+    r"livestream|special\s+program|natlan|snezhnaya|nod.?krai|fontaine|"
+    r"liyue|inazuma|sumeru|mondstadt|tsaritsa|fatui|harbinger|abyss|spiral|"
+    r"gacha|pity|wish|wishes|artifact|build|constellation|c\d\b|weapon|"
+    r"banner|archon|resin|teapot|serenitea)",
+    re.IGNORECASE,
+)
+_VERSION_TOKEN_RE = re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b")
+_WORD_TOKEN_RE = re.compile(r"[a-z][a-z0-9'._-]*")
+
+def build_search_query(text):
+    """Turn a raw member message into a focused web-search query."""
+    t = NAME_RE.sub(" ", (text or "").lower())
+    versions = [v.lstrip("v") for v in _VERSION_TOKEN_RE.findall(t)]
+    words = _WORD_TOKEN_RE.findall(t)
+    kept = []
+    for w in words:
+        w = w.strip(".'-_")
+        if len(w) < 2 or w in _QUERY_STOPWORDS:
+            continue
+        if w in versions:  # already captured as a version token
+            continue
+        kept.append(w)
+    query_words = kept + [v for v in versions if v not in kept]
+    topic_is_game = bool(versions) or bool(_GENSHIN_TOPIC_RE.search(t))
+    if not topic_is_game:
+        # a named character also anchors the topic to the game
+        lowered = t
+        topic_is_game = any(
+            re.search(rf"\b{re.escape(name)}\b", lowered) for name in CHARACTER_GIFS
+        )
+    if topic_is_game and not any(
+        g in query_words for g in ("genshin", "impact", "hsr", "honkai", "wuwa", "wuthering", "zenless", "zzz")
+    ):
+        query_words.insert(0, "impact")
+        query_words.insert(0, "genshin")
+    return " ".join(query_words).strip()
+
+def search_query_for(channel_id):
+    """Newest member message with real topical content -> (query, question).
+
+    Search-command-only messages ("search karo", "browse karo") carry no
+    topic, so walk back the channel history for the actual question.
+    """
+    for author, content in reversed(history[channel_id]):
+        if author == BOT_NAME:
+            continue
+        q = build_search_query(content)
+        if len(q) >= 3:
+            return q, content
+    return "", ""
+
+def current_context():
+    """Ground her in real time so she stops quoting stale training data."""
+    today = time.strftime("%A, %d %B %Y")
+    return (
+        f"\n\nCURRENT DATE: {today}. GAME TIMELINE: your training data is "
+        "old. For reference, late 2026 is Genshin Impact's 7.x era (the "
+        "Snezhnaya cycle); 5.x (Natlan) was 2024-25, 6.x came after that. "
+        "Never state the current version, banners, leaks or news from "
+        "memory. If no web search results were provided for a "
+        "current-events question, say you are not sure and offer to search, "
+        "instead of guessing."
+    )
+
 # Always tell both supported brains that live search exists and how the
 # runtime activates it. This prevents the model from denying the capability.
 SEARCH_CAPABILITY = (
@@ -179,10 +275,15 @@ SEARCH_CAPABILITY = (
 
 # Extra instruction appended only for grounded (web-search) replies
 SEARCH_HINT = (
-    "\n\nThe member is asking about something current or time-sensitive, so "
-    "fresh web search results are included below. Answer from them in your "
-    "normal voice, with the latest accurate info. If the results do not really "
-    "answer the question, say you could not find it instead of guessing."
+    "\n\nThe member asked for a web search. Fresh results are below, but the "
+    "search query was auto-built from their message, so judge the results "
+    "against their ACTUAL question. Answer ONLY from what the results say, in "
+    "your normal voice, and naturally mention where the info came from (site "
+    "or source name). If the results are off-topic or do not really answer "
+    "the question (random unrelated pages, wrong topic), honestly say the "
+    "search did not find the right info. NEVER fill the gap from your own "
+    "memory about current or future game versions, banners, leaks or news - "
+    "your training data is outdated and will be wrong."
 )
 
 _search_day = ""
@@ -635,7 +736,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -685,7 +786,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -757,11 +858,14 @@ def latest_question(channel_id):
 
 async def think_search(channel_id, diary_block="", extra_system="", image_parts=None):
     """Use live web results, then answer in persona; errors are handled by caller."""
-    query = latest_question(channel_id)
+    query, question = search_query_for(channel_id)
     if not query:
         raise RuntimeError("nothing to search for")
     digest = await fetch_search_results(query)
-    search_block = f"{SEARCH_HINT}\n\nWeb search results for \"{query}\":\n{digest}"
+    search_block = (
+        f"{SEARCH_HINT}\n\nMember's actual question: \"{question}\"\n"
+        f"(search query used: \"{query}\")\nWeb search results:\n{digest}"
+    )
     return await think(channel_id, diary_block, image_parts=image_parts,
                        extra_system=extra_system + search_block)
 
