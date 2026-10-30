@@ -312,9 +312,9 @@ async def gemini_generate(payload, url=GEMINI_URL):
             if resp.status == 200:
                 return data
             if resp.status == 400 and generation:
-                err = str(data)
+                err = str(data).lower().replace("_", "")
                 for field in ("thinkingConfig", "responseMimeType"):
-                    if field in generation and field in err:
+                    if field in generation and field.lower() in err:
                         log.warning("Model rejected generationConfig.%s; retrying without it", field)
                         generation.pop(field)
                         break
@@ -501,6 +501,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None):
 
     payload = {
         "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block)}]},
+        "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
         # gemini_generate() drops the field entirely if a model rejects it.
