@@ -31,6 +31,22 @@ SELF_INFO_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit "please remember/save this" requests. These get a guaranteed,
+# confirmed save in bot.py: an immediate extraction (bypassing the routine
+# cooldown), one retry if it fails, and an in-channel confirmation once the
+# fact is actually on disk.
+SAVE_RE = re.compile(
+    r"(\byaad\s+rakh\w*|\byaad\s+rakhna\b|\byaad\s+kar\s+(lena|lo|liyo)\b"
+    r"|\byaad\s+karna\b|\byaad\s+rakhti\b"
+    r"|\bremember\b|\b(dont|don't|do\s+not)\s+forget\b"
+    r"|\bnote\s+(kar|kar\s+lo|karo|karna|down)\b|\bnoted?\s+kar\s+lo\b"
+    r"|\blikh\s+(le|lo|lena|dena|dijiye|do)\b|\blikhna\b"
+    r"|\bsave\s+(kar|karo|kar\s+lo|karna|this|it|karlo)\b|\bsave\s+karlo\b"
+    r"|\bkeep\s+in\s+mind\b|\bdimaag\s+me(in|)\s+rakh\w*\b"
+    r"|\bmeri\s+diary\s+mein\b|\byaadein\s+mein\s+rakh\w*\b)",
+    re.IGNORECASE,
+)
+
 # "forget me" style requests
 FORGET_RE = re.compile(
     r"(\bforget\s+(me|about\s+me|everything(\s+about\s+me)?|my\s+(diary|memory|memories|data|info))\b"
@@ -55,6 +71,10 @@ def wants_forget(text):
 
 def looks_like_self_info(text):
     return bool(SELF_INFO_RE.search(text or ""))
+
+
+def looks_like_save_request(text):
+    return bool(SAVE_RE.search(text or ""))
 
 
 def clean_fact(text):
@@ -185,10 +205,17 @@ def prompt_block(diary, display_name=""):
 
 
 def parse_extraction(raw):
-    """Parse the model's extraction output -> (name, [facts]). Tolerant of code fences/chatter."""
+    """Parse the model's extraction output -> (name, [facts], ok).
+
+    ok is False when the answer could not be read as JSON at all, so callers
+    can tell "the model glitched" apart from "nothing new worth saving".
+    Tolerant of code fences and chatter around the JSON.
+    """
     if not isinstance(raw, str):
-        return None, []
+        return None, [], False
     text = raw.strip()
+    if not text:
+        return None, [], False
     data = None
     for candidate in (text, *re.findall(r"\{.*\}|\[.*\]", text, re.DOTALL)):
         try:
@@ -199,11 +226,11 @@ def parse_extraction(raw):
     if isinstance(data, list):
         data = {"facts": data}
     if not isinstance(data, dict):
-        return None, []
+        return None, [], False
     facts = data.get("facts")
     facts = [f for f in facts if isinstance(f, str)] if isinstance(facts, list) else []
     name = data.get("name") if isinstance(data.get("name"), str) else None
-    return name, facts[:8]
+    return name, facts[:8], True
 
 
 def extraction_prompt(diary, display_name, exchanges):
