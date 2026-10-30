@@ -23,7 +23,8 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
    - **OAuth2** -> scope `bot`, permissions `Send Messages` + `Read Message History`
      -> open the generated URL to invite her to your server
 2. **Gemini** (main brain): make a free API key at https://aistudio.google.com -> Get API key.
-   (Optional fallback: a Groq key from https://console.groq.com is only used if `GEMINI_API_KEY` is not set.)
+   (Optional fallback: a Groq key from https://console.groq.com - used if `GEMINI_API_KEY`
+   is not set, or if the Gemini call itself fails, so a rate limit never leaves her speechless.)
 
 ## Run on Android with Termux (free, your spare phone)
 
@@ -100,15 +101,36 @@ likes, running jokes and things they asked her to remember. She uses it naturall
 - She learns in the background after replying (never delays a reply). To save the free-tier quota
   she runs one extra small AI call per member roughly every 6 messages to her, or sooner when a
   message sounds personal ("my main is...", "remember..."), with cooldowns between calls.
+- Tell her to remember something directly ("yaad rakhna...", "remember this", "likh lo") and she
+  saves it right away, skipping the cooldown: the fact is extracted and written to the diary file,
+  retried once if the first attempt fails (e.g. rate limit), and she confirms in the channel
+  ("likh liya 📔") only once it is actually saved. If every attempt fails she stays silent instead
+  of lying, and retries the save on your next message.
 - Each diary is capped at 40 short facts; the oldest are dropped when it is full.
 - Say "forget me" (or "delete my diary") to her and that diary file is deleted.
 - If a diary is missing or corrupt, she just chats normally. Set `MEMORY_DIR` to store diaries elsewhere.
+
+## Web search (live answers)
+
+When a message clearly asks about something current - next/upcoming banner, redeem codes,
+maintenance, release dates, "search kar...", "pata kar...", weather, etc. - she answers from a
+live Google Search instead of guessing. Casual chatting never triggers a search.
+
+- Searches run on a separate model, `GEMINI_SEARCH_MODEL` (default `gemini-2.5-flash`). Google
+  Search grounding is free-tier on gemini-2.5-flash (500 grounded requests/day) but NOT on the
+  Gemini 3 models, so searches never eat your chat model's daily quota.
+- A client-side cap (`SEARCH_MAX_PER_DAY`, default 25) limits search calls per day, resetting at
+  UTC midnight. Past the cap she just answers normally.
+- Fully fail-open: if the search call errors, is over quota, or returns nothing, she replies
+  with her normal brain as if search never happened.
 
 ## Make her yours
 
 - **Personality**: edit `persona.py` (it's plain English, no code)
 - **GIFs**: add/remove URLs in `gifs.py`, or add new keyword triggers in `bot.py` (`GIF_TRIGGERS`)
-- **Model**: set `GEMINI_MODEL` (default `gemini-3.8-flash`). Only on the Groq fallback: `GROQ_MODEL` (default `openai/gpt-oss-120b`)
+- **Model**: set `GEMINI_MODEL` (default `gemini-3.8-flash`; the request config adapts if a model
+  rejects an option, so switching models can't silently break her). Only on the Groq fallback:
+  `GROQ_MODEL` (default `openai/gpt-oss-120b`). Web search uses `GEMINI_SEARCH_MODEL` (see above)
 - **Name**: set `BOT_NAME` and she responds to the new name instead
 
 ## Files
