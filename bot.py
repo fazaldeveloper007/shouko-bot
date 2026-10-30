@@ -12,12 +12,15 @@ Config (environment variables):
                   only when GEMINI_API_KEY is not set
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
   BOT_NAME        (optional) her name, default "Kristy"
+  MEMORY_DIR      (optional) where member diaries live, default ./memory
 """
 
 import os
 import re
 import random
+import asyncio
 import logging
+import time
 from collections import defaultdict, deque
 
 import aiohttp
@@ -25,6 +28,7 @@ import discord
 
 from persona import SYSTEM_PROMPT
 from gifs import GIFS, CHARACTER_GIFS
+import diary
 
 # Local dev convenience: load a .env file if one exists
 try:
@@ -70,6 +74,22 @@ async def groq_session():
     if _groq_session is None or _groq_session.closed:
         _groq_session = aiohttp.ClientSession()
     return _groq_session
+
+# Diary extraction cadence (free-tier friendly): at most one extra AI call per
+# member every EXTRACT_EVERY addressed messages, or sooner when a message looks
+# like it contains personal info, but never more often than the cooldowns.
+EXTRACT_EVERY = 6          # addressed messages per member between routine extractions
+EXTRACT_MEMBER_GAP = 90    # seconds: min gap between extractions for one member
+EXTRACT_GLOBAL_GAP = 15    # seconds: min gap between any two extractions
+FORGET_REPLY = "done 🥺 maine tumhari diary band karke hata di, ab mujhe tumhare baare mein kuch yaad nahi. chahoge toh phir se shuru kar sakte hain 💗"
+
+_pending = {}        # user_id -> list of (speaker, text) since last extraction
+_since_extract = {}  # user_id -> addressed messages since last extraction
+_last_extract = {}   # user_id -> time of last extraction
+_forget_epoch = {}   # user_id -> bumped on "forget me" so in-flight extractions don't re-save
+_extract_busy = False
+_last_global_extract = 0.0
+_bg_tasks = set()
 
 # Short memory per channel so conversations feel continuous
 history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
@@ -144,9 +164,93 @@ def should_respond(message):
         return True
     return False
 
-async def think_groq(channel_id):
+def with_diary(prompt, diary_block):
+    return f"{prompt}\n\n{diary_block}" if diary_block else prompt
+
+async def call_extractor(prompt):
+    """One small, low-temperature AI call that returns raw text (JSON expected)."""
+    session = await groq_session()
+    timeout = aiohttp.ClientTimeout(total=30)
+    if GEMINI_API_KEY:
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 600, "temperature": 0.2,
+                                 "responseMimeType": "application/json"},
+        }
+        async with session.post(GEMINI_URL, json=payload,
+                                headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=timeout) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status != 200:
+                raise RuntimeError(f"Gemini API {resp.status}: {data}")
+            parts = ((data["candidates"][0].get("content") or {}).get("parts")) or []
+            return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 600,
+        "temperature": 0.2,
+    }
+    async with session.post(GROQ_CHAT_URL, json=payload,
+                            headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=timeout) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise RuntimeError(f"Groq API {resp.status}: {data}")
+        return data["choices"][0]["message"]["content"] or ""
+
+async def update_diary(user_id, display_name, exchanges, epoch):
+    """Background: extract durable facts from recent exchanges and merge them. Never raises."""
+    global _extract_busy
+    try:
+        mem = diary.load(user_id)
+        raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
+        name, facts = diary.parse_extraction(raw)
+        if _forget_epoch.get(user_id, 0) != epoch:
+            return  # member asked to be forgotten while we were thinking
+        if not facts and not name:
+            return
+        mem = diary.load(user_id)  # re-read: it may have changed meanwhile
+        diary.merge(mem, facts, name=name)
+        if diary.save(user_id, mem):
+            log.info("Diary updated for %s (+%d facts, %d total)", user_id, len(facts), len(mem["facts"]))
+    except Exception as e:
+        log.warning("Diary extraction failed for %s: %s", user_id, e)
+    finally:
+        _extract_busy = False
+
+def maybe_schedule_extraction(user_id, display_name, text):
+    """Decide (cheaply, no AI call) whether to run an extraction now. Never raises."""
+    global _extract_busy, _last_global_extract
+    try:
+        _since_extract[user_id] = _since_extract.get(user_id, 0) + 1
+        now = time.monotonic()
+        personal = diary.looks_like_self_info(text)
+        due = personal or _since_extract[user_id] >= EXTRACT_EVERY
+        if not due or _extract_busy:
+            return
+        if now - _last_extract.get(user_id, -1e9) < EXTRACT_MEMBER_GAP:
+            return
+        if now - _last_global_extract < EXTRACT_GLOBAL_GAP:
+            return
+        exchanges = list(_pending.get(user_id, []))
+        if not exchanges:
+            return
+        _pending[user_id] = []
+        _since_extract[user_id] = 0
+        _last_extract[user_id] = now
+        _last_global_extract = now
+        _extract_busy = True
+        task = asyncio.create_task(
+            update_diary(user_id, display_name, exchanges, _forget_epoch.get(user_id, 0))
+        )
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+    except Exception as e:
+        _extract_busy = False
+        log.warning("Could not schedule diary extraction: %s", e)
+
+async def think_groq(channel_id, diary_block=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block)}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -172,7 +276,7 @@ async def think_groq(channel_id):
             log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
         return reply_text
 
-async def think_gemini(channel_id):
+async def think_gemini(channel_id, diary_block=""):
     """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
     contents = []
     for author, content in history[channel_id]:
@@ -193,7 +297,7 @@ async def think_gemini(channel_id):
 
     session = await groq_session()
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block)}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": 500, "temperature": 0.9},
     }
@@ -218,11 +322,11 @@ async def think_gemini(channel_id):
             )
         return reply_text
 
-async def think(channel_id):
+async def think(channel_id, diary_block=""):
     """Gemini is the main brain; Groq is used only if no GEMINI_API_KEY is set."""
     if GEMINI_API_KEY:
-        return await think_gemini(channel_id)
-    return await think_groq(channel_id)
+        return await think_gemini(channel_id, diary_block)
+    return await think_groq(channel_id, diary_block)
 
 @client.event
 async def on_ready():
@@ -242,6 +346,28 @@ async def on_message(message):
     if not should_respond(message):
         return
 
+    user_id = message.author.id
+    speaker = message.author.display_name
+
+    # "forget me": delete this member's diary file, no AI call needed
+    if diary.wants_forget(content):
+        _forget_epoch[user_id] = _forget_epoch.get(user_id, 0) + 1
+        _pending.pop(user_id, None)
+        _since_extract.pop(user_id, None)
+        diary.forget(user_id)
+        try:
+            await message.reply(FORGET_REPLY, mention_author=False)
+        except Exception:
+            log.exception("Failed to send forget reply in channel %s", message.channel.id)
+        return
+
+    # load this member's diary (fail-open: any problem just means no diary block)
+    try:
+        diary_block = diary.prompt_block(diary.load(user_id), speaker)
+    except Exception as e:
+        log.warning("Diary load failed for %s: %s", user_id, e)
+        diary_block = ""
+
     character = detect_character_gif(content)
     if character:
         gif_url = random.choice(CHARACTER_GIFS[character]["gifs"])
@@ -251,7 +377,7 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
-            reply = await think(message.channel.id)
+            reply = await think(message.channel.id, diary_block)
             if not reply:
                 reply = EMPTY_REPLY_FALLBACK
         except Exception as e:
@@ -266,5 +392,13 @@ async def on_message(message):
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
     except Exception:
         log.exception("Failed to send reply in channel %s", message.channel.id)
+
+    # learn from this exchange in the background, after the reply is already out
+    if content and reply not in FALLBACK_LINES and reply != EMPTY_REPLY_FALLBACK:
+        buf = _pending.setdefault(user_id, [])
+        buf.append((speaker, content[:300]))
+        buf.append((BOT_NAME, reply[:300]))
+        del buf[:-12]  # keep at most the last 6 exchanges
+        maybe_schedule_extraction(user_id, speaker, content)
 
 client.run(DISCORD_TOKEN)
