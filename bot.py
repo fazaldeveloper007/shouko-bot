@@ -10,15 +10,17 @@ or pasted image links) and reacts to memes, screenshots and fanart.
 Config (environment variables):
   DISCORD_TOKEN   bot token from the Discord developer portal (required)
   GEMINI_API_KEY  API key from aistudio.google.com (main brain, free tier)
-  GEMINI_MODEL    (optional) Gemini model id, default gemini-3.8-flash
+  GEMINI_MODEL    (optional) Gemini model id, default gemini-3.5-flash-lite
   GROQ_API_KEY    (optional fallback) API key from console.groq.com, used when
                   GEMINI_API_KEY is not set or the Gemini call itself fails
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
   BOT_NAME        (optional) her name, default "Kristy"
   MEMORY_DIR      (optional) where member diaries live, default ./memory
-  GEMINI_SEARCH_MODEL (optional) model for web-search answers, default
-                  gemini-2.5-flash (Google Search grounding is free-tier here,
-                  unlike the Gemini 3 models, and uses its own daily quota)
+  SEARCH_PROVIDER (optional) web search provider, default "tavily"
+  SEARCH_API_KEY  (optional) Tavily API key from https://tavily.com (free tier:
+                  1,000 searches/month, no credit card). Without it Tavily's
+                  free keyless mode is used, so search works out of the box;
+                  the key just raises the limits and reliability
   SEARCH_MAX_PER_DAY  (optional) client-side cap on search calls, default 25
 """
 
@@ -50,11 +52,14 @@ log = logging.getLogger("kristy")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
-GEMINI_SEARCH_MODEL = os.getenv("GEMINI_SEARCH_MODEL", "gemini-2.5-flash")
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily").strip().lower()
+SEARCH_API_KEY = (os.environ.get("SEARCH_API_KEY") or "").strip()
+# Tavily search endpoint, called directly with aiohttp like everything else
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 try:
     SEARCH_MAX_PER_DAY = max(0, int(os.getenv("SEARCH_MAX_PER_DAY", "25")))
 except ValueError:
@@ -68,7 +73,6 @@ GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 # Gemini generateContent REST endpoint, also called directly with aiohttp (no
 # google SDK, so the Termux install stays pure-Python).
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-GEMINI_SEARCH_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent"
 
 if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
     raise SystemExit("Missing DISCORD_TOKEN or GEMINI_API_KEY (or GROQ_API_KEY). Set them as env vars (see .env.example).")
@@ -143,10 +147,10 @@ def looks_like_search(text):
 
 # Extra instruction appended only for grounded (web-search) replies
 SEARCH_HINT = (
-    "\n\nThe member is asking about something current or time-sensitive. "
-    "Use the google_search tool to look it up before answering, then reply in "
-    "your normal voice with the latest accurate info. If the search finds "
-    "nothing useful, say so honestly instead of guessing."
+    "\n\nThe member is asking about something current or time-sensitive, so "
+    "fresh web search results are included below. Answer from them in your "
+    "normal voice, with the latest accurate info. If the results do not really "
+    "answer the question, say you could not find it instead of guessing."
 )
 
 _search_day = ""
@@ -586,42 +590,68 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         )
     return reply_text
 
-async def think_search(channel_id, diary_block="", extra_system=""):
-    """Web-grounded brain for questions about current events.
+async def fetch_search_results(query):
+    """Ask the web about a query and return a compact digest for the brain.
 
-    Uses GEMINI_SEARCH_MODEL (default gemini-2.5-flash): Google Search
-    grounding is free-tier on that model with its own daily quota, while the
-    Gemini 3 models only ground on the paid tier - so searches never eat the
-    chat model's quota. Raises on any failure; the caller falls back to the
-    normal brain.
+    Tavily (free, no credit card): with SEARCH_API_KEY set the request uses
+    the account's 1,000 free monthly credits; without a key it uses Tavily's
+    free keyless mode, so search works out of the box. Raises on any failure -
+    the caller falls back to the normal brain, so search can never break her.
     """
-    contents = []
-    for author, content in history[channel_id]:
-        if author == BOT_NAME:
-            role, text = "model", content
-        else:
-            role, text = "user", f"{author}: {content}"
-        if contents and contents[-1]["role"] == role:
-            contents[-1]["parts"][0]["text"] += "\n" + text
-        else:
-            contents.append({"role": role, "parts": [{"text": text}]})
-    while contents and contents[0]["role"] != "user":
-        contents.pop(0)
-    if not contents:
-        return ""
-    payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + SEARCH_HINT}]},
-        "contents": contents,
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.9},
-    }
-    data = await gemini_generate(payload, url=GEMINI_SEARCH_URL)
-    try:
-        candidate = data["candidates"][0]
-        parts = (candidate.get("content") or {}).get("parts") or []
-        return "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
-    except (KeyError, IndexError, TypeError, AttributeError):
-        return ""
+    if SEARCH_PROVIDER != "tavily":
+        raise RuntimeError(f"unknown SEARCH_PROVIDER: {SEARCH_PROVIDER!r}")
+    payload = {"query": query, "max_results": 5, "search_depth": "basic",
+               "include_answer": True}
+    headers = {"Content-Type": "application/json"}
+    if SEARCH_API_KEY:
+        headers["Authorization"] = f"Bearer {SEARCH_API_KEY}"
+    else:
+        headers["X-Tavily-Access-Mode"] = "keyless"
+    session = await groq_session()
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with session.post(TAVILY_SEARCH_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        data = await resp.json(content_type=None)
+        if resp.status != 200:
+            raise RuntimeError(f"Tavily API {resp.status}: {data}")
+    answer = (data.get("answer") or "").strip()
+    lines = []
+    if answer:
+        lines.append(f"Quick answer: {answer}")
+    for r in (data.get("results") or [])[:5]:
+        if not isinstance(r, dict):
+            continue
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("content") or "").strip()
+        url = (r.get("url") or "").strip()
+        if title or snippet:
+            lines.append(f"- {title}: {snippet} ({url})".strip())
+    digest = "\n".join(lines).strip()
+    if not digest:
+        raise RuntimeError("search returned no usable results")
+    return digest[:3000]
+
+def latest_question(channel_id):
+    """The most recent non-Kristy message in this channel (the search query)."""
+    for author, content in reversed(history[channel_id]):
+        if author != BOT_NAME:
+            return content
+    return ""
+
+async def think_search(channel_id, diary_block="", extra_system=""):
+    """Web-informed brain for questions about current events.
+
+    Searches the web with the configured provider (Tavily by default), then
+    lets the normal chat model answer from those results in persona - so a
+    search costs one provider call plus one ordinary chat-model call, and no
+    special grounded model is needed. Raises on any failure; the caller falls
+    back to the normal brain.
+    """
+    query = latest_question(channel_id)
+    if not query:
+        raise RuntimeError("nothing to search for")
+    digest = await fetch_search_results(query)
+    search_block = f"{SEARCH_HINT}\n\nWeb search results for \"{query}\":\n{digest}"
+    return await think(channel_id, diary_block, extra_system=extra_system + search_block)
 
 async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
@@ -733,7 +763,7 @@ async def on_message(message):
                         log.warning("Image collection failed: %s", e)
                         image_parts = []
                 try:
-                    if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
+                    if not has_image and looks_like_search(content) and search_quota_left():
                         # current-info question: answer from a live web search; any
                         # problem (error, quota, empty) just falls back to the
                         # normal brain, so search can never break replying
@@ -741,9 +771,9 @@ async def on_message(message):
                             mark_search_used()
                             reply = await think_search(message.channel.id, diary_block, extra)
                             if not reply:
-                                raise RuntimeError("grounded search returned no text")
+                                raise RuntimeError("search returned no text")
                         except Exception as e:
-                            log.warning("Grounded search failed, replying without it: %s", e)
+                            log.warning("Web search failed, replying without it: %s", e)
                             reply = await think(message.channel.id, diary_block, image_parts, extra)
                     else:
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
