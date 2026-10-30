@@ -299,7 +299,7 @@ async def think_gemini(channel_id, diary_block=""):
     payload = {
         "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block)}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": 500, "temperature": 0.9},
+        "generationConfig": {"maxOutputTokens": 2048, "thinkingConfig": {"thinkingLevel": "minimal"}, "temperature": 0.9},
     }
     headers = {"x-goog-api-key": GEMINI_API_KEY}
     timeout = aiohttp.ClientTimeout(total=30)
@@ -402,3 +402,4 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content)
 
 client.run(DISCORD_TOKEN)
+
