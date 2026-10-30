@@ -90,6 +90,20 @@ The included `Dockerfile` works on any Docker host or container platform
 (Railway, Fly.io, a VPS, etc.): set `DISCORD_TOKEN` and `GEMINI_API_KEY` as
 environment variables and deploy.
 
+## Memory
+
+Kristy keeps a small private "diary" for every member: their preferred name, Genshin mains,
+likes, running jokes and things they asked her to remember. She uses it naturally in replies.
+
+- Each member's diary is one file, `memory/<discord_user_id>.json`, created automatically.
+  The `memory/` folder is gitignored, so `git pull` never conflicts and diaries are never committed.
+- She learns in the background after replying (never delays a reply). To save the free-tier quota
+  she runs one extra small AI call per member roughly every 6 messages to her, or sooner when a
+  message sounds personal ("my main is...", "remember..."), with cooldowns between calls.
+- Each diary is capped at 40 short facts; the oldest are dropped when it is full.
+- Say "forget me" (or "delete my diary") to her and that diary file is deleted.
+- If a diary is missing or corrupt, she just chats normally. Set `MEMORY_DIR` to store diaries elsewhere.
+
 ## Make her yours
 
 - **Personality**: edit `persona.py` (it's plain English, no code)
@@ -103,6 +117,7 @@ environment variables and deploy.
 |---|---|
 | `bot.py` | all the logic: when to reply, memory, GIF triggers |
 | `persona.py` | her personality (edit this to change it) |
+| `diary.py` | per-member memory (diary files, merge, forget) |
 | `gifs.py` | the GIF library (every URL verified working) |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
