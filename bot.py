@@ -2,7 +2,8 @@
 Kristy - a Genshin Impact Discord chat bot.
 
 She chats when you @her, reply to one of her messages, or say her name,
-and throws GIFs for greetings, hype moments and gacha pain.
+and throws GIFs for greetings, hype moments, gacha pain and character
+name mentions (she keeps gifs for every playable character).
 When Gemini is the brain she can also SEE images sent to her (attachments
 or pasted image links) and reacts to memes, screenshots and fanart.
 
@@ -230,6 +231,56 @@ def detect_character_gif(text):
         if rx.search(text):
             return name
     return None
+
+# A message that merely MENTIONS a character (no "gif" keyword) can also earn a
+# gif. One combined regex over every alias: the leftmost match wins (the
+# primary character of the message); ties go to the longest alias.
+_MENTION_ALIAS_MAP = {}
+for _name, _info in CHARACTER_GIFS.items():
+    for _alias in _info["aliases"]:
+        _MENTION_ALIAS_MAP[_alias.lower()] = _name
+# Aliases that double as everyday English words: fine for explicit gif
+# requests, too noisy as mention triggers (the server itself is "Gaming Verse").
+MENTION_SKIP_ALIASES = {"gaming"}
+_MENTION_RE = re.compile(
+    r"\b(" + "|".join(
+        re.escape(a)
+        for a in sorted(
+            (a for a in _MENTION_ALIAS_MAP if a not in MENTION_SKIP_ALIASES),
+            key=lambda a: -len(a),
+        )
+    ) + r")\b",
+    re.IGNORECASE,
+)
+
+MENTION_GIF_COOLDOWN = 90   # seconds between mention-triggered gifs per channel
+_last_mention_gif = {}      # channel_id -> monotonic time of the last one
+
+def detect_character_mention(text):
+    """Return the character key for a plain name mention (no "gif" keyword), else None."""
+    m = _MENTION_RE.search(text or "")
+    if not m:
+        return None
+    return _MENTION_ALIAS_MAP.get(m.group(1).lower())
+
+def mention_gif_allowed(channel_id):
+    return time.monotonic() - _last_mention_gif.get(channel_id, -1e9) >= MENTION_GIF_COOLDOWN
+
+def short_hype_message(text):
+    """True when the message is basically just a name or short hype about the
+    character ("NEUVILLETTE!!", "furina my queen"): a few words, no question."""
+    words = re.findall(r"[a-z0-9']+", (text or "").lower())
+    return 0 < len(words) <= 4
+
+def gif_note(desc):
+    """System-prompt note so the brain KNOWS a gif went out with this reply and
+    can never contradict it (the "I can't send gifs" bug)."""
+    return (
+        f"\n\n[Context: you are also sending a {desc} GIF in the channel along "
+        "with this reply - the member already sees it. You may react to it "
+        "naturally ('ye lo', 'look at her'), but never deny sending it or say "
+        "you cannot send gifs.]"
+    )
 
 def message_has_image(message):
     """True when the message carries an image attachment or an embedded image."""
@@ -460,9 +511,9 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
         _extract_busy = False
         log.warning("Could not schedule diary extraction: %s", e)
 
-async def think_groq(channel_id, diary_block=""):
+async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block)}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + extra_system}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -488,7 +539,7 @@ async def think_groq(channel_id, diary_block=""):
             log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
         return reply_text
 
-async def think_gemini(channel_id, diary_block="", image_parts=None):
+async def think_gemini(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
     contents = []
     for author, content in history[channel_id]:
@@ -512,7 +563,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None):
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block)}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -535,7 +586,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None):
         )
     return reply_text
 
-async def think_search(channel_id, diary_block=""):
+async def think_search(channel_id, diary_block="", extra_system=""):
     """Web-grounded brain for questions about current events.
 
     Uses GEMINI_SEARCH_MODEL (default gemini-2.5-flash): Google Search
@@ -559,7 +610,7 @@ async def think_search(channel_id, diary_block=""):
     if not contents:
         return ""
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + SEARCH_HINT}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + extra_system + SEARCH_HINT}]},
         "contents": contents,
         "tools": [{"google_search": {}}],
         "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.9},
@@ -572,7 +623,7 @@ async def think_search(channel_id, diary_block=""):
     except (KeyError, IndexError, TypeError, AttributeError):
         return ""
 
-async def think(channel_id, diary_block="", image_parts=None):
+async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
 
     Groq is used when no GEMINI_API_KEY is set, or when the Gemini call itself
@@ -583,12 +634,12 @@ async def think(channel_id, diary_block="", image_parts=None):
     """
     if GEMINI_API_KEY:
         try:
-            return await think_gemini(channel_id, diary_block, image_parts)
+            return await think_gemini(channel_id, diary_block, image_parts, extra_system)
         except Exception as e:
             if not GROQ_API_KEY:
                 raise
             log.warning("Gemini brain failed, falling back to Groq: %s", e)
-    return await think_groq(channel_id, diary_block)
+    return await think_groq(channel_id, diary_block, extra_system)
 
 @client.event
 async def on_ready():
@@ -638,47 +689,73 @@ async def on_message(message):
         diary_block = ""
 
     character = detect_character_gif(content)
+    gif_desc = None
     if character:
         # gif request: send the gif with a short canned line and skip the AI
         # brain entirely - zero API calls, and no chance of a hallucinated
         # "I can't send gifs" paragraph alongside the gif
         gif_url = random.choice(CHARACTER_GIFS[character]["gifs"])
+        gif_desc = f"{character} character"
         reply = random.choice(CHARACTER_GIF_LINES)
     else:
-        category = detect_gif_category(content)
-        gif_url = random.choice(GIFS[category]) if category and GIFS.get(category) else None
+        mention = detect_character_mention(content)
+        if mention and short_hype_message(content):
+            # the message is basically just the character's name or short hype
+            # about them: same zero-API short-circuit as an explicit gif request
+            gif_url = random.choice(CHARACTER_GIFS[mention]["gifs"])
+            gif_desc = f"{mention} character"
+            reply = random.choice(CHARACTER_GIF_LINES)
+        else:
+            # a plain name mention earns that character's gif (one per message,
+            # with a per-channel cooldown so multi-character chatter does not
+            # turn into gif spam); keyword mood gifs keep working as before
+            gif_url = None
+            if mention and mention_gif_allowed(message.channel.id):
+                gif_url = random.choice(CHARACTER_GIFS[mention]["gifs"])
+                gif_desc = f"{mention} character"
+                _last_mention_gif[message.channel.id] = time.monotonic()
+            else:
+                category = detect_gif_category(content)
+                if category and GIFS.get(category):
+                    gif_url = random.choice(GIFS[category])
+                    gif_desc = category.replace("_", " ")
 
-        async with message.channel.typing():
-            image_parts = []
-            if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
-                try:
-                    image_parts = await collect_image_parts(message)
-                except Exception as e:
-                    log.warning("Image collection failed: %s", e)
-                    image_parts = []
-            try:
-                if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
-                    # current-info question: answer from a live web search; any
-                    # problem (error, quota, empty) just falls back to the
-                    # normal brain, so search can never break replying
+            # when a gif rides along, the brain is TOLD about it, so she can
+            # never contradict the gif she just sent
+            extra = gif_note(gif_desc) if gif_url else ""
+
+            async with message.channel.typing():
+                image_parts = []
+                if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
                     try:
-                        mark_search_used()
-                        reply = await think_search(message.channel.id, diary_block)
-                        if not reply:
-                            raise RuntimeError("grounded search returned no text")
+                        image_parts = await collect_image_parts(message)
                     except Exception as e:
-                        log.warning("Grounded search failed, replying without it: %s", e)
-                        reply = await think(message.channel.id, diary_block, image_parts)
-                else:
-                    reply = await think(message.channel.id, diary_block, image_parts)
-                if not reply:
-                    reply = EMPTY_REPLY_FALLBACK
-            except Exception as e:
-                log.warning("AI brain error: %s", e)
-                reply = random.choice(FALLBACK_LINES)
+                        log.warning("Image collection failed: %s", e)
+                        image_parts = []
+                try:
+                    if GEMINI_API_KEY and not has_image and looks_like_search(content) and search_quota_left():
+                        # current-info question: answer from a live web search; any
+                        # problem (error, quota, empty) just falls back to the
+                        # normal brain, so search can never break replying
+                        try:
+                            mark_search_used()
+                            reply = await think_search(message.channel.id, diary_block, extra)
+                            if not reply:
+                                raise RuntimeError("grounded search returned no text")
+                        except Exception as e:
+                            log.warning("Grounded search failed, replying without it: %s", e)
+                            reply = await think(message.channel.id, diary_block, image_parts, extra)
+                    else:
+                        reply = await think(message.channel.id, diary_block, image_parts, extra)
+                    if not reply:
+                        reply = EMPTY_REPLY_FALLBACK
+                except Exception as e:
+                    log.warning("AI brain error: %s", e)
+                    reply = random.choice(FALLBACK_LINES)
 
     reply = reply[:MAX_REPLY_CHARS]
-    history[message.channel.id].append((BOT_NAME, reply))
+    stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
+    history[message.channel.id].append((BOT_NAME, stored_reply))
     try:
         await message.reply(reply, mention_author=False)
         if gif_url:
@@ -695,5 +772,6 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
+
 
 
