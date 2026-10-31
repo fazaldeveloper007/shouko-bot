@@ -159,3 +159,13 @@ web and answers from fresh results instead of guessing. Casual chatting never tr
 | `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
 | `.env.example` | which environment variables she needs |
 
+## Proactive announcements
+
+Kristy can post on her own schedule (all targets and wording approved by the server owner):
+
+- **Good morning** - "Good morning @everyone" + a random GIF, daily at 09:00 (Asia/Kolkata) in the chat channel. If the bot is offline at 09:00 the day's post is skipped - no late catch-up pings.
+- **New redeem codes** - checks game8's Genshin codes page hourly. A code posts only when it's freshly added per the source ("Date Added" within 2 days), was never seen before, and isn't in the known-expired history. Special Program drops post as one batched message. Community-sourced posts carry a source note. Old/uncertain codes are held, never pinged.
+- **Limited-time events** - official HoYoLAB events feed (verified official accounts only), filtered to real events (no discussion rooms / giveaways / top-up promos), with the event's own official image when available.
+- **Welcome message** - pings the actual new member (never @everyone) with a cute GIF when someone joins.
+
+Setup notes: the bot role needs **Mention @everyone** permission in the announcement channels (Discord strips the ping silently otherwise), and welcomes need **Server Members Intent** enabled in the Discord developer portal. Config via env vars - see `.env.example`. State lives in `memory/announcements_state.json` (gitignored, append-only; a corrupted state disables posting rather than re-pinging old codes).
