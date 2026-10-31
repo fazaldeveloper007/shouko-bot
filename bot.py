@@ -113,6 +113,26 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024     # skip images bigger than ~8MB
 MAX_IMAGES = 3                        # most she will look at per message
 IMAGE_TIMEOUT = 25                    # seconds to download one image
 IMAGE_ONLY_PROMPT = "Reply naturally to this image as Kristy."
+EMPTY_MESSAGE_PROMPT = "[sent a message with no text]"
+
+def describe_stickers(message):
+    """Text stand-in for Discord stickers: they arrive on message.stickers,
+    not as attachments, so a sticker-only message has empty content and was
+    invisible to the brain (it also left the chat history ending on Kristy's
+    own turn, which Gemini rejects with a 400). The name always tells her
+    what the sticker conveys; static PNG stickers are also sent as images.
+    """
+    notes = []
+    for st in getattr(message, "stickers", None) or []:
+        name = (getattr(st, "name", "") or "").strip() or "sticker"
+        fmt = getattr(getattr(st, "format", None), "name", "")
+        if fmt == "png":
+            notes.append(f"[sent a sticker: {name}]")
+        else:
+            # APNG/GIF/Lottie stickers can't be fed to Gemini as images;
+            # the name alone still gives her something real to react to.
+            notes.append(f"[sent an animated sticker: {name}]")
+    return " ".join(notes)
 
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
@@ -596,6 +616,9 @@ def message_has_image(message):
     for embed in message.embeds:
         if getattr(embed.image, "url", None) or getattr(embed.thumbnail, "url", None):
             return True
+    for st in getattr(message, "stickers", None) or []:
+        if getattr(getattr(st, "format", None), "name", "") == "png":
+            return True
     return False
 
 async def collect_image_parts(message):
@@ -622,6 +645,15 @@ async def collect_image_parts(message):
             if url and url not in seen:
                 seen.add(url)
                 urls.append((url, None))
+    for st in getattr(message, "stickers", None) or []:  # stickers aren't attachments
+        # Only static PNG stickers: Gemini accepts image/png but not APNG,
+        # GIF or Lottie, and an unsupported type gets the whole reply a 400.
+        if getattr(getattr(st, "format", None), "name", "") != "png":
+            continue
+        url = getattr(st, "url", None)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append((url, "image/png"))
 
     parts = []
     if not urls:
@@ -1168,6 +1200,9 @@ async def on_message(message):
     if message.author.bot:
         return
     content = message.content.strip()
+    sticker_note = describe_stickers(message)
+    if sticker_note:
+        content = f"{content} {sticker_note}".strip()
     if content.casefold() == "!servers":
         if not is_bot_owner(message.author):
             return
@@ -1194,6 +1229,12 @@ async def on_message(message):
     if has_image and not content:
         # image-only message: give her something to react to
         content = IMAGE_ONLY_PROMPT
+        history[message.channel.id].append((speaker, user_id, content))
+    if not content:
+        # Any other contentless trigger (a poll, a file with no caption, ...)
+        # must still add a user turn: without one the history ends on her own
+        # reply and Gemini rejects the request with a 400.
+        content = EMPTY_MESSAGE_PROMPT
         history[message.channel.id].append((speaker, user_id, content))
 
     # "forget me": delete this member's diary file, no AI call needed
@@ -1362,4 +1403,5 @@ async def on_message(message):
         del buf[:-12]  # keep at most the last 6 exchanges
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
-client.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    client.run(DISCORD_TOKEN)
