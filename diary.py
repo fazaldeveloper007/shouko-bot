@@ -241,7 +241,7 @@ def extraction_prompt(diary, display_name, exchanges):
         f"You maintain a private diary about a Discord member called \"{display_name}\".\n"
         "From the conversation below, extract NEW durable facts about THEM that are worth remembering "
         "long-term: their preferred name, Genshin Impact mains/favourites, likes and dislikes, hobbies, "
-        "relationships, running jokes with Kristy, things they asked Kristy to remember, and meaningful "
+        "relationships, running jokes with Kristy, the state of any playful romance arc with her (who is sincerely wooing her, whose rishta she accepted), things they asked Kristy to remember, and meaningful "
         "past topics. Only use what the member said about themselves (or clearly about the relationship "
         "with Kristy). Ignore small talk, one-off questions, other people's facts, and anything Kristy "
         "merely guessed. Never store passwords, tokens, phone numbers, addresses or other sensitive data. "
