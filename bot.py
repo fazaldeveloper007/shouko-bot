@@ -40,6 +40,7 @@ import discord
 from persona import SYSTEM_PROMPT
 from gifs import GIFS, CHARACTER_GIFS
 import diary
+import announcements
 
 # Local dev convenience: load a .env file if one exists
 try:
@@ -107,6 +108,7 @@ IMAGE_ONLY_PROMPT = "Reply naturally to this image as Kristy."
 
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
+intents.members = True          # for new-member welcomes: enable "Server Members Intent" in the portal too
 client = discord.Client(intents=intents)
 
 # One shared HTTP session for AI API calls
@@ -1065,6 +1067,7 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
 async def on_ready():
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
+    announcements.start(client)
 
 def is_bot_owner(author):
     """Check the configured owner ID, or use the documented name fallback."""
