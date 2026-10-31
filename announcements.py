@@ -41,8 +41,15 @@ import discord
 
 try:
     from zoneinfo import ZoneInfo
-except ImportError:  # very old python; Termux py3.11+ has zoneinfo
+except ImportError:
     ZoneInfo = None
+
+# Termux Python ships without IANA tzdata, so ZoneInfo("Asia/Kolkata") fails
+# there. Fixed-offset fallback for the zones we actually use; anything else
+# falls back to system local time (logged once at startup, not per loop tick).
+_TZ_FALLBACK_OFFSETS = {
+    "asia/kolkata": datetime.timezone(datetime.timedelta(hours=5, minutes=30), "IST"),
+}
 
 from gifs import GIFS
 import random
@@ -371,6 +378,11 @@ def render_special_codes(items):
 COMMUNITY_FOOTER = "\n\n*- listed by game8 community page, redeem to confirm*"
 
 def render_event(name, summary, duration, post_id):
+    # Official subjects can run to full sentences; keep the post well under
+    # Discord's 2000-char message limit.
+    name = (name or "").strip()
+    if len(name) > 180:
+        name = name[:177].rstrip() + "..."
     parts = [
         "# 🎪 New Limited-Time Event!",
         "@everyone",
@@ -400,7 +412,12 @@ async def _get_channel(channel_id, label):
             return None
     return ch
 
+MAX_POST_CHARS = 1990  # Discord's limit is 2000; clamp every outbound post
+
 async def _post(channel_id, text, label, image=None):
+    if len(text) > MAX_POST_CHARS:
+        log.warning("announcements: %s post was %d chars, clamping", label, len(text))
+        text = text[:MAX_POST_CHARS - 3].rstrip() + "..."
     if DRY_RUN:
         log.info("announcements DRY-RUN would post to %s (%s):\n%s\nimage: %s",
                  channel_id, label, text, bool(image))
@@ -424,14 +441,35 @@ async def _post(channel_id, text, label, image=None):
 # Morning loop
 # --------------------------------------------------------------------------
 
-def _now_local():
-    if ZoneInfo is None:
-        return datetime.datetime.now()
-    try:
-        return datetime.datetime.now(ZoneInfo(MORNING_TZ))
-    except Exception:
+_tzinfo = None
+_tz_resolved = False
+
+def _resolve_tz():
+    global _tzinfo, _tz_resolved
+    if _tz_resolved:
+        return _tzinfo
+    _tz_resolved = True
+    if ZoneInfo is not None:
+        try:
+            _tzinfo = ZoneInfo(MORNING_TZ)
+            return _tzinfo
+        except Exception:
+            pass
+    fallback = _TZ_FALLBACK_OFFSETS.get(MORNING_TZ.strip().lower())
+    if fallback is not None:
+        log.warning("announcements: no tzdata for %r, using fixed UTC offset %s",
+                    MORNING_TZ, fallback)
+        _tzinfo = fallback
+    else:
         log.warning("announcements: bad MORNING_TZ %r, using system local time", MORNING_TZ)
+        _tzinfo = None
+    return _tzinfo
+
+def _now_local():
+    tz = _resolve_tz()
+    if tz is None:
         return datetime.datetime.now()
+    return datetime.datetime.now(tz)
 
 async def morning_loop():
     await client_ref.wait_until_ready()
@@ -495,9 +533,23 @@ async def seed_baseline():
         return False
     _state["seen_codes"] = sorted({c["code"] for c in active})
     _state["expired_codes"] = sorted(set(expired))
+    # Events and official posts get the same silent baseline: everything
+    # currently in the feeds is recorded as seen so first run never backfills
+    # old announcements into the channel.
+    for feed_type in (1, 2, 3):
+        for item in await hoyo_list(feed_type):
+            post = item.get("post", {})
+            pid = str(post.get("post_id", ""))
+            if not pid:
+                continue
+            if feed_type == 2:
+                _state["seen_events"].append(pid)
+            else:
+                _state["seen_posts"].append(pid)
     _state["seeded"] = True
     save_state()
-    log.info("announcements: silent baseline seeded (%d active, %d expired)", len(active), len(expired))
+    log.info("announcements: silent baseline seeded (%d active codes, %d expired, %d events, %d posts)",
+             len(active), len(expired), len(_state["seen_events"]), len(_state["seen_posts"]))
     return True
 
 async def check_codes():
