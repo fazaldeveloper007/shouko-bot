@@ -85,6 +85,7 @@ if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
     raise SystemExit("Missing DISCORD_TOKEN or GEMINI_API_KEY (or GROQ_API_KEY). Set them as env vars (see .env.example).")
 
 HISTORY_LEN = 20        # messages she remembers per channel
+HISTORY_REPLY_CHARS = 1200  # cap on how much of HER OWN long replies history keeps
 MAX_REPLY_CHARS = 1900  # chunk size for long replies; Discord's own limit is 2000
 
 PING_GUIDANCE = """
@@ -258,23 +259,15 @@ def build_search_query(text):
         query_words.insert(0, "genshin")
     return " ".join(query_words).strip()
 
-# Question words (English + Hinglish): a message carrying one is someone
-# asking something, which is what a command-only "search karo" wants answered.
-_QUESTION_WORD_RE = re.compile(
-    r"\b(kya|kaun|kaunsa|kaunsi|kab|kitne|kitna|kitni|batao|bata|bataiye|"
-    r"suna|suno|dikha|dikhao|when|what|whats|who|whom|which|whose|how)\b",
-    re.IGNORECASE,
-)
-
-def search_query_for(channel_id, requester_id=None):
+def search_query_for(channel_id, requester_id=None, also_author_id=None):
     """Newest usable search topic in this channel -> (query, question).
 
     Search-command-only messages ("search karo", "browse karo") carry no
-    topic, so walk back the channel history for the actual question. The
-    requester's own messages are eligible whenever they carry any topical
-    content; OTHER members' messages only when they are clearly
-    question-shaped or search-shaped - so "search karo" finds the question the channel was
-    just discussing, but never a neighbour's "lol same yaar" noise.
+    topic, so walk back the channel history for the actual question - but
+    only the requester's OWN messages. Another member's message is fair
+    game only when the requester explicitly pointed at it (Discord reply),
+    via also_author_id. Otherwise she asks what to search instead of
+    guessing at a neighbour's question in a busy channel.
     """
     for author, author_id, content in reversed(history[channel_id]):
         if author == BOT_NAME:
@@ -284,8 +277,7 @@ def search_query_for(channel_id, requester_id=None):
             continue
         if author_id == requester_id:
             return q, content
-        if ("?" in content or looks_like_search(content)
-                or _QUESTION_WORD_RE.search(content)):
+        if also_author_id is not None and author_id == also_author_id:
             return q, content
     return "", ""
 
@@ -997,9 +989,10 @@ def latest_question(channel_id):
             return content
     return ""
 
-async def think_search(channel_id, diary_block="", extra_system="", image_parts=None, requester_id=None):
+async def think_search(channel_id, diary_block="", extra_system="", image_parts=None,
+                       requester_id=None, also_author_id=None):
     """Use live web results, then answer in persona; errors are handled by caller."""
-    query, question = search_query_for(channel_id, requester_id)
+    query, question = search_query_for(channel_id, requester_id, also_author_id)
     if not query:
         raise RuntimeError("nothing to search for")
     digest = await fetch_search_results(query)
@@ -1209,7 +1202,16 @@ async def on_message(message):
                 try:
                     if looks_like_search(content):
                         search_error = None
-                        query, _question = search_query_for(message.channel.id, user_id)
+                        ref_author_id = None
+                        ref = message.reference
+                        if (ref and isinstance(ref.resolved, discord.Message)
+                                and ref.resolved.author != client.user
+                                and not ref.resolved.author.bot):
+                            # explicit reply to someone's message: that
+                            # author's messages are fair walk-back targets
+                            ref_author_id = ref.resolved.author.id
+                        query, _question = search_query_for(
+                            message.channel.id, user_id, ref_author_id)
                         if not query:
                             # command-only request with nothing of their own to
                             # walk back to: ask, never search a neighbour's chat
@@ -1224,7 +1226,8 @@ async def on_message(message):
                         else:
                             try:
                                 reply = await think_search(message.channel.id, diary_block, extra,
-                                                           image_parts=image_parts, requester_id=user_id)
+                                                           image_parts=image_parts, requester_id=user_id,
+                                                           also_author_id=ref_author_id)
                                 if not reply:
                                     raise RuntimeError("search returned no text")
                                 mark_search_used()  # only successful searches spend the cap
@@ -1254,7 +1257,10 @@ async def on_message(message):
 
     ping_requested, reply = extract_ping_request(reply)
     reply = sanitize_mentions(reply) or EMPTY_REPLY_FALLBACK
-    stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
+    # history keeps her reply for context, bounded so long chunked answers
+    # cannot eat the brain's input-token headroom; the full text already
+    # lives in the channel for anyone to scroll back to
+    stored_reply = reply[:HISTORY_REPLY_CHARS] + (f" [sent a {gif_desc} gif]" if gif_desc else "")
     history[message.channel.id].append((BOT_NAME, None, stored_reply))
     try:
         # long answers go out as sequential messages at natural boundaries;
