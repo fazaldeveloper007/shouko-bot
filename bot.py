@@ -15,6 +15,7 @@ Config (environment variables):
                   GEMINI_API_KEY is not set or the Gemini call itself fails
   GROQ_MODEL      (optional) Groq model id, default openai/gpt-oss-120b
   BOT_NAME        (optional) her name, default "Kristy"
+  OWNER_ID        (optional) Discord user ID allowed to use owner commands
   MEMORY_DIR      (optional) where member diaries live, default ./memory
   SEARCH_PROVIDER (optional) web search provider, default "tavily"
   SEARCH_API_KEY  (optional) Tavily API key from https://tavily.com (free tier:
@@ -56,6 +57,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
+OWNER_ID = (os.getenv("OWNER_ID") or "").strip()
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily").strip().lower()
 SEARCH_API_KEY = (os.environ.get("SEARCH_API_KEY") or "").strip()
 # Tavily search endpoint, called directly with aiohttp like everything else
@@ -978,13 +980,54 @@ async def on_ready():
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
 
+def is_bot_owner(author):
+    """Check the configured owner ID, or use the documented name fallback."""
+    if OWNER_ID:
+        return str(getattr(author, "id", "")) == OWNER_ID
+    names = (getattr(author, "name", ""), getattr(author, "display_name", ""))
+    return any(str(name).strip().casefold() == "fazallette" for name in names if name)
+
+
+def format_server_list(guilds, include_owner_id_note=False):
+    """Build the plain-text owner response without invoking an AI model."""
+    guilds = list(guilds)
+    lines = [f"I'm in {len(guilds)} server(s):"]
+    if guilds:
+        for guild in guilds:
+            members = getattr(guild, "member_count", None)
+            member_text = str(members) if members is not None else "unknown"
+            lines.append(f"- {guild.name} ({member_text} members)")
+    else:
+        lines.append("- No servers yet.")
+    if include_owner_id_note:
+        lines.extend(("", "Security note: set OWNER_ID to your Discord user ID in .env; the name fallback can be spoofed."))
+    return "\n".join(lines)
+
+
+_owner_id_fallback_notice_sent = False
+
+
 @client.event
 async def on_message(message):
-    # ignore other bots and DMs; she's a server bot
-    if message.author.bot or not message.guild:
+    global _owner_id_fallback_notice_sent
+
+    # Owner utility commands work in DMs as well as server channels.
+    if message.author.bot:
+        return
+    content = message.content.strip()
+    if content.casefold() == "!servers":
+        if not is_bot_owner(message.author):
+            return
+        show_owner_id_note = not OWNER_ID and not _owner_id_fallback_notice_sent
+        if show_owner_id_note:
+            _owner_id_fallback_notice_sent = True
+        await message.reply(format_server_list(client.guilds, show_owner_id_note), mention_author=False)
         return
 
-    content = message.content.strip()
+    # Kristy otherwise only responds in server channels.
+    if not message.guild:
+        return
+
     if content:
         history[message.channel.id].append((message.author.display_name, content[:300]))
 
@@ -1131,4 +1174,3 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
-
