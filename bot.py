@@ -62,6 +62,11 @@ SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily").strip().lower()
 SEARCH_API_KEY = (os.environ.get("SEARCH_API_KEY") or "").strip()
 # Tavily search endpoint, called directly with aiohttp like everything else
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+# How much retrieved context the brain gets: generous enough that detail
+# survives, small enough to stay within the model's fast-reply budget.
+SEARCH_DIGEST_CHARS = 6000       # cap on the whole digest handed to the brain
+MAX_RESULT_SNIPPET_CHARS = 1200  # per-result cap, so one page can't eat it all
+MIN_RESULT_CONTENT_CHARS = 150   # below this a result is boilerplate, not evidence
 try:
     SEARCH_MAX_PER_DAY = max(0, int(os.getenv("SEARCH_MAX_PER_DAY", "25")))
 except ValueError:
@@ -80,7 +85,7 @@ if not DISCORD_TOKEN or not (GEMINI_API_KEY or GROQ_API_KEY):
     raise SystemExit("Missing DISCORD_TOKEN or GEMINI_API_KEY (or GROQ_API_KEY). Set them as env vars (see .env.example).")
 
 HISTORY_LEN = 20        # messages she remembers per channel
-MAX_REPLY_CHARS = 1800  # Discord's limit is 2000; leave some margin
+MAX_REPLY_CHARS = 1900  # chunk size for long replies; Discord's own limit is 2000
 
 PING_GUIDANCE = """
 OPTIONAL DISCORD PING:
@@ -166,8 +171,25 @@ SEARCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Guide-shaped words that become searchable when the message clearly anchors
+# to the game (a game keyword or a known character name). Without the anchor,
+# words like "team" or "stats" are too ordinary to spend a search on.
+_SEARCH_GUIDE_WORDS_RE = re.compile(
+    r"\b(build|builds|guide|guides|team|teams|comp|comps|weapons?|artifacts?|"
+    r"materials?|farm(?:ing)?|rerun|re-run|stats?|kit|"
+    r"aayega|aayegi|ayega|ayegi|aane\s+wala|aane\s+wali)\b",
+    re.IGNORECASE,
+)
+
 def looks_like_search(text):
-    return bool(SEARCH_RE.search(text or ""))
+    t = text or ""
+    if SEARCH_RE.search(t):
+        return True
+    if _SEARCH_GUIDE_WORDS_RE.search(t) and (
+        _GENSHIN_TOPIC_RE.search(t) or detect_character_mention(t)
+    ):
+        return True
+    return False
 
 # --- Search query construction -------------------------------------------
 # Members write things like "Ek baat batao 7.2 mei kya kya aa rha hai? Kristy
@@ -236,31 +258,61 @@ def build_search_query(text):
         query_words.insert(0, "genshin")
     return " ".join(query_words).strip()
 
-def search_query_for(channel_id):
-    """Newest member message with real topical content -> (query, question).
+# Question words (English + Hinglish): a message carrying one is someone
+# asking something, which is what a command-only "search karo" wants answered.
+_QUESTION_WORD_RE = re.compile(
+    r"\b(kya|kaun|kaunsa|kaunsi|kab|kitne|kitna|kitni|batao|bata|bataiye|"
+    r"suna|suno|dikha|dikhao|when|what|whats|who|whom|which|whose|how)\b",
+    re.IGNORECASE,
+)
+
+def search_query_for(channel_id, requester_id=None):
+    """Newest usable search topic in this channel -> (query, question).
 
     Search-command-only messages ("search karo", "browse karo") carry no
-    topic, so walk back the channel history for the actual question.
+    topic, so walk back the channel history for the actual question. The
+    requester's own messages are eligible whenever they carry any topical
+    content; OTHER members' messages only when they are clearly
+    question-shaped or search-shaped - so "search karo" finds the question the channel was
+    just discussing, but never a neighbour's "lol same yaar" noise.
     """
-    for author, content in reversed(history[channel_id]):
+    for author, author_id, content in reversed(history[channel_id]):
         if author == BOT_NAME:
             continue
         q = build_search_query(content)
-        if len(q) >= 3:
+        if len(q) < 3:
+            continue
+        if author_id == requester_id:
+            return q, content
+        if ("?" in content or looks_like_search(content)
+                or _QUESTION_WORD_RE.search(content)):
             return q, content
     return "", ""
+
+def query_has_anchor(query):
+    """True when the query itself names the game, a game term, or a known
+    character - so we never send a lone unknown word (a name we don't know,
+    a typo) to the search API and hand back off-topic junk."""
+    q = (query or "").lower()
+    if not q:
+        return False
+    if _GENSHIN_TOPIC_RE.search(q):
+        return True
+    if re.search(r"\b(genshin|impact|hsr|honkai|wuwa|wuthering|zenless|zzz)\b", q):
+        return True
+    return any(
+        re.search(rf"\b{re.escape(name.lower())}\b", q) for name in CHARACTER_GIFS
+    )
 
 def current_context():
     """Ground her in real time so she stops quoting stale training data."""
     today = time.strftime("%A, %d %B %Y")
     return (
-        f"\n\nCURRENT DATE: {today}. GAME TIMELINE: your training data is "
-        "old. For reference, late 2026 is Genshin Impact's 7.x era (the "
-        "Snezhnaya cycle); 5.x (Natlan) was 2024-25, 6.x came after that. "
-        "Never state the current version, banners, leaks or news from "
-        "memory. If no web search results were provided for a "
-        "current-events question, say you are not sure and offer to search, "
-        "instead of guessing."
+        f"\n\nCURRENT DATE: {today}. Your training data is old and the "
+        "game has moved on since. Never state the current version, banners, "
+        "leaks or news from memory. If no web search results were provided "
+        "for a current-events question, say you are not sure and offer to "
+        "search, instead of guessing."
     )
 
 # Always tell both supported brains that live search exists and how the
@@ -285,7 +337,10 @@ SEARCH_HINT = (
     "the question (random unrelated pages, wrong topic), honestly say the "
     "search did not find the right info. NEVER fill the gap from your own "
     "memory about current or future game versions, banners, leaks or news - "
-    "your training data is outdated and will be wrong."
+    "your training data is outdated and will be wrong. Give the member the "
+    "full useful detail these results contain - the actual names, dates, "
+    "numbers and specifics. A complete, longer answer is right here; do not "
+    "squeeze a search answer into a one-liner."
 )
 
 # --- Model-driven search ---------------------------------------------------
@@ -598,12 +653,45 @@ def extract_ping_request(text):
     return requested, PING_MARKER_RE.sub("", text).strip()
 
 
+def sanitize_mentions(text):
+    """Strip all mention syntax the model may have written."""
+    return re.sub(r"<@!?\d+>|<@&\d+>|@everyone|@here", "", text or "", flags=re.IGNORECASE).strip()
+
+
 def ping_reply_text(user_id, text, ping=False):
     """Sanitize mention syntax; optionally ping only the addressed member."""
-    text = re.sub(r"<@!?\d+>|<@&\d+>|@everyone|@here", "", text or "", flags=re.IGNORECASE).strip()
+    text = sanitize_mentions(text)
     if ping:
         return f"<@{user_id}>" + (f" {text}" if text else "")
     return text
+
+
+def chunk_reply(text, limit=MAX_REPLY_CHARS):
+    """Split a long reply into Discord-sized messages at paragraph, then
+    sentence, then word boundaries. Short replies pass through untouched."""
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    rest = text
+    while len(rest) > limit:
+        cut = rest.rfind("\n\n", 0, limit)
+        if cut < limit // 2:
+            cut = rest.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = max(rest.rfind(". ", 0, limit), rest.rfind("! ", 0, limit),
+                      rest.rfind("? ", 0, limit))
+            if cut >= limit // 2:
+                cut += 1  # keep the punctuation with its sentence
+        if cut < limit // 2:
+            cut = rest.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
 
 
 def reply_mentions(message):
@@ -785,7 +873,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
     messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
-    for author, content in history[channel_id]:
+    for author, _author_id, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
         else:
@@ -813,7 +901,7 @@ async def think_groq(channel_id, diary_block="", extra_system=""):
 async def think_gemini(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
     contents = []
-    for author, content in history[channel_id]:
+    for author, _author_id, content in history[channel_id]:
         if author == BOT_NAME:
             role, text = "model", content
         else:
@@ -884,29 +972,34 @@ async def fetch_search_results(query):
     lines = []
     if answer:
         lines.append(f"Quick answer: {answer}")
-    for r in (data.get("results") or [])[:5]:
+    for r in (data.get("results") or [])[:6]:
         if not isinstance(r, dict):
             continue
         title = (r.get("title") or "").strip()
         snippet = (r.get("content") or "").strip()
         url = (r.get("url") or "").strip()
+        if len(snippet) < MIN_RESULT_CONTENT_CHARS:
+            # boilerplate (channel blurbs, link dumps, nav text) is not
+            # evidence; drop it whatever the domain, keep substantive pages
+            continue
+        snippet = snippet[:MAX_RESULT_SNIPPET_CHARS]
         if title or snippet:
             lines.append(f"- {title}: {snippet} ({url})".strip())
     digest = "\n".join(lines).strip()
     if not digest:
         raise RuntimeError("search returned no usable results")
-    return digest[:3000]
+    return digest[:SEARCH_DIGEST_CHARS]
 
 def latest_question(channel_id):
     """The most recent non-Kristy message in this channel (the search query)."""
-    for author, content in reversed(history[channel_id]):
+    for author, _author_id, content in reversed(history[channel_id]):
         if author != BOT_NAME:
             return content
     return ""
 
-async def think_search(channel_id, diary_block="", extra_system="", image_parts=None):
+async def think_search(channel_id, diary_block="", extra_system="", image_parts=None, requester_id=None):
     """Use live web results, then answer in persona; errors are handled by caller."""
-    query, question = search_query_for(channel_id)
+    query, question = search_query_for(channel_id, requester_id)
     if not query:
         raise RuntimeError("nothing to search for")
     digest = await fetch_search_results(query)
@@ -933,8 +1026,8 @@ async def maybe_model_search(channel_id, reply, diary_block, extra="", image_par
     log.info("Model-driven search requested: %s", query)
     if search_quota_left():
         try:
-            mark_search_used()
             digest = await fetch_search_results(query)
+            mark_search_used()  # only successful searches spend the daily cap
             note = (f'{MODEL_SEARCH_HINT}\n\n(search query used: "{query}")\n'
                     f"Web search results:\n{digest}")
         except Exception as e:
@@ -1029,7 +1122,7 @@ async def on_message(message):
         return
 
     if content:
-        history[message.channel.id].append((message.author.display_name, content[:300]))
+        history[message.channel.id].append((message.author.display_name, message.author.id, content[:300]))
 
     if not should_respond(message):
         return
@@ -1041,7 +1134,7 @@ async def on_message(message):
     if has_image and not content:
         # image-only message: give her something to react to
         content = IMAGE_ONLY_PROMPT
-        history[message.channel.id].append((speaker, content))
+        history[message.channel.id].append((speaker, user_id, content))
 
     # "forget me": delete this member's diary file, no AI call needed
     if diary.wants_forget(content):
@@ -1116,15 +1209,25 @@ async def on_message(message):
                 try:
                     if looks_like_search(content):
                         search_error = None
-                        if not search_quota_left():
+                        query, _question = search_query_for(message.channel.id, user_id)
+                        if not query:
+                            # command-only request with nothing of their own to
+                            # walk back to: ask, never search a neighbour's chat
+                            reply = "kis baare mein search karu? thoda specific bata do 🥺"
+                        elif not query_has_anchor(query) and len(query.split()) <= 1:
+                            # a lone unknown word (name we don't know, typo)
+                            # would return off-topic junk; clarify instead
+                            reply = ("ye kis game ya cheez ke baare mein hai? "
+                                     "thoda aur bata do, phir dhoondh ke batati hu 🥺")
+                        elif not search_quota_left():
                             search_error = "daily search limit reached"
                         else:
                             try:
-                                mark_search_used()
                                 reply = await think_search(message.channel.id, diary_block, extra,
-                                                           image_parts=image_parts)
+                                                           image_parts=image_parts, requester_id=user_id)
                                 if not reply:
                                     raise RuntimeError("search returned no text")
+                                mark_search_used()  # only successful searches spend the cap
                             except Exception as e:
                                 search_error = "web search failed"
                                 log.warning("Web search failed: %s", e)
@@ -1150,15 +1253,21 @@ async def on_message(message):
                     reply = EMPTY_REPLY_FALLBACK
 
     ping_requested, reply = extract_ping_request(reply)
-    reply = reply[:MAX_REPLY_CHARS]
+    reply = sanitize_mentions(reply) or EMPTY_REPLY_FALLBACK
     stored_reply = reply + (f" [sent a {gif_desc} gif]" if gif_desc else "")
-    history[message.channel.id].append((BOT_NAME, stored_reply))
+    history[message.channel.id].append((BOT_NAME, None, stored_reply))
     try:
+        # long answers go out as sequential messages at natural boundaries;
+        # the ping and the reaction stay on the first message only
+        chunks = chunk_reply(reply)
+        first = f"<@{message.author.id}> {chunks[0]}" if ping_requested else chunks[0]
         await message.reply(
-            ping_reply_text(message.author.id, reply, ping_requested),
+            first,
             mention_author=False,
             allowed_mentions=reply_mentions(message),
         )
+        for extra_chunk in chunks[1:]:
+            await message.channel.send(extra_chunk)
         if gif_url:
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
         await try_reaction(message, reaction)
