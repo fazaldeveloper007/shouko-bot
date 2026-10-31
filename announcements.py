@@ -132,6 +132,7 @@ def _default_state():
         "seen_events": [],     # type-2 post_ids already evaluated
         "held_codes": {},      # code -> {"first_seen": iso, "date_added": str|None}
         "morning_last": "",    # YYYY-MM-DD of last posted morning message
+        "feeds_seeded": False,  # True once events/posts baseline is recorded
     }
 
 def load_state():
@@ -412,12 +413,42 @@ async def _get_channel(channel_id, label):
             return None
     return ch
 
-MAX_POST_CHARS = 1990  # Discord's limit is 2000; clamp every outbound post
+# Discord's 2000-char limit is enforced server-side; the safest accounting is
+# UTF-16 code units (what Discord's own clients count), and emoji cost 2 there.
+# Field-level caps keep every template far below this; the clamp is a backstop
+# that drops whole trailing lines instead of cutting a URL or mention in half.
+MAX_POST_UNITS = 1900
+
+def utf16_units(text):
+    return len(text.encode("utf-16-le", errors="replace")) // 2
+
+def clamp_post(text):
+    if utf16_units(text) <= MAX_POST_UNITS:
+        return text
+    lines, total = [], 0
+    for line in text.split("\n"):
+        cost = utf16_units(line) + 1  # + the newline
+        if total + cost > MAX_POST_UNITS:
+            if not lines:
+                # even the first line is oversized: hard-truncate it by
+                # units, never splitting a surrogate pair mid-emoji
+                kept, used = [], 0
+                for ch in line:
+                    cu = utf16_units(ch)
+                    if used + cu > MAX_POST_UNITS - 4:
+                        break
+                    kept.append(ch)
+                    used += cu
+                return "".join(kept).rstrip() + " ..."
+            break
+        lines.append(line)
+        total += cost
+    return "\n".join(lines).rstrip() + "\n..."
 
 async def _post(channel_id, text, label, image=None):
-    if len(text) > MAX_POST_CHARS:
-        log.warning("announcements: %s post was %d chars, clamping", label, len(text))
-        text = text[:MAX_POST_CHARS - 3].rstrip() + "..."
+    if utf16_units(text) > MAX_POST_UNITS:
+        log.warning("announcements: %s post was %d UTF-16 units, clamping", label, utf16_units(text))
+        text = clamp_post(text)
     if DRY_RUN:
         log.info("announcements DRY-RUN would post to %s (%s):\n%s\nimage: %s",
                  channel_id, label, text, bool(image))
@@ -533,9 +564,20 @@ async def seed_baseline():
         return False
     _state["seen_codes"] = sorted({c["code"] for c in active})
     _state["expired_codes"] = sorted(set(expired))
-    # Events and official posts get the same silent baseline: everything
-    # currently in the feeds is recorded as seen so first run never backfills
-    # old announcements into the channel.
+    await seed_feeds()
+    _state["seeded"] = True
+    save_state()
+    log.info("announcements: silent baseline seeded (%d active codes, %d expired, %d events, %d posts)",
+             len(active), len(expired), len(_state["seen_events"]), len(_state["seen_posts"]))
+    return True
+
+async def seed_feeds():
+    """Silently record everything currently in the announcement feeds as seen,
+    so a bot that starts (or migrates) never backfills old posts. Idempotent."""
+    if _state.get("feeds_seeded"):
+        return
+    seen_events = set(_state["seen_events"])
+    seen_posts = set(_state["seen_posts"])
     for feed_type in (1, 2, 3):
         for item in await hoyo_list(feed_type):
             post = item.get("post", {})
@@ -543,14 +585,15 @@ async def seed_baseline():
             if not pid:
                 continue
             if feed_type == 2:
-                _state["seen_events"].append(pid)
+                seen_events.add(pid)
             else:
-                _state["seen_posts"].append(pid)
-    _state["seeded"] = True
+                seen_posts.add(pid)
+    _state["seen_events"] = sorted(seen_events)
+    _state["seen_posts"] = sorted(seen_posts)
+    _state["feeds_seeded"] = True
     save_state()
-    log.info("announcements: silent baseline seeded (%d active codes, %d expired, %d events, %d posts)",
-             len(active), len(expired), len(_state["seen_events"]), len(_state["seen_posts"]))
-    return True
+    log.info("announcements: feeds baseline recorded (%d events, %d posts), nothing posted",
+             len(seen_events), len(seen_posts))
 
 async def check_codes():
     if CODES_MODE == "off":
@@ -720,6 +763,8 @@ async def watch_loop():
         return
     if not _state.get("seeded"):
         await seed_baseline()   # silent: records current codes, posts nothing
+    else:
+        await seed_feeds()      # migration for pre-feeds-seed states: silent, no-op when already done
     while True:
         try:
             await check_codes()
