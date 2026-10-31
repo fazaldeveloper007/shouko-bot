@@ -474,7 +474,7 @@ def gif_note(desc):
 # reacts instead. Costs no extra AI calls, and a missing "Add Reactions"
 # permission only logs once - replying never breaks over a reaction.
 REACTION_RE = re.compile(r"^\s*\[\[react:\s*(.+?)\s*\]\]\s*", re.DOTALL)
-REACTION_COOLDOWN = 120   # seconds between her reactions per channel
+REACTION_COOLDOWN = 60    # seconds between her reactions per channel
 REACTION_CHANCE = 0.3     # on the zero-API gif paths only; the AI path self-regulates
 _last_reaction = {}       # channel_id -> monotonic time of her last reaction
 _reaction_warned = False
