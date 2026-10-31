@@ -97,8 +97,16 @@ a group discussion, distinguishing who you are addressing in a busy channel,
 or when they explicitly asked to be pinged. Do not add it just because you are
 replying to them, answering an ordinary question, or mentioning their name.
 When in doubt, omit it. Never write Discord mention syntax yourself.
+
+TAGGING ANOTHER MEMBER:
+Only when the user explicitly asks you to tag/mention ANOTHER server member,
+put [[tag:their name]] in your reply exactly where the mention belongs, using
+the name the user gave. One tag per person. Never tag anyone you were not
+asked to tag, never use it for @everyone or roles. If the request does not
+name a specific person, ask who they mean instead of guessing.
 """
 PING_MARKER_RE = re.compile(r"\[\[ping\]\]", re.IGNORECASE)
+TAG_MARKER_RE = re.compile(r"\[\[tag:([^\]]{1,50})\]\]", re.IGNORECASE)
 
 # Image vision (Gemini path only; the Groq fallback stays text-only)
 MAX_IMAGE_BYTES = 8 * 1024 * 1024     # skip images bigger than ~8MB
@@ -688,11 +696,67 @@ def chunk_reply(text, limit=MAX_REPLY_CHARS):
     return chunks
 
 
-def reply_mentions(message):
-    """Allow only the addressed member to be pinged, never roles/everyone."""
+def reply_mentions(message, extra_users=()):
+    """Allow only the addressed member (plus explicitly tagged members) to be
+    pinged, never roles/everyone."""
+    seen, users = set(), []
+    for u in (message.author, *extra_users):
+        if u.id not in seen:
+            seen.add(u.id)
+            users.append(u)
     return discord.AllowedMentions(
-        users=[message.author], roles=False, everyone=False, replied_user=False
+        users=users, roles=False, everyone=False, replied_user=False
     )
+
+
+def find_tag_target(guild, name):
+    """Resolve a member by the name the user gave. Returns (member, unclear):
+    member only on one confident match; unclear when ambiguous or not found."""
+    if guild is None:
+        return None, True
+    n = (name or "").strip().lstrip("@").casefold()
+    if not n:
+        return None, True
+    members = list(guild.members)
+    exact = [m for m in members if n in {
+        m.display_name.casefold(), m.name.casefold(), (m.global_name or "").casefold()
+    }]
+    if len(exact) == 1:
+        return exact[0], False
+    if len(exact) > 1:
+        return None, True
+    partial = [m for m in members
+               if m.display_name.casefold().startswith(n) or m.name.casefold().startswith(n)]
+    if len(partial) == 1:
+        return partial[0], False
+    return None, True
+
+
+def resolve_tag_requests(message, text):
+    """Swap the model's [[tag:name]] markers for real mentions of verified
+    members. Ambiguous or unknown names become plain @name text (no ping) and
+    are reported back so she can ask who was meant."""
+    text = text or ""
+    if not TAG_MARKER_RE.search(text):
+        return text, [], []
+    resolved, unclear = [], []
+
+    def _sub(match):
+        member, is_unclear = find_tag_target(message.guild, match.group(1))
+        if member is not None:
+            resolved.append(member)
+            return f"<@{member.id}>"
+        unclear.append(match.group(1).strip())
+        return "@" + match.group(1).strip()
+
+    out = TAG_MARKER_RE.sub(_sub, text)
+    return out, resolved, unclear
+
+
+TAG_UNCLEAR_LINES = [
+    "ek sec - {names} clear nahi ho paya, galat banda tag nahi karna 😅 poora username batao na?",
+    "ruko, {names} se mujhe sure nahi hai kaun... exact username doge? wrong person ko ping nahi karna 🥺",
+]
 
 
 def should_respond(message):
@@ -1260,6 +1324,13 @@ async def on_message(message):
 
     ping_requested, reply = extract_ping_request(reply)
     reply = sanitize_mentions(reply) or EMPTY_REPLY_FALLBACK
+    # only now, after model-written mention syntax is stripped, reinsert real
+    # mentions for verified [[tag:...]] targets; unclear names get a
+    # clarification ask instead of a guessed ping
+    reply, tag_members, tag_unclear = resolve_tag_requests(message, reply)
+    if tag_unclear:
+        names = ", ".join(f'"{n}"' for n in tag_unclear)
+        reply = (reply + "\n\n" + random.choice(TAG_UNCLEAR_LINES).format(names=names)).strip()
     # history keeps her reply for context, bounded so long chunked answers
     # cannot eat the brain's input-token headroom; the full text already
     # lives in the channel for anyone to scroll back to
@@ -1273,7 +1344,7 @@ async def on_message(message):
         await message.reply(
             first,
             mention_author=False,
-            allowed_mentions=reply_mentions(message),
+            allowed_mentions=reply_mentions(message, extra_users=tag_members),
         )
         for extra_chunk in chunks[1:]:
             await message.channel.send(extra_chunk)
