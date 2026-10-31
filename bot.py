@@ -286,6 +286,52 @@ SEARCH_HINT = (
     "your training data is outdated and will be wrong."
 )
 
+# --- Model-driven search ---------------------------------------------------
+# The regex fast-path above only catches explicit "search karo" commands and
+# version/leak-shaped questions. It can never cover every searchable topic
+# (character builds, team comps, weapons, materials, boss guides, random
+# real-world facts). So the BRAIN itself can ask for one live search per
+# reply by emitting a [[search: query]] marker; the runtime runs it and makes
+# a second brain call with the results. The marker text is never shown.
+MODEL_SEARCH_RE = re.compile(r"\[\[\s*search\s*:\s*([^\]\n]{3,200}?)\s*\]\]", re.IGNORECASE)
+
+MODEL_SEARCH_CAPABILITY = (
+    "\n\nSEARCH ON YOUR OWN: When a member asks about something you are not "
+    "sure of - character builds, team comps, weapons, artifacts, materials, "
+    "boss or domain guides, current or upcoming versions, banners, leaks, "
+    "news, or any real-world fact - do NOT guess from memory and do NOT just "
+    "say you don't know. Instead reply with ONLY a search request on its own "
+    "line, exactly like this: [[search: short clean english query]]. The bot "
+    "runtime will run that search and hand you the results, and then you "
+    "answer from them. Use it at most once per reply, and only when you "
+    "actually need outside info - never for chit-chat, greetings, opinions, "
+    "or static game lore you already know well. NEVER claim you searched the "
+    "internet or describe what results said unless the runtime actually gave "
+    "you results - the [[search: ...]] marker is the ONLY way to search, and "
+    "members never see the marker."
+)
+
+MODEL_SEARCH_HINT = (
+    "\n\nYou asked for a web search and the runtime just ran it - fresh "
+    "results are below. Answer ONLY from what the results say, in your normal "
+    "voice, and naturally mention where the info came from (site or source "
+    "name). If the results are off-topic, empty, or do not really answer the "
+    "question, say honestly that the search did not find it - and when there "
+    "is a likely reason (for example the character or thing is not released "
+    "or playable yet, or only unconfirmed leaks exist), explain THAT instead "
+    "of a flat 'nahi mila'. NEVER fill the gap from your own memory about "
+    "current or future game versions, banners, leaks, builds or news - your "
+    "training data is outdated and will be wrong."
+)
+
+MODEL_SEARCH_FAIL_NOTE = (
+    "\n\nYou asked for a web search, but the search FAILED (or the daily "
+    "search limit was reached), so NO results were provided. Tell the member "
+    "plainly, in your normal voice, that the search did not work right now "
+    "and they can try again in a bit. Do not guess the answer from memory, "
+    "and do not say you searched the internet - you did not get any results."
+)
+
 _search_day = ""
 _search_count = 0
 
@@ -736,7 +782,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]
     for author, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -786,7 +832,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -868,6 +914,46 @@ async def think_search(channel_id, diary_block="", extra_system="", image_parts=
     )
     return await think(channel_id, diary_block, image_parts=image_parts,
                        extra_system=extra_system + search_block)
+
+async def maybe_model_search(channel_id, reply, diary_block, extra="", image_parts=None):
+    """Let the brain ask for ONE live search per reply via a [[search: q]] marker.
+
+    Returns the final reply to send. No marker -> reply unchanged (zero extra
+    API calls, so ordinary chat is untouched). With a marker: run the search
+    (respecting the daily cap), then make a second brain call with the results
+    (or with a transparent failure note) so she answers grounded - and can
+    never claim she searched when no search actually happened.
+    """
+    m = MODEL_SEARCH_RE.search(reply or "")
+    if not m:
+        return reply
+    query = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
+    log.info("Model-driven search requested: %s", query)
+    if search_quota_left():
+        try:
+            mark_search_used()
+            digest = await fetch_search_results(query)
+            note = (f'{MODEL_SEARCH_HINT}\n\n(search query used: "{query}")\n'
+                    f"Web search results:\n{digest}")
+        except Exception as e:
+            log.warning("Model-driven search failed: %s", e)
+            note = MODEL_SEARCH_FAIL_NOTE
+    else:
+        note = MODEL_SEARCH_FAIL_NOTE
+    try:
+        followup = await think(channel_id, diary_block, image_parts=image_parts,
+                               extra_system=extra + note)
+    except Exception as e:
+        log.warning("Model search follow-up brain call failed: %s", e)
+        followup = ""
+    followup = MODEL_SEARCH_RE.sub("", followup or "").strip()
+    if followup:
+        return followup
+    # The follow-up brain call gave nothing: stay transparent, never guess.
+    question = latest_question(channel_id)
+    if re.search(r"\b(karo|kar|batao|bata|kya|hai|hain|mein|ka|ki|nahi|kyu)\b", question, re.I):
+        return "abhi search nahi ho paya, isliye main guess nahi karungi 🥺 thodi der baad phir pooch na."
+    return "i couldn't search just now, so i don't want to guess. try again in a bit?"
 
 async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
@@ -1011,9 +1097,11 @@ async def on_message(message):
                             log.warning("Replying transparently: %s", search_error)
                     else:
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
+                        reply = await maybe_model_search(message.channel.id, reply, diary_block, extra, image_parts)
                 except Exception as e:
                     log.warning("AI brain error: %s", e)
                     reply = random.choice(FALLBACK_LINES)
+                reply = MODEL_SEARCH_RE.sub("", reply or "").strip()
                 reaction, reply = extract_reaction(reply)
                 if not reply:
                     reply = EMPTY_REPLY_FALLBACK
@@ -1043,3 +1131,4 @@ async def on_message(message):
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
 client.run(DISCORD_TOKEN)
+
