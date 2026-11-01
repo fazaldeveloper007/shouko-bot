@@ -19,7 +19,7 @@ class DiagnosticsTests(unittest.IsolatedAsyncioTestCase):
    def __exit__(self,*a):pass
    def extract_info(self,*a,**k):return dict(id='jNQXAC9IVRw',title='test',duration=19,url='https://media.googlevideo.com/audio')
   class R:
-   status=200
+   status=200;headers={}
    def __enter__(self):return self
    def __exit__(self,*a):pass
    def geturl(self):return 'https://media.googlevideo.com/audio'
