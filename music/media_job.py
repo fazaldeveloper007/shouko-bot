@@ -39,7 +39,7 @@ def reusable_source(info):
     if expiry<time.time()+45:return None
     headers=info.get('http_headers') or {}
     if not isinstance(headers,dict) or any(not isinstance(k,str) or not isinstance(v,str) or '\r' in k+v or '\n' in k+v for k,v in headers.items()):return None
-    return {k:info.get(k) for k in ('id','title','duration','is_live','live_status','url','ext','acodec','http_headers')}
+    return {k:info.get(k) for k in ('id','title','duration','abr','is_live','live_status','url','ext','acodec','http_headers')}
 
 def _perform(request, rows):
     from yt_dlp import YoutubeDL
