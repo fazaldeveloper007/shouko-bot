@@ -265,6 +265,30 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(follow.reply.call_args.kwargs['allowed_mentions'].everyone)
         self.assertFalse(self.bot._roster_clarifications.matches(follow))
 
+    async def test_empty_generation_retries_before_one_discord_reply(self):
+        from test_retrying import Session, Response
+        m=self.msg('Kristy Junaid ko jawab do');m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        from unittest.mock import MagicMock
+        m.channel.typing=MagicMock()
+        m.channel.typing.return_value.__aenter__=AsyncMock();m.channel.typing.return_value.__aexit__=AsyncMock()
+        self.bot.client.music=None
+        self.bot.GEMINI_API_KEY='OFFLINE';self.bot.GROQ_API_KEY=''
+        session=Session([Response(200,{'candidates':[{'finishReason':'MALFORMED_RESPONSE'}]}),Response(200,{'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':'Haan, sun rahi hoon.'}]}}]})])
+        with patch.object(self.bot,'groq_session',new=AsyncMock(return_value=session)), patch('retrying.asyncio.sleep',new=AsyncMock()), patch.object(self.bot,'try_reaction',new_callable=AsyncMock), patch.object(self.bot,'maybe_schedule_extraction'):
+            await self.bot.on_message(m)
+        self.assertEqual(len(session.calls),2);m.reply.assert_awaited_once()
+        self.assertIn('sun rahi',m.reply.call_args.args[0])
+
+    async def test_blocked_generation_never_provider_fallback(self):
+        from test_retrying import Session, Response
+        self.bot.GEMINI_API_KEY='OFFLINE';self.bot.GROQ_API_KEY='OFFLINE'
+        self.bot.history[555000].append(('Fazal',1,'hello'))
+        session=Session([Response(200,{'promptFeedback':{'blockReason':'SAFETY'}})])
+        with patch.object(self.bot,'groq_session',new=AsyncMock(return_value=session)), patch.object(self.bot,'think_groq',new_callable=AsyncMock) as groq:
+            with self.assertRaises(self.bot.retrying.RequestError):
+                await self.bot.think(555000)
+        self.assertEqual(len(session.calls),1);groq.assert_not_awaited()
+
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
             m=self.msg(text)
