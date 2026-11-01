@@ -44,6 +44,8 @@ import aliases
 import retrying
 import self_diary
 import voice_roster
+import timed_messages
+import schedule_commands
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -159,6 +161,8 @@ class KristyClient(discord.Client):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if globals().get("_schedule_worker"):
+            await _schedule_worker.close()
         if getattr(self, 'music', None):
             await self.music.close()
         await super().close()
@@ -1611,6 +1615,10 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
             log.warning("Gemini brain failed, falling back to Groq: %s", type(e).__name__)
     return await think_groq(channel_id, diary_block, extra_system)
 
+_schedule_store = timed_messages.Store(self_diary.PATH.parent / 'scheduled-messages.json')
+_schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected)
+_schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+
 _voice_cache_connected = False
 _roster_clarifications = voice_roster.Clarifications()
 
@@ -1628,6 +1636,7 @@ async def on_ready():
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
     announcements.start(client)
+    _schedule_worker.start()
     if client.music:
         await client.music.ready()
 
@@ -1717,6 +1726,9 @@ async def on_message(message):
         # reply and Gemini rejects the request with a 400.
         content = EMPTY_MESSAGE_PROMPT
         history[message.channel.id].append((speaker, user_id, content))
+
+    if await _schedule_commands.handle(message, _addressed_text(content), client, action_text):
+        return
 
     # Read actual current voice states in code; never ask the model to guess.
     if roster_followup or (action_text(message, content, question=True) is not None and voice_roster.is_query(content)):
