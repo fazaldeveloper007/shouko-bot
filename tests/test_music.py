@@ -115,9 +115,121 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emojis[0],{'id':111111111111111111,'name':'k_play'})
         self.assertEqual(emojis[1],{'id':222222222222222222,'name':'icon'})
         self.assertEqual(emojis[4]['name'],'👋')  # unset falls back
+    async def test_prefetch_downloads_next_during_playback(self):
+        p=self.player();played=[];downloads=[]
+        async def download(t,path,**kw):
+            downloads.append(t.title);await asyncio.sleep(.05);path.write_bytes(b'd');return path
+        async def play(path):
+            played.append(path.name)
+            f=asyncio.get_running_loop().create_future()
+            if len(played)==1: asyncio.get_running_loop().call_later(.2,f.set_result,{'type':'ended'})
+            else: f.set_result({'type':'ended'})
+            return 'tok',f
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        await p.add(Track('aaaaaaaaaaa','one',19,1));await p.add(Track('bbbbbbbbbbb','two',19,1))
+        await asyncio.wait_for(p.task,3)
+        self.assertEqual(downloads,['one','two'])
+        self.assertEqual(len(played),2)
+        self.assertTrue(played[1].startswith('prefetch-'))  # second track reused the prefetch file
+    async def test_prefetch_failure_falls_back_to_foreground(self):
+        p=self.player();played=[];attempts=[]
+        async def download(t,path,**kw):
+            attempts.append(t.title)
+            if t.title=='two' and attempts.count('two')==1: raise MediaError('FAIL')
+            await asyncio.sleep(.01);path.write_bytes(b'd');return path
+        async def play(path):
+            played.append(path.name)
+            f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
+            return 'tok',f
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        await p.add(Track('aaaaaaaaaaa','one',19,1));await p.add(Track('bbbbbbbbbbb','two',19,1))
+        await asyncio.wait_for(p.task,3)
+        self.assertEqual(attempts,['one','two','two'])  # failed prefetch retried in foreground
+        self.assertEqual(len(played),2)
+    async def test_prefetch_cancelled_on_stop(self):
+        p=self.player();started=asyncio.Event()
+        async def download(t,path,**kw):
+            if t.title=='two':
+                started.set();await asyncio.sleep(10)
+            path.write_bytes(b'd');return path
+        never=asyncio.get_running_loop().create_future()
+        async def play(path): return 'tok',never
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        await p.add(Track('aaaaaaaaaaa','one',19,1));await p.add(Track('bbbbbbbbbbb','two',19,1))
+        await asyncio.wait_for(started.wait(),2)
+        self.assertIsNotNone(p.prefetch)
+        await p.interrupt(clear=True)
+        self.assertIsNone(p.prefetch)
+    async def test_background_admission_preserves_foreground_slot(self):
+        from music.media import Media
+        media=Media();entered=[];release=asyncio.Event()
+        async def fake_job(mode,value,destination=None,**kw):
+            entered.append(value);await release.wait();return {'id':value}
+        media._job=fake_job
+        bg1=asyncio.create_task(media.job('download','bg1','/tmp/a',background=True))
+        bg2=asyncio.create_task(media.job('download','bg2','/tmp/b',background=True))
+        fg=asyncio.create_task(media.job('download','fg','/tmp/c'))
+        await asyncio.sleep(.1)
+        self.assertEqual(entered,['bg1','fg'])  # second background waits on admission; foreground never blocks
+        release.set();await asyncio.gather(bg1,bg2,fg)
+    async def test_prefetch_discarded_when_track_changes(self):
+        p=self.player();started=asyncio.Event()
+        async def download(t,path,**kw): started.set();path.write_bytes(b'd');return path
+        p.manager.media.download=download
+        p.queue.append(Track('bbbbbbbbbbb','two',19,1))
+        p._prefetch_start()
+        await asyncio.wait_for(started.wait(),2)
+        other=Track('ccccccccccc','three',19,1)
+        self.assertIsNone(await p._prefetch_take(other))  # different track: prefetch discarded, foreground must fetch
+        self.assertIsNone(p.prefetch)
+        self.assertFalse(list(p.media_dir.iterdir()))
+    async def test_prefetch_take_returns_completed_file(self):
+        p=self.player()
+        async def download(t,path,**kw): path.write_bytes(b'd');return path
+        p.manager.media.download=download
+        t=Track('bbbbbbbbbbb','two',19,1);p.queue.append(t)
+        p._prefetch_start()
+        path=await p._prefetch_take(t)
+        self.assertIsNotNone(path);self.assertTrue(path.exists())
+        path.unlink(missing_ok=True)
+    async def test_stop_during_inflight_prefetch_cleans_up(self):
+        p=self.player();started=asyncio.Event()
+        async def download(t,path,**kw):
+            if t.title=='two': started.set();await asyncio.sleep(10)
+            path.write_bytes(b'd');return path
+        never=asyncio.get_running_loop().create_future()
+        async def play(path): return 'tok',never
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        await p.add(Track('aaaaaaaaaaa','one',19,1));await p.add(Track('bbbbbbbbbbb','two',19,1))
+        await asyncio.wait_for(started.wait(),2)
+        pf=p.prefetch
+        await p.interrupt(clear=True)
+        self.assertTrue(pf['task'].cancelled() or pf['task'].done())
+        self.assertIsNone(p.prefetch)
+        self.assertFalse(list(p.media_dir.glob('prefetch-*')))
+    async def test_close_during_inflight_prefetch_cleans_up(self):
+        p=self.player();started=asyncio.Event()
+        async def download(t,path,**kw): started.set();await asyncio.sleep(10);return path
+        p.queue.append(Track('bbbbbbbbbbb','two',19,1))
+        p.manager.media.download=download
+        p._prefetch_start()
+        await asyncio.wait_for(started.wait(),2)
+        pf=p.prefetch
+        await p.close()
+        self.assertTrue(pf['task'].cancelled() or pf['task'].done())
+        self.assertIsNone(p.prefetch)
+    async def test_failed_prefetch_exception_retrieved_on_close(self):
+        p=self.player()
+        async def download(t,path,**kw): raise MediaError('FAIL')
+        p.queue.append(Track('bbbbbbbbbbb','two',19,1))
+        p.manager.media.download=download
+        p._prefetch_start()
+        await asyncio.sleep(.1)  # let it fail
+        await p.close()  # must not raise or leak the task exception
+        self.assertIsNone(p.prefetch)
     async def test_autoplay_refills_queue_after_natural_end(self):
         p=self.player();played=[]
-        async def download(t,path): path.write_bytes(b'dummy');return path
+        async def download(t,path,**kw): path.write_bytes(b'dummy');return path
         async def play(path):
             played.append(path.name)
             f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
@@ -132,7 +244,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.manager.media.related.await_count,2)
     async def test_autoplay_off_never_searches(self):
         p=self.player();played=[]
-        async def download(t,path): path.write_bytes(b'dummy');return path
+        async def download(t,path,**kw): path.write_bytes(b'dummy');return path
         async def play(path):
             played.append(path.name)
             f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
@@ -218,7 +330,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         proc.kill.assert_called_once();proc.wait.assert_awaited_once()
     async def test_actual_queue_advances_and_cleans_files(self):
         p=self.player();played=[]
-        async def download(t,path): path.write_bytes(b'dummy');return path
+        async def download(t,path,**kw): path.write_bytes(b'dummy');return path
         async def play(path):
             played.append(path.name)
             f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
@@ -229,7 +341,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(played),2);self.assertFalse(p.current);self.assertFalse(list(p.media_dir.iterdir()))
     async def test_stop_cancels_inflight_download(self):
         p=self.player();started=asyncio.Event();cancelled=asyncio.Event()
-        async def download(t,path):
+        async def download(t,path,**kw):
             started.set()
             try:await asyncio.sleep(20)
             finally:cancelled.set()
