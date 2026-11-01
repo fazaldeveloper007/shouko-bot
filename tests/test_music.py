@@ -92,10 +92,11 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.has_components_v2())
         comps=view.to_components();self.assertEqual(comps[0]['type'],17)
         inner=comps[0]['components'];self.assertLessEqual(len(inner),10)
-        rows=[c for c in inner if c['type']==1];self.assertEqual(len(rows),1)
+        rows=[c for c in inner if c['type']==1];self.assertEqual(len(rows),2)
         emojis=[b.get('emoji',{}).get('name') for b in rows[0]['components']]
         self.assertEqual(emojis,['⏸️','⏭️','📋','⏹️','👋'])
         self.assertTrue(all(not b.get('label') for b in rows[0]['components']))
+        self.assertEqual([b.get('label') for b in rows[1]['components']],['Autoplay: Off'])
         texts=[c for c in inner if c['type']==10]
         self.assertTrue(any('Audio player' in t['content'] for t in texts))
         self.assertTrue(any('now playing' in t['content'] for t in texts))
@@ -114,6 +115,84 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emojis[0],{'id':111111111111111111,'name':'k_play'})
         self.assertEqual(emojis[1],{'id':222222222222222222,'name':'icon'})
         self.assertEqual(emojis[4]['name'],'👋')  # unset falls back
+    async def test_autoplay_refills_queue_after_natural_end(self):
+        p=self.player();played=[]
+        async def download(t,path): path.write_bytes(b'dummy');return path
+        async def play(path):
+            played.append(path.name)
+            f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
+            return 'dummy',f
+        related=Track('abcdefghijk','related song',19,1)
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        p.manager.media.related=AsyncMock(side_effect=[[related],[]])  # 2nd lookup: nothing unseen, stops
+        p.autoplay=True
+        await p.add(track('seed'))
+        await asyncio.wait_for(p.task,2)
+        self.assertEqual(len(played),2)  # seed + one related, no infinite loop
+        self.assertEqual(p.manager.media.related.await_count,2)
+    async def test_autoplay_off_never_searches(self):
+        p=self.player();played=[]
+        async def download(t,path): path.write_bytes(b'dummy');return path
+        async def play(path):
+            played.append(path.name)
+            f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
+            return 'dummy',f
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        p.manager.media.related=AsyncMock()
+        await p.add(track('only'))
+        await asyncio.wait_for(p.task,2)
+        self.assertEqual(len(played),1);p.manager.media.related.assert_not_called()
+    async def test_skip_refills_when_autoplay_on_stop_doesnt(self):
+        p=self.player()
+        p.autoplay=True;p.last_track=track('seed');p.autoplay_history.append(p.last_track.id)
+        p.manager.media.related=AsyncMock(return_value=[])
+        await p.interrupt()
+        await asyncio.wait_for(p.task,2)  # skip with empty queue starts autoplay lookup
+        p.manager.media.related.assert_awaited_once()
+        await p.interrupt(clear=True)
+        p.manager.media.related.assert_awaited_once()  # explicit stop never refills
+    async def test_autoplay_related_dedup_and_off_during_lookup(self):
+        from music.media import normalize_title, Media
+        media=Media()
+        seed=track("GIMS - Est-ce que tu m'aimes ? (Clip officiel)")
+        media.job=AsyncMock(return_value={'items':[
+            dict(id=seed.id,duration=19,title=seed.title),                       # same id
+            dict(id='ABCDEFGHIJK',duration=19,title="Est-ce que tu m'aimes ? (Lyrics)"),  # same song, variant
+            dict(id='bcdefghijk0',duration=19,title='Different song') ]})
+        out=await media.related(seed, {seed.id}, set())
+        self.assertEqual([t.id for t in out],['bcdefghijk0'])
+        # Turning Off mid-lookup must not enqueue.
+        p=self.player();p.autoplay=True;p.last_track=track('seed');p.autoplay_history.append(p.last_track.id)
+        async def slow_related(*a,**k):
+            p.autoplay=False
+            return [Track('bcdefghijk0','other',19,1)]
+        p.manager.media.related=slow_related
+        self.assertFalse(await p.autoplay_refill());self.assertFalse(p.queue)
+    async def test_autoplay_stop_during_lookup_never_enqueues(self):
+        p=self.player();p.autoplay=True;p.last_track=track('seed');p.autoplay_history.append(p.last_track.id)
+        started=asyncio.Event()
+        async def slow_related(*a,**k):
+            started.set();await asyncio.sleep(10)
+        p.manager.media.related=slow_related
+        await p.interrupt()  # skip: starts refill lookup
+        await asyncio.wait_for(started.wait(),1)
+        await p.interrupt(clear=True)  # stop cancels the pending lookup
+        self.assertFalse(p.queue)
+        await asyncio.sleep(0.05);self.assertFalse(p.queue)
+    async def test_autoplay_toggle_button(self):
+        p=self.player();p.manager.get=AsyncMock(return_value=p);p.manager.caller_channel=lambda u,ch:p.channel
+        interaction=types.SimpleNamespace(user=types.SimpleNamespace(id=1),channel=p.channel,channel_id=20,
+            response=types.SimpleNamespace(is_done=lambda:False,defer=AsyncMock(),send_message=AsyncMock()),
+            followup=SimpleNamespace_send())
+        view=player_panel(p.manager,p)
+        toggle=[b for b in view.walk_children() if isinstance(b,discord.ui.Button) and (b.label or '').startswith('Autoplay')][0]
+        await toggle.callback(interaction)
+        self.assertTrue(p.autoplay)
+        p.manager.panel.assert_awaited()
+        view=player_panel(p.manager,p)
+        labels=[b.label for b in view.walk_children() if isinstance(b,discord.ui.Button) and b.label]
+        self.assertEqual(labels,['Autoplay: On'])
+        await p.manager.remove(p)
     async def test_command_tree_setup_no_sync_or_login(self):
         c=discord.Client(intents=discord.Intents.none());m=Music(c)
         self.assertEqual({x.name for x in m.tree.get_commands()},{'joinvckristy','leavevckristy','search','play','pause','next','queue','stop'})
