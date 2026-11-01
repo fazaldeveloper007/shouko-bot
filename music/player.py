@@ -38,6 +38,10 @@ class GuildPlayer:
         self.panel_dirty = False
         self.panel_status = None
         self.panel_orphans = []
+        self.autoplay = False
+        self.last_track = None
+        self.autoplay_history = deque(maxlen=25)
+        self.autoplay_titles = deque(maxlen=25)
 
     async def connect(self):
         bridge = Bridge(self.manager.client, self.channel, self.media_dir,
@@ -83,11 +87,19 @@ class GuildPlayer:
         try:
             while not self.closed:
                 async with self.lock:
-                    if not self.queue: break
-                    self.current = self.queue.popleft(); self.paused = False; self.started = 0
-                    track = self.current; generation = self.generation
-                    queued = self.queued_at.pop(id(track), time.monotonic())
-                    emit('QUEUE_WAIT','OK',elapsed=time.monotonic()-queued)
+                    if self.queue:
+                        self.current = self.queue.popleft(); self.paused = False; self.started = 0
+                        track = self.current; generation = self.generation
+                        queued = self.queued_at.pop(id(track), time.monotonic())
+                        emit('QUEUE_WAIT','OK',elapsed=time.monotonic()-queued)
+                    else:
+                        track = None
+                if track is None:
+                    if not await self.autoplay_refill(): break
+                    continue
+                self.autoplay_history.append(track.id)
+                self.autoplay_titles.append(track.title)
+                self.last_track = track
                 path = self.media_dir / ('track-' + secrets.token_hex(8) + '.webm')
                 try:
                     await self.manager.panel(self, 'Loading audio...')
@@ -134,6 +146,36 @@ class GuildPlayer:
                     if self.queue and not self.closed:
                         self.task = asyncio.create_task(self.run())
 
+    async def autoplay_refill(self):
+        # Queue ran out: when autoplay is on, ask YouTube's radio for the last track and
+        # queue the first related song not already played (by id or title variant) this session.
+        if not self.autoplay or self.closed: return False
+        async with self.lock:
+            if self.queue: return True  # someone queued meanwhile
+            seed = self.last_track
+        if not seed: return False
+        await self.manager.panel(self, 'Autoplay: finding a related track...')
+        try:
+            candidates = await self.manager.media.related(seed, set(self.autoplay_history), set(self.autoplay_titles))
+        except Exception:
+            return False
+        async with self.lock:
+            if self.closed or not self.autoplay: return False  # Off/Leave during the lookup wins
+            if self.queue: return True  # manually queued tracks keep priority
+            for t in candidates:
+                if t.id not in self.autoplay_history:
+                    self.queue.append(t); self.queued_at[id(t)] = time.monotonic()
+                    return True
+        return False
+
+    async def set_autoplay(self, enabled):
+        async with self.lock:
+            self.autoplay = enabled
+            if enabled and not self.current and not self.queue and not self.closed and (not self.task or self.task.done()):
+                if self.idle: self.idle.cancel()
+                self.task = asyncio.create_task(self.run())
+        await self.manager.panel(self)
+
     async def start_queue(self):
         async with self.lock:
             if not self.current and self.queue and (not self.task or self.task.done()):
@@ -171,6 +213,8 @@ class GuildPlayer:
                 self.interrupting = False
                 self.current = None; self.paused = False
                 if self.queue and not self.closed:
+                    self.task = asyncio.create_task(self.run())
+                elif not clear and self.autoplay and self.last_track and not self.closed:
                     self.task = asyncio.create_task(self.run())
                 else: self.arm_idle()
             await self.manager.panel(self)
