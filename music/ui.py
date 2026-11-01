@@ -9,7 +9,7 @@ from .diagnostics import emit
 
 ERROR_TEXT = 'Music request failed. Try again later; no API keys or session details are shown.'
 ACCENT = 0xB79AFF
-PLAYER_FOOTER = 'VC chat only • No AI for music controls • 5-minute idle leave'
+PLAYER_FOOTER = 'VC chat only • No AI for music controls'
 
 def clean(text, limit=180):
     return discord.utils.escape_markdown(discord.utils.escape_mentions(text))[:limit]
