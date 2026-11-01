@@ -101,9 +101,18 @@ class Media:
         self.max_seconds = max_minutes * 60
         self.max_bytes = max_bytes
         self.slots = asyncio.Semaphore(2)
+        self.bg_slots = asyncio.Semaphore(1)  # background admission: one prefetch globally, foreground slot always free
         self.prepared = {}  # short-lived process-local capabilities; never log or persist
 
-    async def job(self, mode, value, destination=None, *, prepared=None, expected_id=None, related_title=None):
+    async def job(self, mode, value, destination=None, *, prepared=None, expected_id=None, related_title=None, background=False):
+        # Background jobs (prefetch) are admission-limited to one globally, so one
+        # foreground slot always stays free; total fetch pressure is unchanged.
+        if background:
+            async with self.bg_slots:
+                return await self._job(mode, value, destination, prepared=prepared, expected_id=expected_id, related_title=related_title)
+        return await self._job(mode, value, destination, prepared=prepared, expected_id=expected_id, related_title=related_title)
+
+    async def _job(self, mode, value, destination=None, *, prepared=None, expected_id=None, related_title=None):
         allowed = ('PATH', 'HOME', 'TMPDIR', 'PREFIX', 'LD_LIBRARY_PATH', 'LD_PRELOAD',
                    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'LANG', 'LC_ALL')
         env = {k: os.environ[k] for k in allowed if k in os.environ}
@@ -181,10 +190,10 @@ class Media:
             out.append(track)
         return out
 
-    async def download(self, track, destination):
+    async def download(self, track, destination, *, background=False):
         cached=self.prepared.pop(track.id,None)
         prepared=dict(cached[1],_remaining=max(0,cached[0]-time.monotonic())) if cached and cached[0]>time.monotonic() else None
-        result = await self.job('download', track.url, destination, prepared=prepared, expected_id=track.id)
+        result = await self.job('download', track.url, destination, prepared=prepared, expected_id=track.id, background=background)
         if result.get('id') != track.id:
             raise media_failure('SOURCE_CHANGED')
         return pathlib.Path(destination)
