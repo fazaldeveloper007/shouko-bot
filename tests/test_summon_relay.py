@@ -304,6 +304,16 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.load()[0]['status'],'preview');self.assertEqual(store.load()[0]['targets'],[2])
         self.assertFalse(m.reply.call_args.kwargs['allowed_mentions'].everyone)
 
+    async def test_natural_reminder_and_samechannel_never_fallthrough_brain(self):
+        m=self.msg('Kristy reminder laga do 9:20 PM ka');m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        m.reply.return_value=types.SimpleNamespace(id=444)
+        self.bot.client.music=None
+        with patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
+            await self.bot.on_message(m)
+            follow=self.msg('haan isi channel mein dena');follow.attachments=[];follow.stickers=[];follow.embeds=[];follow.reference=types.SimpleNamespace(message_id=444,resolved=None)
+            await self.bot.on_message(follow)
+        brain.assert_not_awaited();self.assertIn('active nahi',follow.reply.call_args.args[0])
+
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
             m=self.msg(text)
