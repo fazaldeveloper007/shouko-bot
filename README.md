@@ -304,3 +304,17 @@ text channel. A reply to some other message does not select a VC for it; quoted,
 forwarded or prose-only answers are not interpreted as roster selections. The
 selection is consumed on lookup and the normal current access/readiness checks
 run again. After expiry, ask the full question with the VC mention again.
+
+Generation retries also validate HTTP 200 responses: missing/malformed/empty
+Gemini or Groq text is retryable within the same three-call operation cap and
+60-second response deadline. A reaction-only/unusable reply is not treated as
+a successful answer; a valid model-search request still is a valid intermediate
+step. Explicit provider safety/policy blocks stop without retry or alternate-
+provider bypass. Permanent HTTP failures and quota/long Retry-After limits still
+fail fast. Local history/setup errors are not blindly replayed.
+
+Termux logs now show safe provider labels, actual call `attempt=N/3`, HTTP status
+and fixed reason codes such as `empty_output`, `malformed_output` or `blocked`,
+without provider response bodies, request headers or keys. These logs distinguish
+silent retries from an immediate non-retryable stop. Only one final Discord
+answer/fallback is sent; screenshot timestamps alone cannot count attempts.
