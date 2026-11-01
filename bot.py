@@ -40,6 +40,7 @@ import discord
 from persona import SYSTEM_PROMPT
 from gifs import GIFS, CHARACTER_GIFS
 import diary
+import aliases
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -104,6 +105,13 @@ put [[tag:their name]] in your reply exactly where the mention belongs, using
 the name the user gave. One tag per person. Never tag anyone you were not
 asked to tag, never use it for @everyone or roles. If the request does not
 name a specific person, ask who they mean instead of guessing.
+
+NICKNAMES & VC SUMMONS (handled by code, no marker needed):
+Members can teach you nicknames ("Mayank ka username mayank_123" or
+"call me X") and can ask you to call named people to VC in a specific
+#channel they mention. Both are handled for you, so never claim you cannot
+do these; if a name or channel is unclear, the code asks instead of
+guessing. You never tag anyone you were not asked to tag.
 """
 PING_MARKER_RE = re.compile(r"\[\[ping\]\]", re.IGNORECASE)
 TAG_MARKER_RE = re.compile(r"\[\[tag:([^\]]{1,50})\]\]", re.IGNORECASE)
@@ -760,6 +768,19 @@ def find_tag_target(guild, name):
     n = (name or "").strip().lstrip("@").casefold()
     if not n:
         return None, True
+    # Taught server nicknames win over fuzzy matching: they are explicit
+    # mappings stored by member ID, verified against the live member list
+    # here. A stale alias (member left) is unresolvable - never fall through
+    # to a fuzzy guess that could tag the wrong person.
+    try:
+        aliased_id = aliases.resolve(guild.id, name)
+    except Exception:
+        aliased_id = None
+    if aliased_id is not None:
+        member = guild.get_member(aliased_id)
+        if member is not None:
+            return member, False
+        return None, True
     members = list(guild.members)
     exact = [m for m in members if n in {
         m.display_name.casefold(), m.name.casefold(), (m.global_name or "").casefold()
@@ -800,6 +821,384 @@ TAG_UNCLEAR_LINES = [
     "ek sec - {names} clear nahi ho paya, galat banda tag nahi karna 😅 poora username batao na?",
     "ruko, {names} se mujhe sure nahi hai kaun... exact username doge? wrong person ko ping nahi karna 🥺",
 ]
+
+# ---------------------------------------------------------------------------
+# Nickname registry + VC summons.
+# Both are handled in CODE, parsed from the CURRENT addressed message only.
+# Model output, chat history, quoted text and diary/registry contents can
+# never trigger a ping, a save or a cross-channel post: no stored value is
+# ever used to build mention syntax, and every relay below goes out only
+# after code-side verification of the people and the destination.
+# ---------------------------------------------------------------------------
+
+# "Mayank ka username mayank_123 (hai)" / "Mayank's username is mayank_123"
+ALIAS_TEACH_RE = re.compile(
+    r"(?P<alias>[\w][\w .-]{0,30}?)\s+ka\s+(?:discord\s+)?username\s+"
+    r"[\s:=]*(?:is[\s:=]+)?(?P<username>[a-z0-9_.]{2,32})\b",
+    re.IGNORECASE,
+)
+ALIAS_TEACH_RE2 = re.compile(
+    r"(?P<alias>[\w][\w .-]{0,30}?)'s\s+(?:discord\s+)?username\s+"
+    r"[\s:=]*(?:is[\s:=]+)?(?P<username>[a-z0-9_.]{2,32})\b",
+    re.IGNORECASE,
+)
+# "call me X" / "mujhe X bulao (bulana/kehte ho/kehna)"
+SELF_ALIAS_RE = re.compile(
+    r"\bcall\s+me\s+(?P<alias>[\w][\w .-]{0,30}?)\s*[.!]?$", re.IGNORECASE)
+SELF_ALIAS_RE2 = re.compile(
+    r"\bmujhe\s+(?P<alias>[\w][\w .-]{0,30}?)\s+"
+    r"(?:bula\w*|kehti\s+ho|kehte\s+ho|kehna)\s*[.!]?$", re.IGNORECASE)
+# "Mayank ko bhool ja" / "forget the nickname Mayank"
+ALIAS_FORGET_RE = re.compile(
+    r"(?P<alias>[\w][\w .-]{0,30}?)\s+ko\s+bhool\s+ja\w*\s*[.!]?$", re.IGNORECASE)
+ALIAS_FORGET_RE2 = re.compile(
+    r"\bforget\s+(?:the\s+)?(?:name|alias|nickname)\s+"
+    r"(?P<alias>[\w][\w .-]{0,30}?)\s*[.!]?$", re.IGNORECASE)
+
+# leading filler words that can get swept into a captured nickname
+_ALIAS_FILLERS = {
+    "suno", "haan", "han", "ok", "okay", "accha", "acha", "are", "arre",
+    "toh", "to", "aur", "please", "pls", "plz", "yaar", "bro", "matlab",
+    "ki", "ab", "bas", "ek", "kaam", "karo", "kar", "bolo", "note",
+    "yaad", "rakhna", "rakho", "rakh", "remember", "likh", "likho", "lo",
+}
+# words that make a "call me ..." capture clearly not a name
+_NOT_NAME_WORDS = {
+    "when", "if", "after", "back", "later", "kal", "jab", "mat", "nahi",
+    "nhi", "dont", "don't", "please", "pls", "kab", "phir", "se", "kuch",
+}
+# aliases that would be ambiguous or abusive as names
+ALIAS_RESERVED_WORDS = {
+    "everyone", "here", "someone", "all", "koi", "sab", "sabko", "sabhi",
+    "channel", "server", "admin", "mod",
+}
+# never parsed as a nickname in "X ko bhool ja" - these are people-talk, not
+# names, and diary-forget phrases ("mujhe bhool ja") must fall through to the
+# diary handler (which is checked earlier anyway)
+ALIAS_FORGET_SKIP = {"mujhe", "hum", "humein", "unko", "usko", "inko", "isko", "sabko", "sab", "inhe", "unhe"}
+
+
+def action_text(message, content):
+    """Only a direct current human request is eligible for side effects.
+
+    Quotes, code, forwarded snapshots, reported speech, questions about a
+    command and negated commands are deliberately not action syntax.
+    This conservative parser may ask people to restate an unusual request.
+    """
+    if getattr(message.author, "bot", False) or getattr(message, "webhook_id", None):
+        return None
+    if getattr(message, "message_snapshots", None):
+        return None
+    if re.search(r"[`\"“”]|(?:^|\n)\s*>|https?://", content or ""):
+        return None
+    if re.search(r"\b(example|quote|quoted|said|says|bola|bolta|kehta|forwarded|agar|if|don't|dont|not|mat|nahi|nhi)\b|[?]", content or "", re.I):
+        return None
+    return _addressed_text(content)
+
+
+def _addressed_text(content):
+    text = re.sub(rf"^\s*{re.escape(BOT_NAME)}\b[,:! ]*", "", content or "", flags=re.I)
+    if client.user:
+        text = re.sub(rf"^\s*<@!?{client.user.id}>[,:! ]*", "", text)
+    return text.strip()
+
+
+def _strip_fillers(alias):
+    words = [w for w in (alias or "").split() if w.casefold() not in _ALIAS_FILLERS]
+    return " ".join(words[-3:])  # a nickname is at most a few words
+
+
+def _plausible_self_name(alias):
+    words = (alias or "").split()
+    return bool(alias) and len(words) <= 3 and not any(
+        w.casefold() in _NOT_NAME_WORDS for w in words)
+
+
+def alias_reserved_reason(guild, alias, member):
+    """Why this alias may not point at member, else None."""
+    a = (alias or "").casefold()
+    if not a:
+        return "ye naam theek nahi lag raha 😅 chhota sa simple naam do"
+    if a in ALIAS_RESERVED_WORDS or a == BOT_NAME.casefold():
+        return f'"{alias}" toh common word hai, isse confusion hoga 😅 koi doosra nickname do'
+    for m in list(guild.members):
+        if m.id == member.id:
+            continue
+        if a in {m.name.casefold(), m.display_name.casefold(), (m.global_name or "").casefold()}:
+            return (f'"{alias}" toh {m.display_name} ka apna naam hai - main usse hijack nahi kar sakti, '
+                    "doosra naam batao 😅")
+    return None
+
+
+async def _alias_reply(message, text):
+    try:
+        await message.reply(text, mention_author=False, allowed_mentions=reply_mentions(message))
+    except Exception:
+        log.exception("Failed to send alias reply in channel %s", message.channel.id)
+
+
+async def handle_alias_teach(message, content):
+    """'X ka username Y' -> remember X as a server nickname for member Y."""
+    content = action_text(message, content)
+    if content is None:
+        return False
+    content = re.sub(r"^(?:yaad rakhna|remember|note karlo)\s+", "", content, flags=re.I)
+    content = re.sub(r"\s+hai[.!]?$", "", content, flags=re.I).rstrip(".!")
+    m = ALIAS_TEACH_RE.fullmatch(content) or ALIAS_TEACH_RE2.fullmatch(content)
+    if not m:
+        return False
+    alias = aliases.clean_alias(_strip_fillers(m.group("alias")))
+    username = m.group("username")
+    if not alias:
+        await _alias_reply(message, "wo naam theek nahi lag raha 😅 chhota sa simple naam do")
+        return True
+    un = username.casefold()
+    matches = [mm for mm in list(message.guild.members) if mm.name.casefold() == un]
+    if len(matches) != 1:
+        await _alias_reply(
+            message,
+            f'"{username}" naam ka member is server mein clearly nahi mila - exact username dobara check karke batao? 😅')
+        return True
+    member = matches[0]
+    reason = alias_reserved_reason(message.guild, alias, member)
+    if reason:
+        await _alias_reply(message, reason)
+        return True
+    status, existing_id = aliases.set_alias(message.guild.id, alias, member.id, by_id=message.author.id)
+    if status == "taken":
+        existing = message.guild.get_member(existing_id)
+        who = existing.display_name if existing else "kisi aur"
+        await _alias_reply(
+            message,
+            f'"{alias}" toh already {who} ke liye saved hai - galat banda tag na ho isliye pehle '
+            f'"{alias} ko bhool ja" bolke hatana padega 🙈')
+        return True
+    if status in {"error", "invalid"}:
+        await _alias_reply(message, "abhi nickname save nahi hua, dobara try karna")
+        return True
+    if status == "full":
+        await _alias_reply(message, "meri nickname list full hai is server ki 😥 pehle koi purana naam bhulwao")
+        return True
+    await _alias_reply(message, f'likh liya 📔 ab "{alias}" bolne par {member.display_name} ko tag kar dungi 💗')
+    return True
+
+
+async def handle_self_alias(message, content):
+    """'call me X' / 'mujhe X bulao' -> nickname for the speaker themself."""
+    content = action_text(message, content)
+    if content is None:
+        return False
+    m = SELF_ALIAS_RE.search(content) or SELF_ALIAS_RE2.search(content)
+    if not m:
+        return False
+    alias = aliases.clean_alias(m.group("alias"))
+    if not _plausible_self_name(alias):
+        return False
+    reason = alias_reserved_reason(message.guild, alias, message.author)
+    if reason:
+        await _alias_reply(message, reason)
+        return True
+    status, existing_id = aliases.set_alias(message.guild.id, alias, message.author.id, by_id=message.author.id)
+    if status == "taken":
+        await _alias_reply(
+            message,
+            f'"{alias}" toh already kisi aur ka nickname hai 🙈 koi doosra naam choose karo, '
+            f'ya pehle "{alias} ko bhool ja" bulwao jiska hai')
+        return True
+    if status in {"error", "invalid"}:
+        await _alias_reply(message, "abhi nickname save nahi hua, dobara try karna")
+        return True
+    if status == "full":
+        await _alias_reply(message, "meri nickname list full hai is server ki 😥 pehle koi purana naam bhulwao")
+        return True
+    await _alias_reply(message, f'theek hai, ab tumhe "{alias}" se bhi tag kar sakti hain 💗')
+    return True
+
+
+async def handle_alias_forget(message, content):
+    """'X ko bhool ja' / 'forget the nickname X' -> drop a taught nickname."""
+    content = action_text(message, content)
+    if content is None:
+        return False
+    m = ALIAS_FORGET_RE.fullmatch(content) or ALIAS_FORGET_RE2.fullmatch(content)
+    if not m:
+        return False
+    alias = aliases.clean_alias(m.group("alias"))
+    if not alias or alias.casefold() in ALIAS_FORGET_SKIP:
+        return False
+    if aliases.remove_alias(message.guild.id, alias):
+        await _alias_reply(message, f'ho gaya, ab "{alias}" kisi ko tag nahi karega 👍')
+    else:
+        await _alias_reply(message, f'"{alias}" toh meri nickname list mein hai hi nahi 😅')
+    return True
+
+
+# ---- VC summons ------------------------------------------------------------
+
+# "bulao / bolo / bhejo / summon / tell them / vc join karo ..." - the verb
+# that makes a #channel mention a request to call people, not just talk
+SUMMON_VERB_RE = re.compile(
+    r"(\bbula\w*|\bbolo\b|\bbolna\b|\bbol\s+do\b"
+    r"|\bbhej\w*|\bsummon\b|\binvite\b"
+    r"|\bcall\s+(?:them|him|her|in|sab)\b|\btell\s+(?:them|sab)\b"
+    r"|\baao\b|\baajao\b|\baa\s+jao\b"
+    r"|\bvc\s+join\b|\bjoin\s+kar\w*)",
+    re.IGNORECASE,
+)
+
+CHANNEL_MENTION_RE = re.compile(r"<#\d+>")
+USER_MENTION_RE = re.compile(r"<@!?\d+>")
+
+SUMMON_STOPWORDS = {
+    "vc", "voice", "chat", "join", "karna", "karno", "karne", "karo", "kar",
+    "kardo", "kare", "kariye", "bolo", "bol", "bolna", "boldo", "bulao",
+    "bula", "bulana", "bulaao", "bulwa", "bulwao", "bhejo", "bhej", "bhejna",
+    "bhejdo", "turant", "abhi", "ab", "jaldi", "jald", "aao", "aajao", "aa",
+    "jao", "ja", "summon", "call", "tell", "ask", "invite", "please", "pls",
+    "plz", "ko", "ka", "ki", "ke", "mein", "me", "pe", "par", "per", "se",
+    "tak", "to", "in", "on", "at", "the", "is", "ye", "yeh", "wo", "woh",
+    "unko", "usko", "inko", "isko", "unhe", "sab", "sabko", "sabhi", "logo",
+    "log", "guys", "dena", "do", "dijiye", "zara", "ek", "baar", "msg",
+    "message", "ping", "mention", "tag", "fast", "quickly", "immediately",
+    "raha", "rahi", "rahe", "hai", "h", "ho", "un", "yahan", "wahan",
+    "idhar", "udhar", "hi", "bhi", "na", "thoda", "sabse", "us",
+    "channel", "group", "de", "liye", "hue", "huye", "gaya", "gaye",
+}
+
+MAX_SUMMON_PINGS = 5        # hard cap on people pinged per summon
+MAX_SUMMON_CANDIDATES = 8   # parsed name chunks allowed before we ask instead
+SUMMON_COOLDOWN = 45        # seconds between one member's summons per server
+_last_summon = {}           # (guild_id, user_id) -> monotonic time
+
+
+def extract_name_candidates(content):
+    """Pull the named people out of a summon request.
+
+    Markup (<#channel>, <@member>) and her own name are removed first; the
+    rest is split on separators / 'aur' / 'and', and what survives the
+    stopword filter is a candidate name to verify against the member list.
+    """
+    text = CHANNEL_MENTION_RE.sub(" ", content or "")
+    text = USER_MENTION_RE.sub(" ", text)
+    text = _addressed_text(text)
+    text = text.replace("#", " ")
+    candidates = []
+    for part in re.split(r"[,;&+\n/]|\baur\b|\band\b", text, flags=re.IGNORECASE):
+        words = [w for w in re.split(r"\s+", part.strip())
+                 if w and w.casefold() not in SUMMON_STOPWORDS]
+        name = " ".join(words).strip(" .!?,:\"'()[]{}")
+        if len(name) >= 2 and re.search(r"\w", name, re.UNICODE):
+            candidates.append(name)
+    return candidates
+
+
+def build_summon_text(requester, members):
+    """The fixed, code-built summons. No model text, no stored free text."""
+    mentions = " ".join(f"<@{m.id}>" for m in members)
+    vchan = getattr(getattr(requester, "voice", None), "channel", None)
+    vname = getattr(vchan, "name", "") if vchan else ""
+    where = f" ({vname} VC)" if vname else ""
+    return (f"{mentions} abhi ke abhi VC join kariye turant! 🎮\n"
+            f"- {requester.display_name} bula rahe hain{where}")
+
+
+async def _summon_reply(message, text):
+    try:
+        await message.reply(text, mention_author=False, allowed_mentions=reply_mentions(message))
+    except Exception:
+        log.exception("Failed to send summon reply in channel %s", message.channel.id)
+
+
+async def handle_summon(message, content):
+    """Relay a VC summon to the one #channel the requester natively mentioned.
+
+    Every failure mode asks or refuses IN the current channel and sends
+    nothing: an unclear name, a missing name, an unreachable destination,
+    too many people. A partial summons never goes out.
+    """
+    content = action_text(message, content)
+    if content is None:
+        return
+    guild = message.guild
+    author = message.author
+    mentioned = list(message.channel_mentions)
+    if len(mentioned) != 1:
+        await _summon_reply(message, "ek hi #channel mention karo na, itne mein se kahan bheju samajh nahi aaya 😅")
+        return
+    dest = mentioned[0]
+    # defensive: Discord's autocomplete only offers this server's channels,
+    # but never relay anywhere without verifying the destination's guild
+    if getattr(dest, "guild", None) is None or dest.guild.id != guild.id:
+        await _summon_reply(message, "us channel mein nahi bhej sakti - woh is server ka nahi hai 🙈")
+        return
+    if getattr(dest, "type", None) is not discord.ChannelType.text:
+        await _summon_reply(message, "wahan text nahi bhej sakti 😅 kisi text channel ko # mention karo")
+        return
+    me = guild.me
+    if me is None:
+        await _summon_reply(message, "meri server permissions verify nahi hui, abhi nahi bhejungi")
+        return
+    if me is not None:
+        bot_perms = dest.permissions_for(me)
+        if not (bot_perms.view_channel and bot_perms.send_messages):
+            await _summon_reply(message, f"{dest.mention} mein meri posting permission nahi hai 🥺 admin se settings check karwa do")
+            return
+    req_perms = dest.permissions_for(author)
+    if not (req_perms.view_channel and req_perms.send_messages):
+        await _summon_reply(message, "tum khud us channel ko dekh nahi sakte, wahan summon nahi bhejungi 🙈")
+        return
+
+    # people: native @mentions arrive already verified against the server
+    members, seen = [], set()
+    for raw_member in message.mentions:
+        m = guild.get_member(raw_member.id)
+        if m is None:
+            await _summon_reply(message, "ek member is server mein verify nahi hua, kuch nahi bheja")
+            return
+        if m.bot or (client.user and m.id == client.user.id):
+            continue
+        if m.id not in seen:
+            seen.add(m.id)
+            members.append(m)
+    unclear = []
+    for name in extract_name_candidates(content):
+        member, _unclear = find_tag_target(guild, name)
+        if member is not None and not member.bot:
+            if member.id not in seen:
+                seen.add(member.id)
+                members.append(member)
+        else:
+            unclear.append(name)
+    if unclear:
+        names = ", ".join(f'"{n}"' for n in unclear[:5])
+        await _summon_reply(
+            message,
+            f"ruko, {names} clear nahi ho paye - kuch bhejne se pehle pooch leti hoon: inke exact usernames batao? "
+            "galat bande ko ping nahi karna 😅")
+        return
+    if not members:
+        await _summon_reply(message, "kise bulaana hai? naam batao (ya @mention kar do) 😊")
+        return
+    if len(members) > MAX_SUMMON_PINGS:
+        await _summon_reply(message, f"ek saath itne nahi bula paungi (max {MAX_SUMMON_PINGS}) - thode kam karke bolo 😅")
+        return
+
+    key = (guild.id, author.id)
+    if time.monotonic() - _last_summon.get(key, -1e9) < SUMMON_COOLDOWN:
+        await _summon_reply(message, "ek sec, abhi-abhi ek summon bheja hai - thodi der ruk jao 🙏")
+        return
+
+    try:
+        await dest.send(
+            build_summon_text(author, members),
+            allowed_mentions=discord.AllowedMentions(users=members, everyone=False, roles=False),
+        )
+    except Exception:
+        log.exception("Summon relay failed to channel %s", dest.id)
+        await _summon_reply(message, "bhejne mein error aa gaya 😢 thodi der baad phir try karna")
+        return
+    _last_summon[key] = time.monotonic()
+    await _summon_reply(message, f"bhej diya {dest.mention} mein ✅")
 
 
 def should_respond(message):
@@ -1220,7 +1619,7 @@ async def on_message(message):
     global _owner_id_fallback_notice_sent
 
     # Owner utility commands work in DMs as well as server channels.
-    if message.author.bot:
+    if message.author.bot or getattr(message, "webhook_id", None):
         return
     content = message.content.strip()
     sticker_note = describe_stickers(message)
@@ -1276,6 +1675,19 @@ async def on_message(message):
             )
         except Exception:
             log.exception("Failed to send forget reply in channel %s", message.channel.id)
+        return
+
+    # Nickname teaching / forgetting and VC summons run in code only, on the
+    # current addressed message. They must never depend on model output, so
+    # they are checked before the brain and return without any AI call.
+    if await handle_alias_forget(message, content):
+        return
+    if await handle_alias_teach(message, content):
+        return
+    if await handle_self_alias(message, content):
+        return
+    if action_text(message, content) is not None and re.search(r"\b(vc|voice)\b", content, re.I) and SUMMON_VERB_RE.search(content):
+        await handle_summon(message, content)
         return
 
     # load this member's diary (fail-open: any problem just means no diary block)
@@ -1395,6 +1807,8 @@ async def on_message(message):
     # only now, after model-written mention syntax is stripped, reinsert real
     # mentions for verified [[tag:...]] targets; unclear names get a
     # clarification ask instead of a guessed ping
+    if action_text(message, content) is None:
+        reply = TAG_MARKER_RE.sub(lambda m: m.group(1), reply)
     reply, tag_members, tag_unclear = resolve_tag_requests(message, reply)
     if tag_unclear:
         names = ", ".join(f'"{n}"' for n in tag_unclear)
