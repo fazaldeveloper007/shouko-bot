@@ -276,3 +276,23 @@ with an optional `SELF_DIARY_FILE` override. It is local and gitignored by the
 normal memory directory rule. Writes use atomic replacement; read/write failure
 does not claim success. `reset confirm` deletes only the current server's
 self-diary entries, never member diaries, aliases or another server's lessons.
+
+## Current VC members from text chat
+
+Ask `Kristy VC mein kaun hai?` in a server text channel. Kristy reads your
+current voice/stage channel's gateway snapshot and replies directly, without
+asking the AI. If you are not in a VC, she asks which one. To select a different
+VC, pick its native Discord #channel mention, for example
+`Kristy #Gaming mein kaun hai?`. Exactly one voice/stage channel, from the same
+server, is accepted. Unknown, text, inaccessible or multiple channels are not
+guessed. The requester and Kristy must both be able to view the VC.
+
+The reply displays current member names, labels bots, and disables all mentions.
+It does not join a call, ping anyone or expose mute/deafen/streaming details.
+An empty channel is reported as empty. Before startup is ready, while the guild
+is unavailable, or after disconnect until ready/resume, it refuses to report an
+old list. Unresolved voice-state IDs cause a retry-later message rather than a
+partial or falsely empty list. Discord has no separate REST roster refresh here:
+this is the gateway snapshot at handling time, not a guarantee nobody joins or
+leaves just after it. Webhooks, bots, code, quotes and forwarded snapshots do not
+trigger roster lookup. Music, summons and diary controls are unchanged.
