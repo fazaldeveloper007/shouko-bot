@@ -217,3 +217,62 @@ longer waits stop the retry. Only one final reply/fallback is sent. Message send
 VC summons and other actions are not replayed. Background member-diary extraction
 has its own independent three-call budget, no second outer retry loop; a failed
 explicit save stays pending for the member's next message.
+
+## Kristy's own review-first lesson diary
+
+This is separate from member diaries. Each member, including the owner, still
+has a maximum of 40 facts. Kristy's lesson file has at most **100 entries total**
+across servers, pending and active combined. Entries are server-scoped: one
+server's suggestions, reviews and style hints do not appear in another server.
+At capacity new suggestions are refused, not silently evicted. Owner deletion
+or a server reset frees space.
+
+Any human member can suggest one of these fixed style IDs:
+
+- `concise-answer`
+- `explain-step-by-step`
+- `avoid-repeating-joke`
+- `admit-uncertainty`
+
+Examples (say these to Kristy in a server):
+
+```text
+Kristy lesson suggest concise-answer
+Kristy lesson list
+Kristy lesson approve 1
+Kristy lesson delete 1
+Kristy lesson reset confirm
+```
+
+Only `suggest` is open to all members. List, approve, delete and reset require
+the exact Discord user ID configured in `OWNER_ID` in `.env`. **No name fallback**
+is accepted for these commands. If `OWNER_ID` is missing, suggestions can still
+be saved, but nobody can activate or manage lessons until it is set. Use Discord
+Developer Mode's Copy User ID on your own profile; no token or API key is needed
+for this setting. This feature does not edit `.env` or infer the owner's ID.
+
+Simple direct feedback also creates a pending suggestion, for example:
+`Kristy jawab bahut lamba hai`, `Kristy steps mein samjhao`,
+`Kristy wahi joke dobara mat sunao`, `Kristy pakka nahi ho toh guess mat karo`.
+Other corrections are not automatically classified. Quotes, code, forwarded
+snapshots, webhooks and bots cannot create lesson commands. No extra AI call is
+needed. Even the owner's own suggestions need a separate approval command.
+
+Each entry records the suggester's user ID, source channel/message IDs and time;
+approval records the owner's ID and time. `lesson list` shows this server's
+entries and attribution without pinging anyone. It posts in the current channel,
+so use an owner-only channel when you want the review private. It does not
+copy message text or private member facts into the self-diary. Duplicate lesson
+IDs keep the original source instead of overwriting its attribution.
+
+Pending suggestions never affect answers. After approval, only fixed,
+code-owned style hints enter this server's subsequent AI replies. Arbitrary
+free-text instructions cannot be taught. Lessons cannot change the persona,
+permissions, tools, ping destinations or privacy rules. These are style hints,
+not a guarantee that every generated reply will follow them perfectly.
+
+Storage defaults to `memory/kristy-lessons.json` (inside `MEMORY_DIR` if set),
+with an optional `SELF_DIARY_FILE` override. It is local and gitignored by the
+normal memory directory rule. Writes use atomic replacement; read/write failure
+does not claim success. `reset confirm` deletes only the current server's
+self-diary entries, never member diaries, aliases or another server's lessons.
