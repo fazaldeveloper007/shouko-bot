@@ -86,7 +86,21 @@ class Controls(discord.ui.LayoutView):
             b.callback = on_click
             row.add_item(b)
         container.add_item(row)
-        container.add_item(discord.ui.TextDisplay('-# ' + PLAYER_FOOTER))
+        toggle_row = discord.ui.ActionRow()
+        toggle = discord.ui.Button(label='Autoplay: On' if player.autoplay else 'Autoplay: Off',
+                                   style=discord.ButtonStyle.success if player.autoplay else discord.ButtonStyle.secondary)
+        async def on_toggle(interaction):
+            try:
+                p = await self.manager.get(interaction.user, interaction.channel)
+                if p is not self.player: raise MusicError('This player is from an ended session')
+                await interaction.response.defer()
+                await p.set_autoplay(not p.autoplay)
+            except Exception as exc: await callback_error(interaction, exc)
+        toggle.callback = on_toggle
+        toggle_row.add_item(toggle)
+        container.add_item(toggle_row)
+        footer = PLAYER_FOOTER + (' • Autoplay on: related tracks play when the queue ends' if player.autoplay else '')
+        container.add_item(discord.ui.TextDisplay('-# ' + footer))
         self.add_item(container)
 
 class Results(discord.ui.LayoutView):
