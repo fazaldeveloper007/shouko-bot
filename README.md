@@ -358,8 +358,8 @@ Kristy schedule cancel JOB_ID
 Confirm/list/cancel use the real returned 10-character ID, not the words above.
 Only the creator can confirm. Members list/cancel their own same-server jobs;
 the configured exact `OWNER_ID` can list/cancel others in that server, never
-confirm as them. No display-name fallback. Lists omit jobs whose destination
-is no longer accessible and show statuses/time/channel IDs, not private bodies.
+confirm as them. No display-name fallback. Lists show own same-server job status/time/reason even after access or target
+loss, without destination IDs, target IDs or private bodies.
 
 Supported time formats:
 
@@ -381,7 +381,7 @@ armed job. Missing permissions or departed targets fail the whole job without
 partial pings. Quotes, forwarded snapshots, webhooks and bots cannot arm jobs.
 
 The phone, Termux and bot **must be running**. A local worker checks about every
-15 seconds, with no model call per check. Jobs survive restart in gitignored
+15 seconds and drains up to 10 due jobs per tick, with no model call per check. Jobs survive restart in gitignored
 `memory/scheduled-messages.json` (beside the self-diary storage). Use one bot
 process per state file, not multiple competing instances. Corrupt/unwritable
 state stops delivery rather than resetting/replaying jobs. Scheduled work never
@@ -399,3 +399,29 @@ job. A failure saving final state halts the worker, not replaying the send.
 (e.g. a short reconnect); anything later is marked `missed` and skipped, never
 caught up hours later. The normal 15-second check cadence is not exact-second
 delivery. The preview and confirmation state this before arming.
+
+
+### Reminder routing and safe status
+
+Explicit reminder/schedule/timer or timed-send intent no longer falls through
+normal AI chat when the fields are incomplete. Kristy responds with a code-owned
+"not saved/active" clarification and the required format instead of pretending
+an "okay" has scheduled a delivery. A short same-user/server/channel follow-up
+like "haan isi channel mein dena" is linked to that clarification for two minutes
+(or must reply to that exact clarification); it still **cannot arm a job**.
+Only the creator's exact `schedule confirm ID` arms the unchanged preview.
+
+A bounded short form also works:
+`Kristy reminder 10 min baad: Paani pi lena`
+This creates a current-channel self-reminder **preview**, not an armed job.
+Unclear clock dates/times, missing message text, targets or destination still
+need the explicit format. This is not unrestricted natural-language extraction.
+
+Use `Kristy schedule status JOB_ID` or `Kristy schedule list` to see your saved
+jobs and worker health, without message bodies or destination/member identifiers.
+Statuses include preview, scheduled, sent, missed, failed and uncertain, with
+fixed reason codes. Empty list means no saved job found here, not a promise that
+an earlier conversational "okay" was scheduled. `failed` can reflect membership/
+permission checks; `uncertain` must never be blindly resent. Diagnostics show
+worker running/not started/stopped/halted/waiting for connection. Corrupt storage
+stays fail-closed. No job history is replayed by this repair.
