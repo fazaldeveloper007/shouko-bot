@@ -240,6 +240,24 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.bot.handle_self_diary(m,m.content))
         self.assertEqual(self.bot.self_diary.load()['entries'],[])
 
+    async def test_roster_direct_answer_has_no_pings_and_no_brain(self):
+        m=self.msg('Kristy VC mein kaun hai?');m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        self.bot.client.music=None
+        with patch.object(self.bot.voice_roster,'snapshot',return_value='Gaming: @everyone and @here') as lookup, patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
+            await self.bot.on_message(m)
+        lookup.assert_called_once()
+        brain.assert_not_called()
+        m.reply.assert_awaited_once()
+        mentions=m.reply.call_args.kwargs['allowed_mentions']
+        self.assertFalse(mentions.everyone);self.assertFalse(mentions.users);self.assertFalse(mentions.roles)
+
+    async def test_roster_quote_and_forward_not_read(self):
+        for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
+            m=self.msg(text)
+            self.assertIsNone(self.bot.action_text(m,text))
+        m=self.msg('Kristy VC mein kaun hai?');m.message_snapshots=[object()]
+        self.assertIsNone(self.bot.action_text(m,m.content))
+
     # ---------- summon relay ----------
     async def test_summon_success_names_only(self):
         dest = self.dest()
