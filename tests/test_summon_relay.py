@@ -43,6 +43,7 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         # aliases stays in sys.modules between per-test bot reimports, so
         # re-point its file at THIS test's temp dir for isolation
         self.bot.aliases._ALIASES_FILE = pathlib.Path(self._tmp.name) / 'aliases.json'
+        self.bot.self_diary.PATH = pathlib.Path(self._tmp.name)/'lessons.json'
         self.addAsyncCleanup(self.bot.client.close)
         # a small friend server
         self.fazal = member(1, 'fazal_techiudex07', 'Fazal')
@@ -212,6 +213,32 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         m = self.msg('Kristy <#777> pe Mayank ko vc bulao', channel_mentions=[dest])
         await self.bot.handle_summon(m, m.content)
         dest.send.assert_not_awaited()
+
+    async def test_self_diary_review_and_exact_owner_id(self):
+        self.bot.self_diary.PATH = pathlib.Path(self._tmp.name)/'lessons.json'
+        self.bot.OWNER_ID = '1'
+        m=self.msg('Kristy lesson suggest concise-answer');m.id=100
+        self.assertTrue(await self.bot.handle_self_diary(m,m.content))
+        self.assertEqual(self.bot.self_diary.prompt(555),'')
+        other=self.msg('Kristy lesson approve 1',author=self.mayank);other.id=101
+        await self.bot.handle_self_diary(other,other.content)
+        self.assertEqual(self.bot.self_diary.prompt(555),'')
+        m.content='Kristy lesson approve 1'
+        await self.bot.handle_self_diary(m,m.content)
+        self.assertIn('concise',self.bot.self_diary.prompt(555))
+        self.bot.OWNER_ID=''
+        m.content='Kristy lesson reset confirm'
+        await self.bot.handle_self_diary(m,m.content)
+        self.assertIn('concise',self.bot.self_diary.prompt(555))
+
+    async def test_self_diary_quotes_webhooks_and_unknown_lessons_ignored(self):
+        self.bot.self_diary.PATH = pathlib.Path(self._tmp.name)/'lessons.json'
+        for text in ['Kristy `lesson suggest concise-answer`', '> Kristy lesson suggest concise-answer']:
+            m=self.msg(text);m.id=1
+            self.assertFalse(await self.bot.handle_self_diary(m,text))
+        m=self.msg('Kristy lesson suggest concise-answer');m.id=1;m.webhook_id=7
+        self.assertFalse(await self.bot.handle_self_diary(m,m.content))
+        self.assertEqual(self.bot.self_diary.load()['entries'],[])
 
     # ---------- summon relay ----------
     async def test_summon_success_names_only(self):
