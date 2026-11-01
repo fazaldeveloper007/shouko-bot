@@ -150,3 +150,45 @@ class MoreSchedules(Schedules):
         self.create();data=self.store.load();data[0]['due']='bad';self.store.save(data)
         with self.assertRaises(ValueError):await self.worker.tick(100)
         self.dest.send.assert_not_awaited()
+
+class RepairTests(Schedules):
+    async def test_natural_intents_no_false_ok_no_saved_job(self):
+        commands=sc.Commands(self.store,lambda *a:(self.target,False))
+        msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
+        for text in ('reminder laga do 9:20 PM ka','10 min baad Mayank ko isi channel mein bula dena','9:20 PM pe message bhejna'):
+            self.assertTrue(await commands.handle(msg,text,self.client,lambda *a,**kw:'ok'))
+            self.assertIn('active nahi',msg.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+        self.assertTrue(commands.followup(msg,'haan isi channel mein dena'))
+        self.assertTrue(await commands.handle(msg,'haan isi channel mein dena',self.client,lambda *a,**kw:'ok'))
+        self.assertEqual(self.store.load(),[])
+    async def test_followup_scoping_ttl_no_arm(self):
+        commands=sc.Commands(self.store,lambda *a:(self.target,False))
+        msg=S(guild=self.guild,author=self.author,channel=self.dest,reply=AsyncMock(return_value=S(id=700)),reference=None)
+        await commands.clarify(msg)
+        self.assertTrue(commands.followup(msg,'okay'))
+        for obj in (msg.author,msg.channel,msg.guild):
+            old=obj.id;obj.id=777;self.assertFalse(commands.followup(msg,'okay'));obj.id=old
+        msg.reference=S(message_id=999);self.assertFalse(commands.followup(msg,'okay'))
+        msg.reference=S(message_id=700);self.assertTrue(commands.followup(msg,'okay'))
+        commands.pending[commands.key(msg)]=(0,700);self.assertFalse(commands.followup(msg,'okay'))
+    async def test_bounded_natural_self_reminder_creates_preview_only(self):
+        commands=sc.Commands(self.store,lambda *a:(self.target,False))
+        msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(),reference=None)
+        await commands.handle(msg,'reminder 10 min baad: Paani pi lena',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load()[0]['status'],'preview');self.assertEqual(self.store.load()[0]['targets'],[1])
+        self.assertEqual(self.store.load()[0]['body'],'<@1>\nPaani pi lena')
+    async def test_own_failed_status_without_body_destination_or_targets(self):
+        e=self.arm();data=self.store.load();data[0].update(status='failed',reason='access_or_member_check_failed');self.store.save(data)
+        del self.members[2]
+        commands=sc.Commands(self.store,lambda *a:(self.target,False));commands.health=lambda:'running'
+        msg=S(guild=self.guild,author=self.author,channel=self.dest,reply=AsyncMock())
+        await commands.handle(msg,'schedule status '+e['id'],self.client,lambda *a,**kw:'ok')
+        result=msg.reply.call_args.args[0]
+        self.assertIn('failed',result);self.assertIn('running',result);self.assertNotIn('hello',result);self.assertNotIn('<@2>',result)
+        msg.author=S(id=3);await commands.handle(msg,'schedule list',self.client,lambda *a,**kw:'ok')
+        self.assertNotIn(e['id'],msg.reply.call_args.args[0])
+    async def test_ten_due_jobs_drained_same_tick_no_15s_each(self):
+        for i in range(10):self.arm()
+        await self.worker.tick(100)
+        self.assertEqual(self.dest.send.await_count,10)
+        self.assertTrue(all(e['status']=='sent' for e in self.store.load()))
