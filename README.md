@@ -318,3 +318,84 @@ and fixed reason codes such as `empty_output`, `malformed_output` or `blocked`,
 without provider response bodies, request headers or keys. These logs distinguish
 silent retries from an immediate non-retryable stop. Only one final Discord
 answer/fallback is sent; screenshot timestamps alone cannot count attempts.
+
+## Preview-confirmed reminders and timed messages
+
+One-shot only, for every human member. Examples (the `|` separators are required):
+
+```text
+Kristy schedule 10 minute baad | here | Mayank, Naiyo | Match shuru karte hain
+Kristy schedule kal 8 PM | #gaming-chat | @Mayank, @Naiyo | VC join kar lo
+Kristy remind 10 minute baad | here | Paani pi lena
+Kristy summon kal 8 PM | #gaming-chat | Mayank, Naiyo
+```
+
+Pick native Discord channel/member mentions where shown. `here` explicitly means
+this text channel. The destination may be another ordinary text channel in this
+server, never another server. Targets can be known aliases/exact usernames or
+native member mentions, separated by commas or `aur`/`and`. Input order is kept;
+duplicates are removed. Maximum five human targets. `none` permits a no-ping
+message. `remind` pings only its creator. `summon` uses this fixed previewed text:
+`VC join kar lo, creator ne is time par bulaya hai.` It does not join or move
+anyone, infer a future VC, repeat pings or escalate them.
+
+The outgoing body is the user's exact text, not an AI rewrite. Put message text
+after the last separator. Payloads must be 1-1000 characters and cannot contain
+Discord mention markup, @everyone/@here, or bot tag/search control markers. Tags
+come only from the target field; role/everyone/here/reply pings are disabled.
+
+Nothing is armed immediately. Kristy saves a **preview** showing the exact
+outgoing text, stable member IDs in mention form (without pinging), destination
+name/ID and full weekday/date/time in IST (Asia/Kolkata). Within two minutes,
+the same creator confirms from the source text channel:
+
+```text
+Kristy schedule confirm PREVIEW_ID
+Kristy schedule list
+Kristy schedule cancel JOB_ID
+```
+
+Confirm/list/cancel use the real returned 10-character ID, not the words above.
+Only the creator can confirm. Members list/cancel their own same-server jobs;
+the configured exact `OWNER_ID` can list/cancel others in that server, never
+confirm as them. No display-name fallback. Lists omit jobs whose destination
+is no longer accessible and show statuses/time/channel IDs, not private bodies.
+
+Supported time formats:
+
+- `10 minute baad`, `2 hour baad` (relative to the original message timestamp)
+- `aaj 9:30 PM`, `today 9 PM`, `kal 8 AM`, `tomorrow 8 AM`
+- `2026-11-03 20:30` (explicit date and 24-hour clock)
+
+Bare `8 baje`, passed times and unclear dates are not guessed. Between midnight
+and 4 AM, use an explicit date instead of `kal`/`tomorrow`. The preview is the
+final authority for the resolved date/time. Jobs must be 1 minute to 30 days
+in the future. Limits include previews: 10 active per member/server, 50 per
+server and 1000 total; last 200 terminal jobs are retained. This is a bounded
+command grammar, not unrestricted natural-language scheduling.
+
+Both creation/confirmation and delivery recheck the same-server destination,
+creator membership and destination view/send access for creator and bot. Every
+target must still be a verified human member. Alias changes cannot retarget an
+armed job. Missing permissions or departed targets fail the whole job without
+partial pings. Quotes, forwarded snapshots, webhooks and bots cannot arm jobs.
+
+The phone, Termux and bot **must be running**. A local worker checks about every
+15 seconds, with no model call per check. Jobs survive restart in gitignored
+`memory/scheduled-messages.json` (beside the self-diary storage). Use one bot
+process per state file, not multiple competing instances. Corrupt/unwritable
+state stops delivery rather than resetting/replaying jobs. Scheduled work never
+changes the independent proactive announcements feature.
+
+Delivery is attempted once only. The worker saves `dispatching` before sending,
+then records the returned Discord message ID on success. A crash/timeout during
+send can leave delivery uncertain: it may have reached Discord, so it is never
+automatically retried. Restart turns old `dispatching` jobs into `uncertain`.
+This avoids duplicate pings; it is not a promise of exactly-once delivery over
+network failure. Check the channel before creating a replacement for an uncertain
+job. A failure saving final state halts the worker, not replaying the send.
+
+**Missed-time policy:** delivery can occur within two minutes of the due time
+(e.g. a short reconnect); anything later is marked `missed` and skipped, never
+caught up hours later. The normal 15-second check cadence is not exact-second
+delivery. The preview and confirmation state this before arming.
