@@ -169,3 +169,11 @@ Kristy can post on her own schedule (all targets and wording approved by the ser
 - **Welcome message** - pings the actual new member (never @everyone) with a cute GIF when someone joins.
 
 Setup notes: the bot role needs **Mention @everyone** permission in the announcement channels (Discord strips the ping silently otherwise), and welcomes need **Server Members Intent** enabled in the Discord developer portal. Config via env vars - see `.env.example`. State lives in `memory/announcements_state.json` (gitignored, append-only; a corrupted state disables posting rather than re-pinging old codes).
+
+## Music candidate (off by default)
+
+Local, not-yet-deployed music implementation is documented in [music/README.md](music/README.md).
+It uses the existing Python gateway plus a token-free Node voice worker. Commands,
+buttons, output and music-state awareness stay in the connected VC's built-in chat.
+`MUSIC_ENABLED=0` and `MUSIC_SYNC_COMMANDS=0` keep playback and slash registration off.
+Do not enable/install/register from this review build without the separate deployment decision.
