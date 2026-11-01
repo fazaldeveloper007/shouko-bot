@@ -54,11 +54,30 @@ def _perform(request, rows):
             0<request.get('prepared_until',0)-time.time()<=31 and reusable_source(prepared) is not None)
     try:
         if reused:info=prepared
+        elif request['mode']=='related':
+            opts['extract_flat']='in_playlist';opts['playlistend']=15
+            # Primary: YouTube's own radio mix for the seed video. Fallback: artist
+            # search built from the seed title's "Artist - Title" shape.
+            vid=request['value']
+            sources=['https://www.youtube.com/watch?v=%s&list=RD%s' % (vid,vid)]
+            artist=re.split(r'\s[-\u2013\u2014|]\s',request.get('related_title') or '')[0].strip()
+            if len(artist)>=2:sources.append('ytsearch15:%s' % artist)
+            info=last=None
+            for source in sources:
+                try:
+                    with YoutubeDL(opts) as y:info=y.extract_info(source,download=False)
+                    break
+                except Exception as exc:last=exc
+            if info is None:raise last
         else:
             with YoutubeDL(opts) as y:info=y.extract_info(request['value'],download=False)
     except TimeoutError:raise JobFailure('NETWORK_TIMEOUT',stage='EXTRACT') from None
     except Exception:raise JobFailure('EXTRACT_FAILED',stage='EXTRACT') from None
     rows.append(dict(stage='SOURCE_REUSE' if reused else 'EXTRACT',code='OK',seconds=time.monotonic()-start))
+    if request['mode']=='related':
+        items=info.get('entries') or []
+        safe=[{k:i.get(k) for k in ('id','title','duration','is_live','live_status')} for i in items if i]
+        return dict(ok=True,items=safe,diagnostics=rows)
     if request['mode']=='search':
         items=info.get('entries') if info.get('_type') in ('playlist','multi_video') else [info]
         safe=[{k:i.get(k) for k in ('id','title','duration','is_live','live_status')} for i in items if i]
