@@ -5,15 +5,40 @@ import os
 import pathlib
 import types
 import unittest
+import warnings
+import asyncio
+
+def load_source(spec, module):
+    # discord.py2.7.1 event decorator uses a Python3.14-deprecated alias.
+    # Limit this exception to that exact dependency call during offline import.
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message=r"^'asyncio\.iscoroutinefunction' is deprecated and slated for removal in Python 3\.16; use inspect\.iscoroutinefunction\(\) instead$", category=DeprecationWarning, module=r'^discord\.client$')
+        spec.loader.exec_module(module)
+
 from unittest.mock import patch, AsyncMock
 
 ROOT=pathlib.Path(__file__).parents[1]
 class BotIntegration(unittest.IsolatedAsyncioTestCase):
     async def load(self, enabled):
         with patch.dict(os.environ,{'DISCORD_TOKEN':'OFFLINE_DUMMY','GEMINI_API_KEY':'OFFLINE_DUMMY','MUSIC_ENABLED':str(enabled),'MUSIC_SYNC_COMMANDS':'0'}):
-            spec=importlib.util.spec_from_file_location('offline_bot_'+str(enabled),ROOT/'bot.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+            spec=importlib.util.spec_from_file_location('offline_bot_'+str(enabled),ROOT/'bot.py');m=importlib.util.module_from_spec(spec);load_source(spec,m)
         self.addAsyncCleanup(m.client.close)
         return m
+    async def test_python314_dependency_warning_precisely_scoped(self):
+        original=asyncio.iscoroutinefunction
+        def deprecated(obj):
+            warnings.warn("'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead",DeprecationWarning,stacklevel=2)
+            return original(obj)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            with patch('asyncio.iscoroutinefunction',deprecated):
+                await self.load(0)
+                await self.load(1)
+            with self.assertRaises(DeprecationWarning):
+                warnings.warn('unrelated compatibility regression',DeprecationWarning)
+            with self.assertRaises(DeprecationWarning):
+                deprecated(None)  # Same text outside discord.client remains fatal.
+
     async def test_disabled_preserves_existing_helpers(self):
         m=await self.load(0);self.assertIsNone(m.client.music)
         self.assertTrue(m.looks_like_search('search latest genshin codes'))
