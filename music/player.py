@@ -30,6 +30,7 @@ class GuildPlayer:
         self.queued_at = {}
         self.generation = 0
         self.interrupting = False
+        self.prefetch = None
         self.temp = tempfile.TemporaryDirectory(prefix='kristy-music-')
         self.media_dir = pathlib.Path(self.temp.name)
         self.panel = None
@@ -72,6 +73,36 @@ class GuildPlayer:
     async def engine_failed(self):
         await self.manager.remove(self, 'Voice connection failed. Queue cleared; request /joinvckristy to start a fresh session.')
 
+    def _prefetch_start(self):
+        # Download the next queued track in the background while the current one plays.
+        # One track ahead only; the file is bounded by max_bytes and cleaned like any temp track file.
+        if self.prefetch or self.closed or not self.queue: return
+        track = self.queue[0]
+        path = self.media_dir / ('prefetch-' + secrets.token_hex(8) + '.webm')
+        self.prefetch = dict(id=track.id, task=asyncio.create_task(self.manager.media.download(track, path, background=True)), path=path)
+
+    async def _prefetch_cancel(self):
+        pf = self.prefetch; self.prefetch = None
+        if pf:
+            pf['task'].cancel(); await asyncio.gather(pf['task'], return_exceptions=True)
+            pf['path'].unlink(missing_ok=True)
+
+    async def _prefetch_take(self, track):
+        # Reuse the background download when it matches the track being started.
+        # A failed prefetch falls back to a foreground download instead of failing playback.
+        pf = self.prefetch; self.prefetch = None
+        if not pf: return None
+        if pf['id'] != track.id:
+            pf['task'].cancel(); await asyncio.gather(pf['task'], return_exceptions=True)
+            pf['path'].unlink(missing_ok=True)
+            return None
+        try:
+            await pf['task']
+        except Exception:
+            pf['path'].unlink(missing_ok=True)
+            return None
+        return pf['path']
+
     async def add(self, track, *, start=True):
         async with self.lock:
             if self.closed: raise MusicError('Voice session ended; join again')
@@ -81,6 +112,7 @@ class GuildPlayer:
             if self.idle and start: self.idle.cancel()
             if start and not self.interrupting and (not self.task or self.task.done()):
                 self.task = asyncio.create_task(self.run())
+            elif self.current is not None: self._prefetch_start()
             return len(self.queue)
 
     async def run(self):
@@ -100,11 +132,15 @@ class GuildPlayer:
                 self.autoplay_history.append(track.id)
                 self.autoplay_titles.append(track.title)
                 self.last_track = track
-                path = self.media_dir / ('track-' + secrets.token_hex(8) + '.webm')
+                path = None
                 try:
-                    await self.manager.panel(self, 'Loading audio...')
                     began = time.monotonic()
-                    await self.manager.media.download(track, path)
+                    path = await self._prefetch_take(track)
+                    if path is None:
+                        await self.manager.panel(self, 'Loading audio...')
+                        path = self.media_dir / ('track-' + secrets.token_hex(8) + '.webm')
+                        await self.manager.media.download(track, path)
+                    else: emit('PREFETCH','HIT')
                     if self.closed or generation != self.generation: continue
                     voice_began = time.monotonic()
                     token, ended = await self.bridge.play(path)
@@ -112,6 +148,7 @@ class GuildPlayer:
                     self.started = time.monotonic()
                     emit('PLAY_START','OK',elapsed=self.started-began)
                     await self.manager.panel(self)
+                    self._prefetch_start()
                     # Paused time should not count against media playback duration.
                     remaining = track.duration + 30
                     while not ended.done() and remaining > 0:
@@ -132,7 +169,7 @@ class GuildPlayer:
                     await self.manager.remove(self, 'Playback failed. Queue cleared; join again for a fresh session.')
                     return
                 finally:
-                    path.unlink(missing_ok=True)
+                    if path is not None: path.unlink(missing_ok=True)
                     self.current = None; self.paused = False
             if not self.closed:
                 await self.manager.panel(self)
@@ -201,6 +238,7 @@ class GuildPlayer:
                     self.queue.clear(); self.queued_at.clear()
                 task = self.task
                 self.task = None
+            if clear: await self._prefetch_cancel()
             if task and task is not asyncio.current_task():
                 task.cancel(); await asyncio.gather(task, return_exceptions=True)
             try:
@@ -226,6 +264,7 @@ class GuildPlayer:
     async def _close(self):
         if self.closed: return self.bridge.leave_confirmed if self.bridge else False
         self.closed = True; self.generation += 1; self.queue.clear(); self.queued_at.clear()
+        await self._prefetch_cancel()
         current = asyncio.current_task()
         for task in (self.idle, self.task):
             if task and task is not current:
