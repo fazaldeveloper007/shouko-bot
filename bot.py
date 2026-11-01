@@ -1618,6 +1618,7 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
 _schedule_store = timed_messages.Store(self_diary.PATH.parent / 'scheduled-messages.json')
 _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected)
 _schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+_schedule_commands.health = _schedule_worker.health
 
 _voice_cache_connected = False
 _roster_clarifications = voice_roster.Clarifications()
@@ -1708,7 +1709,9 @@ async def on_message(message):
 
     roster_followup = (action_text(message, content, question=True) is not None
                        and _roster_clarifications.matches(message))
-    if not roster_followup and not should_respond(message):
+    schedule_followup = (action_text(message, content, question=True) is not None
+                         and _schedule_commands.followup(message, _addressed_text(content)))
+    if not roster_followup and not schedule_followup and not should_respond(message):
         return
 
     music_context = client.music.context(message.channel) if client.music else ""
