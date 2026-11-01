@@ -251,6 +251,20 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         mentions=m.reply.call_args.kwargs['allowed_mentions']
         self.assertFalse(mentions.everyone);self.assertFalse(mentions.users);self.assertFalse(mentions.roles)
 
+    async def test_roster_question_then_only_mention_reply(self):
+        m=self.msg('Vc pe abhi kaun hai Kristy?');m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        self.bot.client.music=None
+        m.reply.return_value=types.SimpleNamespace(id=808)
+        with patch.object(self.bot.voice_roster,'snapshot',side_effect=[self.bot.voice_roster.SELECT_VC,'Music: NAIYO and Kristy [bot]']) as lookup, patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
+            await self.bot.on_message(m)
+            follow=self.msg('<#777>');follow.attachments=[];follow.stickers=[];follow.embeds=[]
+            follow.reference=types.SimpleNamespace(message_id=808,resolved=None)
+            await self.bot.on_message(follow)
+        self.assertEqual(lookup.call_count,2);brain.assert_not_called()
+        self.assertIn('NAIYO',follow.reply.call_args.args[0])
+        self.assertFalse(follow.reply.call_args.kwargs['allowed_mentions'].everyone)
+        self.assertFalse(self.bot._roster_clarifications.matches(follow))
+
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
             m=self.msg(text)
