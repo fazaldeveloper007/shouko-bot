@@ -1281,10 +1281,18 @@ def should_respond(message):
 def with_diary(prompt, diary_block):
     return f"{prompt}\n\n{diary_block}" if diary_block else prompt
 
-async def gemini_generate(payload, url=GEMINI_URL):
+def usable_generation(text):
+    # Search-only output is a valid intermediate step, not an empty answer.
+    if MODEL_SEARCH_RE.search(text):
+        return True
+    _reaction, clean = extract_reaction(text)
+    return bool(sanitize_mentions(clean).strip())
+
+
+async def gemini_generate(payload, url=GEMINI_URL, validate=None):
     session = await groq_session()
     return await retrying.post_json(session, url, label="Gemini",
-        headers={"x-goog-api-key": GEMINI_API_KEY}, payload=payload)
+        headers={"x-goog-api-key": GEMINI_API_KEY}, payload=payload, validate=validate)
 
 
 async def call_extractor(prompt):
@@ -1428,7 +1436,8 @@ async def think_groq(channel_id, diary_block="", extra_system=""):
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=30)
-    data = await retrying.post_json(session, GROQ_CHAT_URL, label="Groq", headers=headers, payload=payload)
+    data = await retrying.post_json(session, GROQ_CHAT_URL, label="Groq", headers=headers, payload=payload,
+                                     validate=retrying.generation_validator("Groq", usable_generation))
     return (data["choices"][0]["message"]["content"] or "").strip()
 
 async def think_gemini(channel_id, diary_block="", image_parts=None, extra_system=""):
@@ -1448,6 +1457,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
     while contents and contents[0]["role"] != "user":
         contents.pop(0)  # a conversation must start with a user turn
     if not contents:
+        log.warning("Gemini generation skipped: reason=no_user_history calls=0")
         return ""
     if image_parts and contents[-1]["role"] == "user":
         # images ride along with the CURRENT turn only; the history deque
@@ -1462,11 +1472,11 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         # gemini_generate() drops the field entirely if a model rejects it.
         "generationConfig": {"maxOutputTokens": 2048, "thinkingConfig": {"thinkingLevel": "low"}, "temperature": 0.9},
     }
-    data = await gemini_generate(payload)
+    data = await gemini_generate(payload, validate=retrying.generation_validator("Gemini", usable_generation))
     try:
         candidate = data["candidates"][0]
         parts = (candidate.get("content") or {}).get("parts") or []
-        reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+        reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought")).strip()
     except (KeyError, IndexError, TypeError, AttributeError):
         candidate = None
         reply_text = ""
@@ -1587,16 +1597,16 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
 
     Groq is used when no GEMINI_API_KEY is set, or when the Gemini call itself
-    fails (429/503/network) and a GROQ_API_KEY is available. An empty Gemini
-    answer is not retried on Groq (usually a safety block, which Groq would
-    likely also block). image_parts (Gemini only) are ignored by the Groq
+    fails (429/503/network) and a GROQ_API_KEY is available. Explicit safety
+    blocks stop without provider fallback. Empty/malformed responses retry
+    within the same three-call budget. image_parts are ignored by the Groq
     fallback, which replies text-only.
     """
     if GEMINI_API_KEY:
         try:
             return await think_gemini(channel_id, diary_block, image_parts, extra_system)
         except Exception as e:
-            if not GROQ_API_KEY:
+            if not GROQ_API_KEY or (isinstance(e, retrying.RequestError) and e.reason == "blocked"):
                 raise
             log.warning("Gemini brain failed, falling back to Groq: %s", type(e).__name__)
     return await think_groq(channel_id, diary_block, extra_system)
@@ -1857,11 +1867,13 @@ async def on_message(message):
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
                         reply = await maybe_model_search(message.channel.id, reply, diary_block, extra, image_parts)
                 except Exception as e:
-                    log.warning("AI brain error: %s", type(e).__name__)
+                    log.warning("AI brain error: class=%s status=%s reason=%s", type(e).__name__,
+                                getattr(e, "status", None), getattr(e, "reason", "local_error"))
                     reply = random.choice(FALLBACK_LINES)
                 reply = MODEL_SEARCH_RE.sub("", reply or "").strip()
                 reaction, reply = extract_reaction(reply)
                 if not reply:
+                    log.warning("AI final output unusable after formatting; reason=empty_formatted_output")
                     reply = EMPTY_REPLY_FALLBACK
 
     ping_requested, reply = extract_ping_request(reply)
