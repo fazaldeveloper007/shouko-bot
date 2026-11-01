@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from .player import Manager, MusicError
 from .media import MediaError
-from .ui import answer, callback_error, search_embed, queue_embed, player_panel, Results, clean
+from .ui import answer, callback_error, queue_embed, player_panel, Results, clean
 
 log = logging.getLogger('kristy.music')
 
@@ -65,7 +65,8 @@ class Music:
                 tracks = await self.manager.media.search(query, interaction.user.id)
                 # Search can take time: reject stale membership before any result publication.
                 self.manager.caller_channel(interaction.user, interaction.channel)
-                await answer(interaction, '', embed=search_embed(tracks), view=Results(self.manager, interaction.channel_id, tracks))
+                await answer(interaction, view=Results(self.manager, interaction.channel_id, tracks))
+                await self._repost(interaction)
                 return
             if action == 'play' and query:
                 tracks = await self.manager.media.search(query, interaction.user.id)
@@ -73,6 +74,7 @@ class Music:
                 self.manager.caller_channel(interaction.user, interaction.channel)
                 await p.add(tracks[0])
                 await answer(interaction, 'Added: ' + clean(tracks[0].title) + (' Preparing audio; playback starts after extraction/download.' if not p.started else ' Waiting behind the current track.'))
+                await self._repost(interaction)
                 return
             p = await self.manager.get(interaction.user, interaction.channel, join=action == 'join')
             if action == 'join': await self.manager.panel(p)
@@ -82,10 +84,17 @@ class Music:
             elif action == 'pause': await p.pause(True)
             elif action == 'next': await p.interrupt()
             elif action == 'stop': await p.interrupt(clear=True)
-            elif action == 'queue': await answer(interaction, '', embed=queue_embed(p))
+            elif action == 'queue': await answer(interaction, embed=queue_embed(p))
+            if action == 'queue': await self._repost(interaction)
             if action != 'queue': await answer(interaction, 'Done.', ephemeral=True)
         except Exception as exc:
             await callback_error(interaction, exc)
+
+    async def _repost(self, interaction):
+        # After a public command reply, re-post the player card so it stays at the chat bottom.
+        p = self.manager.players.get(getattr(getattr(interaction, 'guild', None), 'id', None))
+        if p and not p.closed and p.channel.id == interaction.channel_id:
+            await self.manager.panel(p)
 
     async def ready(self):
         # No slash registration unless operator explicitly opts into deployment.
