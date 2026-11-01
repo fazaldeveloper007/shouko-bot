@@ -19,6 +19,12 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
 - Adds an **emoji reaction** to genuinely shocking, dark, hilarious or wholesome messages -
   rarely, never on routine chat (needs the **Add Reactions** permission)
 - Knows Genshin Impact (characters, banners, resin, artifacts, 50/50 pain) and talks like a player
+- **Tags people by nickname**: teach her once ("Mayank ka username mayank_123") and anyone can
+  then say "Mayank ko tag karo" - she resolves the name to the right member, and asks instead of
+  guessing when a name is unclear
+- **Calls people to VC from any channel**: "Kristy #gaming-chat pe Mayank aur Naiyo ko VC join
+  karne bolo turant" posts the summon in that channel with their real @mentions
+
 
 ## Setup (one time)
 
@@ -99,6 +105,25 @@ python bot.py
 The included `Dockerfile` works on any Docker host or container platform
 (Railway, Fly.io, a VPS, etc.): set `DISCORD_TOKEN` and `GEMINI_API_KEY` as
 environment variables and deploy.
+
+## Nicknames and VC summons
+
+Per-server nickname registry (`memory/aliases.json`, gitignored), separate from the diaries:
+
+- Teach: "Kristy, yaad rakhna Mayank ka username mayank_123" (or "Mayank's username is mayank_123").
+  The username must match exactly one current member, and a nickname can never point at someone
+  else silently - retargeting needs "Mayank ko bhool ja" first. A nickname also can't steal
+  another member's existing name.
+- Teach your own: "call me Fazallette" / "mujhe Junaid bhai bulao".
+- Forget: "Kristy, Mayank ko bhool ja".
+- Tag: "Kristy, Mayank ko tag karo" works with taught nicknames, display names and usernames;
+  ambiguous or unknown names get a question, never a guessed ping.
+- Summon: mention ONE #channel natively and name the people:
+  "Kristy #gaming-chat pe Mayank aur Naiyo aur Junaid ko VC join karne bolo turant".
+  She posts "@Mayank @Naiyo @Junaid abhi ke abhi VC join kariye turant!" there (max 5 people,
+  45s cooldown per member, never @everyone/@here/roles). If any name is unclear she asks first
+  and sends nothing. She refuses channels she can't post in or you can't see, and never relays
+  to another server.
 
 ## Memory
 
