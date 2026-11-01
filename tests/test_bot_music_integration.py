@@ -1,12 +1,12 @@
 """Offline integration smoke tests. Dummy config; never client.run/start/sync."""
 import asyncio
+import inspect
 import importlib.util
 import os
 import pathlib
 import types
 import unittest
 import warnings
-import asyncio
 
 def load_source(spec, module):
     # discord.py2.7.1 event decorator uses a Python3.14-deprecated alias.
@@ -25,10 +25,9 @@ class BotIntegration(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(m.client.close)
         return m
     async def test_python314_dependency_warning_precisely_scoped(self):
-        original=asyncio.iscoroutinefunction
         def deprecated(obj):
             warnings.warn("'asyncio.iscoroutinefunction' is deprecated and slated for removal in Python 3.16; use inspect.iscoroutinefunction() instead",DeprecationWarning,stacklevel=2)
-            return original(obj)
+            return inspect.iscoroutinefunction(obj)
         with warnings.catch_warnings():
             warnings.simplefilter('error')
             with patch('asyncio.iscoroutinefunction',deprecated):
