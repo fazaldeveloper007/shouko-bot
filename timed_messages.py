@@ -79,13 +79,13 @@ class Store:
             if name and os.path.exists(name):os.unlink(name)
     def expire(self,data,now):
         for e in data:
-            if e['status']=='preview' and now>e['expires']:e['status']='cancelled'
+            if e['status']=='preview' and now>e['expires']:e.update(status='cancelled',reason='preview_expired')
     def create(self, *, guild,author,source,dest,targets,body,due,now):
         data=self.load();self.expire(data,now)
         active=[e for e in data if e['status'] in ACTIVE]
         if len(active)>=1000 or sum(e['guild']==guild for e in active)>=50 or sum(e['author']==author and e['guild']==guild for e in active)>=10:
             raise ValueError('Schedule limit: 10/member, 50/server, 1000 total active previews/jobs.')
-        e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='preview')
+        e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='preview',reason='awaiting_confirmation')
         data.append(e);self.save(data);return e
     def control(self,ident,guild,author,action,now,owner=False):
         data=self.load();self.expire(data,now)
@@ -94,10 +94,10 @@ class Store:
         if action=='confirm':
             if e['author']!=author or e['status']!='preview':raise ValueError('Sirf creator apna unexpired preview confirm kar sakta hai.')
             if e['due']<=now:raise ValueError('Time nikal gaya. Naya preview banao.')
-            e['status']='scheduled'
+            e.update(status='scheduled',reason='confirmed')
         elif action=='cancel':
             if e['status'] not in ('preview','scheduled'):raise ValueError('Ye job ab cancel nahi ho sakti; list mein status dekho.')
-            e['status']='cancelled'
+            e.update(status='cancelled',reason='creator_or_owner_cancelled')
         self.save(data);return e
 
 
@@ -128,7 +128,7 @@ class Worker:
             # Never replay a pre-crash send with unknown delivery outcome.
             data=self.store.load()
             for e in data:
-                if e['status']=='dispatching':e['status']='uncertain'
+                if e['status']=='dispatching':e.update(status='uncertain',reason='restart_during_send')
             self.store.save(data)
             while not self.halted:
                 await self.tick()
@@ -136,30 +136,40 @@ class Worker:
         except asyncio.CancelledError:raise
         except (OSError,ValueError,TypeError):
             self.halted=True;log.error('Schedule worker stopped: state unreadable/unwritable; no send replay')
+    def health(self):
+        if self.halted: return 'halted_storage_or_worker_error'
+        if self.task is None: return 'not_started'
+        if self.task.done(): return 'stopped'
+        if not self.connected() or not self.client.is_ready(): return 'waiting_for_connection'
+        return 'running'
+
     async def tick(self,now=None):
-        now=time.time() if now is None else now
-        data=self.store.load();self.store.expire(data,now)
-        self.store.save(data)
-        for e in data:
-            if e['status']!='scheduled' or e['due']>now:continue
-            if now-e['due']>self.late:e['status']='missed';self.store.save(data);continue
-            if not self.connected() or not self.client.is_ready():continue
+        # Drain a bounded batch, rereading after each send to respect cancels.
+        # discord.py handles rate limits; never retry a send here.
+        for _ in range(10):
+            clock=time.time() if now is None else now
+            data=self.store.load();self.store.expire(data,clock)
+            self.store.save(data)
+            due=sorted((e for e in data if e['status']=='scheduled' and e['due']<=clock),key=lambda e:e['due'])
+            if not due:return
+            e=due[0]
+            if clock-e['due']>self.late:
+                e.update(status='missed',reason='late_over_2min');self.store.save(data);continue
+            if not self.connected() or not self.client.is_ready():return
             try:dest,targets=access(self.client,e)
             except ValueError:
-                e['status']='failed';self.store.save(data);continue
-            e['status']='dispatching';self.store.save(data) # durable BEFORE send
+                e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
+            e.update(status='dispatching',reason='send_started');self.store.save(data)
             try:
                 sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=targets,roles=False,everyone=False,replied_user=False))
             except asyncio.CancelledError:raise
             except Exception:
-                e['status']='uncertain' # even network failure may have reached Discord
-            else:e['status']='sent';e['sent_message']=sent.id
-            # Reload: a user may create/cancel a DIFFERENT job while send awaited.
-            # Never overwrite that concurrent action with this old snapshot.
+                e.update(status='uncertain',reason='send_outcome_unknown')
+            else:e.update(status='sent',reason='discord_accepted',sent_message=sent.id)
+            # A user can create/cancel another job during the awaited send.
             fresh=self.store.load()
             for ix,latest in enumerate(fresh):
                 if latest['id']==e['id']:fresh[ix]=e;break
             try:self.store.save(fresh)
             except (OSError,ValueError,TypeError):self.halted=True;raise
-            # Subsequent jobs must be loaded fresh to observe cancellation.
-            return
+            log.info('Schedule delivery status=%s reason=%s',e['status'],e['reason'])
