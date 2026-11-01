@@ -106,3 +106,37 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             async with retrying.request_scope():
                 with self.assertRaises(retrying.RequestError): await generation()
         self.assertEqual(len(session.calls),3)
+
+class OutputValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def run_script(self,script,provider='Gemini'):
+        session=Session(script)
+        with patch('retrying.asyncio.sleep',new=AsyncMock()):
+            result=await retrying.post_json(session,'x',label=provider,headers={},payload={},validate=retrying.generation_validator(provider))
+        return result,session
+    def gemini(self,text='hello',reason='STOP'):
+        return {'candidates':[{'finishReason':reason,'content':{'parts':[{'text':text}]}}]}
+    async def test_empty_then_valid(self):
+        _,s=await self.run_script([Response(200,{}),Response(200,self.gemini())]);self.assertEqual(len(s.calls),2)
+    async def test_reported_malformed_response_finish_reason_retried(self):
+        _,s=await self.run_script([Response(200,self.gemini('',reason='MALFORMED_RESPONSE')),Response(200,self.gemini())]);self.assertEqual(len(s.calls),2)
+    async def test_three_empty_only(self):
+        s=Session([Response(200,{})]*4)
+        with patch('retrying.asyncio.sleep',new=AsyncMock()):
+            with self.assertRaises(retrying.RequestError):
+                await retrying.post_json(s,'x',label='Gemini',headers={},payload={},validate=retrying.generation_validator('Gemini'))
+        self.assertEqual(len(s.calls),3)
+    async def test_block_never_retried(self):
+        for data in ({'promptFeedback':{'blockReason':'SAFETY'}},self.gemini('',reason='SAFETY'),self.gemini('',reason='RECITATION')):
+            s=Session([Response(200,data)])
+            with self.assertRaises(retrying.RequestError) as caught:
+                await retrying.post_json(s,'x',label='Gemini',headers={},payload={},validate=retrying.generation_validator('Gemini'))
+            self.assertEqual(caught.exception.reason,'blocked');self.assertEqual(len(s.calls),1)
+    async def test_malformed_groq_empty_then_valid(self):
+        _,s=await self.run_script([Response(200,{'choices':[]}),Response(200,{'choices':[{'message':{'content':''}}]}),Response(200,{'choices':[{'message':{'content':'hello'}}]})],'Groq')
+        self.assertEqual(len(s.calls),3)
+    async def test_mixed_http_and_empty_share_cap(self):
+        _,s=await self.run_script([Response(503),Response(200,{}),Response(200,self.gemini())]);self.assertEqual(len(s.calls),3)
+    async def test_diagnostics_no_body_or_headers(self):
+        with self.assertLogs('kristy.retry',level='INFO') as logs:
+            await self.run_script([Response(200,{'secret':'TOKEN_MARKER'}),Response(200,self.gemini())])
+        text=' '.join(logs.output);self.assertIn('attempt=2/3',text);self.assertIn('malformed_output',text);self.assertNotIn('TOKEN_MARKER',text)
