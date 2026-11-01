@@ -23,7 +23,7 @@ class ReuseTests(unittest.IsolatedAsyncioTestCase):
   class Y:
    def __init__(self,*a,**k):raise AssertionError('must not extract')
   class R:
-   status=200
+   status=200;headers={}
    def __enter__(self):return self
    def __exit__(self,*a):pass
    def geturl(self):return 'https://a.googlevideo.com/a'
@@ -41,3 +41,17 @@ class ReuseTests(unittest.IsolatedAsyncioTestCase):
    with patch('yt_dlp.YoutubeDL',Y):
     with self.assertRaises(JobFailure) as e:perform(dict(mode='download',value='unused',prepared=source(),prepared_until=expiry,expected_id=expected))
     self.assertEqual(e.exception.code,'EXTRACT_FAILED')
+ def test_fetch_connection_vs_timeout_preserves_extract_timing(self):
+  import urllib.error
+  class Y:
+   def __init__(self,*a,**k):pass
+   def __enter__(self):return self
+   def __exit__(self,*a):pass
+   def extract_info(self,*a,**k):return source()
+  for reason,code in ((TimeoutError('private error text'),'NETWORK_TIMEOUT'),(OSError('private DNS text'),'NETWORK_FAILED')):
+   with tempfile.TemporaryDirectory() as d,patch('yt_dlp.YoutubeDL',Y),patch('urllib.request.urlopen',side_effect=urllib.error.URLError(reason)):
+    with self.assertRaises(JobFailure) as e:perform(dict(mode='download',value='unused',max_seconds=60,max_bytes=100,destination=str(pathlib.Path(d)/'audio')))
+    self.assertEqual(e.exception.code,code)
+    self.assertEqual(e.exception.diagnostics[0]['stage'],'EXTRACT')
+    self.assertEqual(e.exception.diagnostics[-1]['stage'],'FETCH')
+    self.assertNotIn('private',str(e.exception.diagnostics))
