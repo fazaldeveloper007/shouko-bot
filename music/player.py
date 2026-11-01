@@ -22,7 +22,6 @@ class GuildPlayer:
         self.started = 0
         self.bridge = None
         self.task = None
-        self.idle = None
         self.lock = asyncio.Lock()
         self.control_lock = asyncio.Lock()
         self.closed = False
@@ -57,18 +56,6 @@ class GuildPlayer:
             self.temp.cleanup()
             raise
         emit('VOICE_CONNECT','OK',elapsed=time.monotonic()-began)
-        self.arm_idle()
-
-    def arm_idle(self):
-        if self.idle: self.idle.cancel()
-        self.idle = asyncio.create_task(self.idle_leave())
-
-    async def idle_leave(self):
-        try:
-            await asyncio.sleep(self.manager.idle_seconds)
-            if not self.current:
-                await self.manager.remove(self, 'Idle timeout: leaving VC.')
-        except asyncio.CancelledError: pass
 
     async def engine_failed(self):
         await self.manager.remove(self, 'Voice connection failed. Queue cleared; request /joinvckristy to start a fresh session.')
@@ -109,7 +96,6 @@ class GuildPlayer:
             if len(self.queue) >= self.manager.queue_limit: raise MusicError('Queue is full')
             self.queue.append(track)
             self.queued_at[id(track)] = time.monotonic()
-            if self.idle and start: self.idle.cancel()
             if start and not self.interrupting and (not self.task or self.task.done()):
                 self.task = asyncio.create_task(self.run())
             elif self.current is not None: self._prefetch_start()
@@ -173,7 +159,7 @@ class GuildPlayer:
                     self.current = None; self.paused = False
             if not self.closed:
                 await self.manager.panel(self)
-                self.arm_idle()
+                # Queue finished: stay connected; a later add/toggle/start wakes the player.
         except asyncio.CancelledError:
             pass
         finally:
@@ -209,14 +195,12 @@ class GuildPlayer:
         async with self.lock:
             self.autoplay = enabled
             if enabled and not self.current and not self.queue and not self.closed and (not self.task or self.task.done()):
-                if self.idle: self.idle.cancel()
                 self.task = asyncio.create_task(self.run())
         await self.manager.panel(self)
 
     async def start_queue(self):
         async with self.lock:
             if not self.current and self.queue and (not self.task or self.task.done()):
-                if self.idle: self.idle.cancel()
                 self.task = asyncio.create_task(self.run())
                 return True
         return False
@@ -254,7 +238,6 @@ class GuildPlayer:
                     self.task = asyncio.create_task(self.run())
                 elif not clear and self.autoplay and self.last_track and not self.closed:
                     self.task = asyncio.create_task(self.run())
-                else: self.arm_idle()
             await self.manager.panel(self)
 
     async def close(self):
@@ -266,7 +249,7 @@ class GuildPlayer:
         self.closed = True; self.generation += 1; self.queue.clear(); self.queued_at.clear()
         await self._prefetch_cancel()
         current = asyncio.current_task()
-        for task in (self.idle, self.task):
+        for task in (self.task,):
             if task and task is not current:
                 task.cancel(); await asyncio.gather(task, return_exceptions=True)
         confirmed = await self.bridge.disconnect(force=True) if self.bridge else True
@@ -274,10 +257,9 @@ class GuildPlayer:
         return confirmed
 
 class Manager:
-    def __init__(self, client, *, idle_seconds=300, queue_limit=50, max_minutes=120):
+    def __init__(self, client, *, queue_limit=50, max_minutes=120):
         self.client = client
         self.media = Media(max_minutes=max_minutes)
-        self.idle_seconds = idle_seconds
         self.queue_limit = queue_limit
         self.players = {}
         self.guild_locks = {}
