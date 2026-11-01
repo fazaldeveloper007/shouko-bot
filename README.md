@@ -137,7 +137,7 @@ likes, running jokes and things they asked her to remember. She uses it naturall
   message sounds personal ("my main is...", "remember..."), with cooldowns between calls.
 - Tell her to remember something directly ("yaad rakhna...", "remember this", "likh lo") and she
   saves it right away, skipping the cooldown: the fact is extracted and written to the diary file,
-  retried once if the first attempt fails (e.g. rate limit), and she confirms in the channel
+  retried within a separate three-call budget for temporary failures, and she confirms in the channel
   ("likh liya 📔") only once it is actually saved. If every attempt fails she stays silent instead
   of lying, and retries the save on your next message.
 - Each diary is capped at 40 short facts; the oldest are dropped when it is full.
@@ -202,3 +202,18 @@ It uses the existing Python gateway plus a token-free Node voice worker. Command
 buttons, output and music-state awareness stay in the connected VC's built-in chat.
 `MUSIC_ENABLED=0` and `MUSIC_SYNC_COMMANDS=0` keep playback and slash registration off.
 Do not enable/install/register from this review build without the separate deployment decision.
+
+## Temporary API failures
+
+Each generation or search operation gets at most three HTTP attempts, including
+the first. Provider fallback and Gemini config fixes share that same generation
+budget. Successful distinct steps (initial reply, search, researched answer) get
+separate budgets and are not counted as failed retries. The whole AI/search reply
+phase has a 60-second deadline; each call is capped at 20 seconds or remaining time.
+Temporary connection errors, timeouts and retryable server errors get a short
+internal retry. Invalid keys, permanent requests and quota failures fail fast. A
+provider Retry-After is never shortened: waits up to eight seconds are respected,
+longer waits stop the retry. Only one final reply/fallback is sent. Message sends,
+VC summons and other actions are not replayed. Background member-diary extraction
+has its own independent three-call budget, no second outer retry loop; a failed
+explicit save stays pending for the member's next message.
