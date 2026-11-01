@@ -1,5 +1,6 @@
 """Current gateway voice snapshot, never model/history-derived or ping-bearing."""
 import re
+import time
 import discord
 
 QUERY = re.compile(
@@ -7,6 +8,42 @@ QUERY = re.compile(
     r'\b(?:kaun|kon|who|members?)\b.*\b(?:vc|voice(?:\s+channel)?)\b|'
     r'<#\d+>.*\b(?:kaun|kon|who|members?)\b|'
     r'\b(?:kaun|kon|who|members?)\b.*<#\d+>)', re.I)
+
+
+SELECT_VC = 'Tum abhi VC mein nahi ho. Kaunsa VC? Usko # mention karke poochho: Kristy is VC mein kaun hai?'
+
+
+class Clarifications:
+    """Only a short-lived selection for the same human, guild and text channel."""
+    def __init__(self, ttl=120, capacity=1000):
+        self.ttl, self.capacity, self.items = ttl, capacity, {}
+
+    def key(self, message):
+        return message.guild.id, message.channel.id, message.author.id
+
+    def prune(self):
+        now = time.monotonic()
+        self.items = {k: v for k, v in self.items.items() if v[0] > now}
+
+    def remember(self, message, reply):
+        self.prune()
+        key = self.key(message)
+        self.items.pop(key, None)
+        if len(self.items) >= self.capacity:
+            self.items.pop(next(iter(self.items)))
+        self.items[key] = (time.monotonic() + self.ttl, getattr(reply, 'id', None))
+
+    def forget(self, message):
+        self.items.pop(self.key(message), None)
+
+    def matches(self, message):
+        self.prune()
+        entry = self.items.get(self.key(message))
+        if entry is None or not re.fullmatch(r'\s*<#\d+>(?:\s+<#\d+>)*\s*', message.content):
+            return False
+        ref = getattr(message, 'reference', None)
+        # A reply to another bot/person/question is not a roster selection.
+        return ref is None or (entry[1] is not None and getattr(ref, 'message_id', None) == entry[1])
 
 
 def is_query(text):
@@ -28,7 +65,7 @@ def snapshot(message, client, connected):
     else:
         channel = getattr(getattr(message.author, 'voice', None), 'channel', None)
         if channel is None:
-            return 'Tum abhi VC mein nahi ho. Kaunsa VC? Usko # mention karke poochho: Kristy is VC mein kaun hai?'
+            return SELECT_VC
         # Resolve again, do not trust a detached channel object.
         channel = guild.get_channel(channel.id)
     if (channel is None or getattr(getattr(channel, 'guild', None), 'id', None) != guild.id
