@@ -1602,6 +1602,7 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     return await think_groq(channel_id, diary_block, extra_system)
 
 _voice_cache_connected = False
+_roster_clarifications = voice_roster.Clarifications()
 
 
 @client.event
@@ -1686,7 +1687,9 @@ async def on_message(message):
     if content:
         history[message.channel.id].append((message.author.display_name, message.author.id, content[:300]))
 
-    if not should_respond(message):
+    roster_followup = (action_text(message, content, question=True) is not None
+                       and _roster_clarifications.matches(message))
+    if not roster_followup and not should_respond(message):
         return
 
     music_context = client.music.context(message.channel) if client.music else ""
@@ -1706,10 +1709,13 @@ async def on_message(message):
         history[message.channel.id].append((speaker, user_id, content))
 
     # Read actual current voice states in code; never ask the model to guess.
-    if action_text(message, content, question=True) is not None and voice_roster.is_query(content):
+    if roster_followup or (action_text(message, content, question=True) is not None and voice_roster.is_query(content)):
         roster = voice_roster.snapshot(message, client, _voice_cache_connected)
+        _roster_clarifications.forget(message)
         for chunk in chunk_reply(roster):
-            await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            sent = await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            if roster == voice_roster.SELECT_VC:
+                _roster_clarifications.remember(message, sent)
         return
 
     if await handle_self_diary(message, content):
