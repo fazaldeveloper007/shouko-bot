@@ -43,6 +43,7 @@ import diary
 import aliases
 import retrying
 import self_diary
+import voice_roster
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -889,7 +890,7 @@ ALIAS_RESERVED_WORDS = {
 ALIAS_FORGET_SKIP = {"mujhe", "hum", "humein", "unko", "usko", "inko", "isko", "sabko", "sab", "inhe", "unhe"}
 
 
-def action_text(message, content):
+def action_text(message, content, *, question=False):
     """Only a direct current human request is eligible for side effects.
 
     Quotes, code, forwarded snapshots, reported speech, questions about a
@@ -902,7 +903,7 @@ def action_text(message, content):
         return None
     if re.search(r"[`\"“”]|(?:^|\n)\s*>|https?://", content or ""):
         return None
-    if re.search(r"\b(example|quote|quoted|said|says|bola|bolta|kehta|forwarded|agar|if|don't|dont|not|mat|nahi|nhi)\b|[?]", content or "", re.I):
+    if re.search(r"\b(example|quote|quoted|said|says|bola|bolta|kehta|forwarded|agar|if|don't|dont|not|mat|nahi|nhi)\b", content or "", re.I) or (not question and '?' in (content or '')):
         return None
     return _addressed_text(content)
 
@@ -1600,8 +1601,19 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
             log.warning("Gemini brain failed, falling back to Groq: %s", type(e).__name__)
     return await think_groq(channel_id, diary_block, extra_system)
 
+_voice_cache_connected = False
+
+
+@client.event
+async def on_resumed():
+    global _voice_cache_connected
+    _voice_cache_connected = True
+
+
 @client.event
 async def on_ready():
+    global _voice_cache_connected
+    _voice_cache_connected = True
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
     announcements.start(client)
@@ -1615,6 +1627,8 @@ async def on_voice_state_update(member, before, after):
 
 @client.event
 async def on_disconnect():
+    global _voice_cache_connected
+    _voice_cache_connected = False
     if client.music:
         await client.music.gateway_disconnected()
 
@@ -1690,6 +1704,13 @@ async def on_message(message):
         # reply and Gemini rejects the request with a 400.
         content = EMPTY_MESSAGE_PROMPT
         history[message.channel.id].append((speaker, user_id, content))
+
+    # Read actual current voice states in code; never ask the model to guess.
+    if action_text(message, content, question=True) is not None and voice_roster.is_query(content):
+        roster = voice_roster.snapshot(message, client, _voice_cache_connected)
+        for chunk in chunk_reply(roster):
+            await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        return
 
     if await handle_self_diary(message, content):
         return
