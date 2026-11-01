@@ -2,6 +2,9 @@
 import json
 import pathlib
 import signal
+import socket
+import re
+import ssl
 import sys
 import time
 import urllib.parse
@@ -38,9 +41,8 @@ def reusable_source(info):
     if not isinstance(headers,dict) or any(not isinstance(k,str) or not isinstance(v,str) or '\r' in k+v or '\n' in k+v for k,v in headers.items()):return None
     return {k:info.get(k) for k in ('id','title','duration','is_live','live_status','url','ext','acodec','http_headers')}
 
-def perform(request):
+def _perform(request, rows):
     from yt_dlp import YoutubeDL
-    rows=[]
     opts=dict(quiet=True,no_warnings=True,logger=Quiet(),noplaylist=True,
         js_runtimes={'node':{}},socket_timeout=10,retries=0,extractor_retries=0,
         cachedir=False,skip_download=True,format='bestaudio[ext=webm][acodec=opus]',playlistend=5)
@@ -68,24 +70,80 @@ def perform(request):
     if track.duration>request['max_seconds']:raise JobFailure('DURATION_LIMIT',stage='VALIDATE')
     url=info.get('url','')
     if not allowed_audio_url(url):raise JobFailure('SOURCE_REJECTED',stage='VALIDATE')
-    path=pathlib.Path(request['destination']);total=0;start=time.monotonic()
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url,headers=info.get('http_headers') or {}),timeout=15) as response:
-            if response.status!=200:raise JobFailure('HTTP_FAILED',response.status,stage='FETCH')
-            if not allowed_audio_url(response.geturl()):raise JobFailure('SOURCE_REJECTED',stage='VALIDATE')
-            with path.open('xb') as output:
-                head=response.read(65536)
-                if not head.startswith(b'\x1a\x45\xdf\xa3') or b'A_OPUS' not in head:raise JobFailure('BAD_AUDIO',stage='VALIDATE')
-                while head:
-                    total+=len(head)
-                    if total>request['max_bytes']:raise JobFailure('SIZE_LIMIT',stage='FETCH')
-                    output.write(head);head=response.read(65536)
-    except urllib.error.HTTPError as exc:raise JobFailure('HTTP_FAILED',exc.code,stage='FETCH') from None
-    except (TimeoutError,urllib.error.URLError):raise JobFailure('NETWORK_TIMEOUT',stage='FETCH') from None
-    except OSError:raise JobFailure('LOCAL_IO',stage='WRITE') from None
+    path=pathlib.Path(request['destination']);start=time.monotonic()
+    try:total=fetch_audio(url,info.get('http_headers') or {},path,request['max_bytes'])
+    except JobFailure as exc:
+        exc.seconds=time.monotonic()-start
+        raise
     rows.append(dict(stage='FETCH',code='OK',seconds=time.monotonic()-start,bytes=total))
     return dict(ok=True,id=track.id,bytes=total,diagnostics=rows)
 
+
+def fetch_audio(url, headers, path, maximum, *, opener=None):
+    # Range requests avoid an unbounded whole-file request. Never splice mismatched ranges.
+    opener=opener or urllib.request.urlopen
+    total=0;expected=None;chunk=1024*1024;prefix=bytearray();validated=False
+    try:
+        with path.open('xb') as output:
+            while True:
+                end=min(total+chunk-1,maximum)
+                h={k:v for k,v in headers.items() if k.lower() not in ('range','accept-encoding')}
+                h.update(Range=f'bytes={total}-{end}',**{'Accept-Encoding':'identity'})
+                with opener(urllib.request.Request(url,headers=h),timeout=15) as response:
+                    if not allowed_audio_url(response.geturl()):raise JobFailure('SOURCE_REJECTED',stage='VALIDATE')
+                    ranged=response.status==206
+                    if ranged:
+                        m=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
+                        if not m:raise JobFailure('BAD_RESPONSE',stage='FETCH')
+                        first,last,length=map(int,m.groups())
+                        if first!=total or last<first or last>end or last>=length or (expected is not None and expected!=length):raise JobFailure('BAD_RESPONSE',stage='FETCH')
+                        expected=length;promised=last-first+1
+                    elif response.status==200 and total==0:
+                        length=response.headers.get('Content-Length')
+                        if length and not length.isdigit():raise JobFailure('BAD_RESPONSE',stage='FETCH')
+                        expected=int(length) if length else None;promised=expected
+                    else:raise JobFailure('HTTP_FAILED',response.status,stage='FETCH')
+                    if expected is not None and expected>maximum:raise JobFailure('SIZE_LIMIT',stage='FETCH')
+                    received=0
+                    while True:
+                        reader=getattr(response,'read1',response.read)
+                        data=reader(16384)
+                        if not data:break
+                        received+=len(data);total+=len(data)
+                        if total>maximum:raise JobFailure('SIZE_LIMIT',stage='FETCH')
+                        if promised is not None and received>promised:raise JobFailure('BAD_RESPONSE',stage='FETCH')
+                        if not validated:
+                            prefix.extend(data[:max(0,65536-len(prefix))])
+                            if len(prefix)>=4 and not prefix.startswith(b'\x1a\x45\xdf\xa3'):raise JobFailure('BAD_AUDIO',stage='VALIDATE')
+                            validated=b'A_OPUS' in prefix
+                            if len(prefix)>=65536 and not validated:raise JobFailure('BAD_AUDIO',stage='VALIDATE')
+                        output.write(data)
+                    if promised is not None and received!=promised:raise JobFailure('BAD_RESPONSE',stage='FETCH')
+                    if not ranged or total==expected:break
+                    if received==0:raise JobFailure('BAD_RESPONSE',stage='FETCH')
+            if not validated:raise JobFailure('BAD_AUDIO',stage='VALIDATE')
+        return total
+    except urllib.error.HTTPError as exc:failure=JobFailure('HTTP_FAILED',exc.code,stage='FETCH')
+    except TimeoutError:failure=JobFailure('NETWORK_TIMEOUT',stage='FETCH')
+    except urllib.error.URLError as exc:
+        failure=JobFailure('NETWORK_TIMEOUT' if isinstance(exc.reason,(TimeoutError,socket.timeout)) else 'NETWORK_FAILED',stage='FETCH')
+    except ssl.SSLError:failure=JobFailure('NETWORK_FAILED',stage='FETCH')
+    except JobFailure as exc:failure=exc
+    except OSError:failure=JobFailure('LOCAL_IO',stage='WRITE')
+    failure.size=total
+    raise failure from None
+
+def perform(request):
+    rows=[]
+    began=time.monotonic()
+    try:return _perform(request,rows)
+    except JobFailure as exc:
+        exc.diagnostics=rows+[dict(stage=exc.stage,code=exc.code,status=exc.status,seconds=getattr(exc,'seconds',None),bytes=getattr(exc,'size',None))]
+        raise
+    except TimeoutError:
+        exc=JobFailure('NETWORK_TIMEOUT',stage='FETCH' if rows else 'EXTRACT')
+        exc.diagnostics=rows+[dict(stage=exc.stage,code=exc.code,seconds=time.monotonic()-began)]
+        raise exc from None
 
 def main():
     request=json.loads(sys.stdin.buffer.read(8192))
@@ -96,7 +154,7 @@ def main():
 
 if __name__=='__main__':
     try:result=main()
-    except JobFailure as exc:result=dict(ok=False,code=exc.code,diagnostics=[dict(stage=exc.stage,code=exc.code,status=exc.status)])
+    except JobFailure as exc:result=dict(ok=False,code=exc.code,diagnostics=getattr(exc,'diagnostics',[dict(stage=exc.stage,code=exc.code,status=exc.status,seconds=getattr(exc,'seconds',None),bytes=getattr(exc,'size',None))]))
     except TimeoutError:result=dict(ok=False,code='NETWORK_TIMEOUT')
     except Exception:result=dict(ok=False,code='WORKER_FAILED')
     print(json.dumps(result));sys.exit(0 if result.get('ok') else 1)
