@@ -41,7 +41,6 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self): self.players=[]
     async def asyncTearDown(self):
         for p in self.players:
-            if p.idle: p.idle.cancel()
             if p.task and not p.task.done(): p.task.cancel();await asyncio.gather(p.task,return_exceptions=True)
             p.temp.cleanup()
     def player(self,gid=10,cid=20):
@@ -160,6 +159,37 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(p.prefetch)
         await p.interrupt(clear=True)
         self.assertIsNone(p.prefetch)
+    async def test_idle_player_stays_connected_and_resumable(self):
+        p=self.player();played=[]
+        async def download(t,path,**kw): path.write_bytes(b'd');return path
+        async def play(path):
+            played.append(path.name)
+            f=asyncio.get_running_loop().create_future();f.set_result({'type':'ended'})
+            return 'tok',f
+        p.manager.media.download=download;p.bridge.play=play;p.bridge.waiters={}
+        p.manager.remove=AsyncMock()
+        await p.add(Track('aaaaaaaaaaa','one',19,1))
+        await asyncio.wait_for(p.task,2)
+        await asyncio.sleep(.05)
+        p.manager.remove.assert_not_called()  # no idle auto-leave
+        self.assertFalse(p.closed)
+        await p.add(Track('bbbbbbbbbbb','two',19,1))  # still resumable on the same connection
+        await asyncio.wait_for(p.task,2)
+        self.assertEqual(len(played),2)
+    async def test_empty_vc_does_not_disconnect_but_platform_drop_does(self):
+        from music.integration import Music
+        p=self.player()
+        music=types.SimpleNamespace(manager=p.manager,client=types.SimpleNamespace(user=types.SimpleNamespace(id=999)))
+        p.manager.remove=AsyncMock()
+        p.bridge.state='connected'
+        p.channel.members=[]  # last human left
+        human=types.SimpleNamespace(id=1,bot=False,guild=p.channel.guild)
+        before=types.SimpleNamespace(channel=p.channel)
+        await Music.voice_changed(music,human,before,types.SimpleNamespace(channel=None))
+        p.manager.remove.assert_not_called()  # empty VC: stay connected
+        bot=types.SimpleNamespace(id=999,bot=True,guild=p.channel.guild)
+        await Music.voice_changed(music,bot,before,types.SimpleNamespace(channel=None))
+        p.manager.remove.assert_awaited_once()  # platform-enforced drop still cleans up
     async def test_background_admission_preserves_foreground_slot(self):
         from music.media import Media
         media=Media();entered=[];release=asyncio.Event()
