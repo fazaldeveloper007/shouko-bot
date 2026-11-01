@@ -24,7 +24,8 @@ def fail(msg):
 def req(method, path, token, payload=None, uploaded=None, total=None):
     r = urllib.request.Request(API + path, method=method,
         data=json.dumps(payload).encode() if payload is not None else None,
-        headers={'Authorization': 'Bot ' + token, 'Content-Type': 'application/json'})
+        headers={'Authorization': 'Bot ' + token, 'Content-Type': 'application/json',
+                 'User-Agent': 'DiscordBot (kristy-icon-setup, 1.0)'})
     try:
         with urllib.request.urlopen(r) as resp:
             body = resp.read()
@@ -57,14 +58,14 @@ def main():
         expected = json.loads(ledger.read_text()).get('application_id')
     except Exception:
         fail('Could not read the music command ledger.')
-    status, app = req('GET', '/applications/@me', token)
+    status, app = req('GET', '/oauth2/applications/@me', token)
     app_id = str(app.get('id', ''))
     if not expected or str(expected) != app_id:
         fail('Token belongs to a different app than the registered music commands. Not touching anything.')
     print(f"App verified: {app.get('name')} - matches the registered music commands.")
     status, data = req('GET', f'/applications/{app_id}/emojis', token)
     existing = {e['name']: e for e in data.get('items', [])}
-    own_ids = {app_id, str((app.get('bot') or {}).get('id', ''))}
+    own_ids = {x for x in (app_id, str((app.get('bot') or {}).get('id', ''))) if x}
     foreign = [n for n in ICONS if n in existing
                and str((existing[n].get('user') or {}).get('id', '')) not in own_ids]
     if foreign:
