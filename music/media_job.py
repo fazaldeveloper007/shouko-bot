@@ -56,18 +56,24 @@ def _perform(request, rows):
         if reused:info=prepared
         elif request['mode']=='related':
             opts['extract_flat']='in_playlist';opts['playlistend']=15
-            # Primary: YouTube's own radio mix for the seed video. Fallback: artist
-            # search built from the seed title's "Artist - Title" shape.
+            # Primary: YouTube's own radio mix for the seed video. The mix needs
+            # playlist processing: with noplaylist=True yt-dlp resolves the URL to
+            # the bare video and returns no entries at all, which also wrongly
+            # suppressed the fallback (yt-dlp YoutubeTabIE._yes_playlist).
+            # Fallback: artist search built from the seed title's "Artist - Title"
+            # shape; also used when the mix extracts but yields no entries.
             vid=request['value']
             sources=['https://www.youtube.com/watch?v=%s&list=RD%s' % (vid,vid)]
             artist=re.split(r'\s[-\u2013\u2014|]\s',request.get('related_title') or '')[0].strip()
             if len(artist)>=2:sources.append('ytsearch15:%s' % artist)
             info=last=None
             for source in sources:
+                attempt=dict(opts)
+                if 'list=RD' in source:attempt['noplaylist']=False
                 try:
-                    with YoutubeDL(opts) as y:info=y.extract_info(source,download=False)
-                    break
-                except Exception as exc:last=exc
+                    with YoutubeDL(attempt) as y:info=y.extract_info(source,download=False)
+                    if info.get('entries'):break
+                except Exception as exc:last=exc;info=None
             if info is None:raise last
         else:
             with YoutubeDL(opts) as y:info=y.extract_info(request['value'],download=False)
