@@ -2,9 +2,10 @@ import unittest
 from unittest.mock import patch
 from music.media_job import perform,JobFailure
 
-def fake(extract):
+def fake(extract,captured=None):
     class Y:
-        def __init__(self,*a,**k):pass
+        def __init__(self,*a,**k):
+            if captured is not None:captured.append(k)
         def __enter__(self):return self
         def __exit__(self,*a):pass
         def extract_info(self,url,download=False):return extract(url)
@@ -16,15 +17,27 @@ class RelatedFallbackTests(unittest.TestCase):
         r.update(over);return r
 
     def test_radio_mix_preferred(self):
-        calls=[]
+        calls=[];captured=[]
         def extract(url):
             calls.append(url)
             return dict(entries=[dict(id='mix1',title='Song A',duration=200)])
-        with patch('yt_dlp.YoutubeDL',fake(extract)):
+        with patch('yt_dlp.YoutubeDL',fake(extract,captured)):
             out=perform(self.request())
         self.assertEqual(out['items'],[dict(id='mix1',title='Song A',duration=200,is_live=None,live_status=None)])
         self.assertEqual(len(calls),1)
         self.assertIn('list=RDabcdefghijk',calls[0])
+        self.assertFalse(captured[0].get('noplaylist'))  # mix needs playlist processing; noplaylist strips entries
+
+    def test_empty_mix_falls_back_to_artist_search(self):
+        calls=[]
+        def extract(url):
+            calls.append(url)
+            if 'list=RD' in url:return dict(entries=[])  # mix resolved but yielded nothing
+            return dict(entries=[dict(id='art1',title='J\'me tire',duration=262)])
+        with patch('yt_dlp.YoutubeDL',fake(extract)):
+            out=perform(self.request())
+        self.assertEqual(calls[1],'ytsearch15:GIMS')
+        self.assertEqual(out['items'][0]['id'],'art1')
 
     def test_artist_search_fallback(self):
         calls=[]
