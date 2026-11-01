@@ -111,9 +111,6 @@ class Music:
         if member.id == self.client.user.id:
             if p.bridge and p.bridge.state not in ('leaving', 'closed') and (not after.channel or after.channel.id != p.channel.id):
                 await self.manager.remove(p, 'Voice session ended. Queue cleared.')
-        elif before.channel and before.channel.id == p.channel.id:
-            humans = [m for m in p.channel.members if not m.bot]
-            if not humans: await self.manager.remove(p, 'VC is empty. Leaving and clearing the queue.')
 
     async def gateway_disconnected(self):
         # Do not silently resume voice under a changed main-gateway session.
