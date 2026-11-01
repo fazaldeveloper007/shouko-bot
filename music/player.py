@@ -34,6 +34,10 @@ class GuildPlayer:
         self.media_dir = pathlib.Path(self.temp.name)
         self.panel = None
         self.panel_view = None
+        self.panel_task = None
+        self.panel_dirty = False
+        self.panel_status = None
+        self.panel_orphans = []
 
     async def connect(self):
         bridge = Bridge(self.manager.client, self.channel, self.media_dir,
@@ -195,6 +199,7 @@ class Manager:
         self.players = {}
         self.guild_locks = {}
         self.panel_builder = None
+        self.panel_interval = 1.0
 
     def caller_channel(self, user, text_channel):
         vc = getattr(getattr(user, 'voice', None), 'channel', None)
@@ -232,12 +237,17 @@ class Manager:
             confirmed = await player.close()
             if self.players.get(gid) is player:
                 self.players.pop(gid, None)
+        if player.panel_task and not player.panel_task.done():
+            player.panel_dirty = False
+            await asyncio.gather(player.panel_task, return_exceptions=True)
         if reason: await self.note(player, reason)
         if not confirmed: await self.note(player, 'Leave could not be confirmed. If Kristy is still in VC, disconnect her manually.')
         if player.panel_view: player.panel_view.stop()
-        if player.panel:
-            try: await player.panel.edit(view=None)
+        for message in [player.panel] + player.panel_orphans:
+            if not message: continue
+            try: await message.delete()
             except Exception: pass
+        player.panel = None; player.panel_orphans = []
         return confirmed
 
     async def note(self, player, text):
@@ -245,17 +255,41 @@ class Manager:
         except Exception: pass
 
     async def panel(self, player, status=None):
+        # The panel always re-posts at chat bottom: new message first, old own panel deleted after.
+        # Calls coalesce through a per-player task so rapid changes send only the latest state.
         if not self.panel_builder or player.closed: return
-        began = time.monotonic()
-        embed, view = self.panel_builder(player, status)
-        if player.panel_view: player.panel_view.stop()
-        player.panel_view = view
+        player.panel_status = status; player.panel_dirty = True
+        if player.panel_task and not player.panel_task.done(): return
+        player.panel_task = asyncio.create_task(self._panel_loop(player))
+
+    async def _panel_loop(self, player):
         try:
-            if player.panel: await player.panel.edit(embed=embed, view=view)
-            else: player.panel = await player.channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
-            emit('PANEL','OK',elapsed=time.monotonic()-began)
-        except Exception:
-            emit('PANEL','PANEL_FAILED')
+            while player.panel_dirty and not player.closed:
+                status = player.panel_status; player.panel_status = None; player.panel_dirty = False
+                began = time.monotonic()
+                view = self.panel_builder(player, status)
+                if player.panel_view: player.panel_view.stop()
+                player.panel_view = view
+                old, player.panel = player.panel, None
+                try:
+                    player.panel = await player.channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+                    emit('PANEL','OK',elapsed=time.monotonic()-began)
+                except Exception:
+                    player.panel = old
+                    emit('PANEL','PANEL_FAILED')
+                else:
+                    if old:
+                        try: await old.delete()
+                        except Exception:
+                            player.panel_orphans.append(old)
+                            del player.panel_orphans[:-3]
+                    for orphan in player.panel_orphans[:]:
+                        try:
+                            await orphan.delete()
+                            player.panel_orphans.remove(orphan)
+                        except Exception: pass
+                await asyncio.sleep(self.panel_interval)
+        except asyncio.CancelledError: pass
 
     def context(self, channel):
         guild = getattr(channel, 'guild', None)
