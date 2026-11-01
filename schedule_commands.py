@@ -1,6 +1,8 @@
 """Strict preview-confirmed timed messages; content after | is literal data."""
 import re
 import time
+
+INTENT = re.compile(r"\b(remind(?:er)?|schedule|timer|yaad\s+dila(?:na|do|dena)?|reminder\s+laga)\b|\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b.*\b(?:bhej|bol|bula|tag|ping|message)|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*\b(?:bhej|bol|bula|tag|ping|message)", re.I)
 import discord
 import timed_messages as tm
 
@@ -15,16 +17,37 @@ HELP = ('Schedule format:\nKristy schedule 10 minute baad | here | Mayank, Naiyo
 class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
+        self.pending={};self.health=lambda:'unknown'
+    def key(self,message):return message.guild.id,message.channel.id,message.author.id
+    def followup(self,message,text):
+        now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
+        item=self.pending.get(self.key(message))
+        ref=getattr(message,'reference',None)
+        return bool(item and (ref is None or getattr(ref,'message_id',None)==item[1]) and re.fullmatch(r'(?:(?:haan?|ha|okay|ok|yes)\s+)?(?:haan?|ha|okay|ok|confirm|yes|isi channel mein(?: dena)?|same channel|yahi(?: channel)?)[ .!]*',text,re.I))
     async def reply(self,message,text):
-        await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
+        return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
+    async def clarify(self,message):
+        sent=await self.reply(message,'Abhi schedule save/active nahi hua. Exact time, destination, targets aur message chahiye. Neeche format se preview banao; sirf okay/same channel bolne se job arm nahi hota.\n'+HELP)
+        if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
+        self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None))
+
     async def handle(self,message,text,client,guard):
         # Guard command/header, not literal payload (quotes in a user-authored
         # message are data). No AI or quoted old messages can call this handler.
         header=text.split('|',1)[0]
         if guard(message,header,question=True) is None:return False
-        m=re.match(r'^(schedule|remind|summon)\b\s*(.*)$',text,re.I|re.S)
-        if not m:return False
+        m=re.match(r'^(schedule|remind(?:er)?|summon)\b\s*(.*)$',text,re.I|re.S)
+        if not m:
+            if INTENT.search(text) or self.followup(message,text):
+                await self.clarify(message);return True
+            return False
         kind,rest=m[1].lower(),m[2].strip()
+        if kind=='reminder':kind='remind'
+        # Bounded conversational self-reminder: exact time before ':', literal
+        # reminder text after it. No inferred names or rewritten payload.
+        natural=re.fullmatch(r'(\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad)\s*:\s*(.+)',rest,re.I|re.S)
+        if kind=='remind' and '|' not in rest and natural:
+            rest=f'{natural[1]} | here | {natural[2]}' 
         now=time.time();guild=message.guild
         try:
             ctl=re.fullmatch(r'(confirm|cancel)\s+([a-f0-9]{10})',rest,re.I)
@@ -39,20 +62,22 @@ class Commands:
                 entry=self.store.control(ident,guild.id,message.author.id,action,now,owner)
                 await self.reply(message,f"{entry['id']}: {'scheduled' if action=='confirm' else 'cancelled'}." + (' Bot time par chalni chahiye; 2 minute se zyada late hua toh missed, catch-up ping nahi.' if action=='confirm' else ''))
                 return True
-            if rest.lower()=='list':
+            status=re.fullmatch(r'status(?:\s+([a-f0-9]{10}))?',rest,re.I)
+            if rest.lower()=='list' or status:
                 rows=[]
                 for e in self.store.load():
                     if e['guild']!=guild.id or (e['author']!=message.author.id and not owner):continue
-                    # Never reveal jobs in hidden destinations, including owner list.
-                    try:dest,_=tm.access(client,e)
-                    except ValueError:continue
-                    if not dest.permissions_for(message.author).view_channel:continue
-                    rows.append(f"{e['id']} | {e['status']} | {tm.shown(e['due'])} | channel {e['dest']}")
-                for start in range(0,max(1,len(rows)),8):await self.reply(message,'\n'.join(rows[start:start+8]) or 'Koi visible schedule nahi mila.')
+                    if status and status[1] and e['id']!=status[1]:continue
+                    # Own status remains useful after access/target loss. Omit
+                    # destination/body/target identifiers from diagnostics.
+                    reason=e.get('reason','legacy_status')
+                    if reason not in {'awaiting_confirmation','confirmed','creator_or_owner_cancelled','preview_expired','late_over_2min','access_or_member_check_failed','send_started','send_outcome_unknown','discord_accepted','restart_during_send'}:reason='legacy_status'
+                    rows.append(f"{e['id']} | {e['status']} | {tm.shown(e['due'])} | reason={reason}")
+                for start in range(0,max(1,len(rows)),8):await self.reply(message,'Worker: '+self.health()+'\n'+('\n'.join(rows[start:start+8]) or 'Is server mein apna saved schedule nahi mila. Normal chat ka okay schedule nahi hota.'))
                 return True
             parts=[x.strip() for x in rest.split('|')]
             if len(parts)!=(3 if kind in ('remind','summon') else 4):
-                await self.reply(message,HELP);return True
+                await self.clarify(message);return True
             when,destination=parts[:2]
             anchor=getattr(message,'created_at',None)
             if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
@@ -81,6 +106,7 @@ class Commands:
             draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due)
             tm.access(client,draft)
             entry=self.store.create(**draft,now=now)
+            self.pending.pop(self.key(message),None)
             await self.reply(message,f"Preview {entry['id']} (abhi armed nahi):\n{tm.shown(due)}\nDestination: {discord.utils.escape_markdown(dest.name)} (ID {dest.id})\nExact outgoing text:\n{full}\n\nIsi channel mein 2 minute ke andar: Kristy schedule confirm {entry['id']}\nBot chalni chahiye. 15-second check cadence; 2 minute se zyada late -> missed, no catch-up. 10 jobs/member, 50/server, max30days. Unknown send outcome par automatic retry nahi, duplicate ping se bachne ke liye.")
         except (ValueError,TypeError) as exc:
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch arm nahi hua.')
