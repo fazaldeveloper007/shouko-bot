@@ -59,6 +59,18 @@ class Track:
         return cls(video_id, str(data.get('title') or video_id)[:180], int(duration), requester)
 
 
+def normalize_title(title):
+    # Compare songs, not upload variants: drop bracketed tags (lyrics/slowed/HD), case and spacing.
+    return re.sub(r'\s+', ' ', re.sub(r'\([^)]*\)|\[[^\]]*\]|\{[^}]*\}', ' ', str(title).lower())).strip()
+
+def same_song(a, b):
+    # True when normalized titles match, or one is the other plus an artist/version prefix or suffix.
+    a, b = normalize_title(a), normalize_title(b)
+    if not a or not b: return False
+    if a == b: return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 8 and shorter in longer
+
 def query_input(query):
     query = query.strip()
     if not query or len(query) > 300:
@@ -91,12 +103,12 @@ class Media:
         self.slots = asyncio.Semaphore(2)
         self.prepared = {}  # short-lived process-local capabilities; never log or persist
 
-    async def job(self, mode, value, destination=None, *, prepared=None, expected_id=None):
+    async def job(self, mode, value, destination=None, *, prepared=None, expected_id=None, related_title=None):
         allowed = ('PATH', 'HOME', 'TMPDIR', 'PREFIX', 'LD_LIBRARY_PATH', 'LD_PRELOAD',
                    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'LANG', 'LC_ALL')
         env = {k: os.environ[k] for k in allowed if k in os.environ}
         request = dict(mode=mode, value=value, destination=str(destination) if destination else None,
-                       max_seconds=self.max_seconds, max_bytes=self.max_bytes, prepared={k:v for k,v in prepared.items() if k!='_remaining'} if prepared else None, expected_id=expected_id,
+                       max_seconds=self.max_seconds, max_bytes=self.max_bytes, prepared={k:v for k,v in prepared.items() if k!='_remaining'} if prepared else None, expected_id=expected_id, related_title=related_title,
                        prepared_until=time.time()+max(0,prepared.get('_remaining',0)) if prepared else 0)
         async with self.slots:
             began = time.monotonic()
@@ -152,6 +164,22 @@ class Media:
             if len(self.prepared)>=16:self.prepared.pop(next(iter(self.prepared)))
             self.prepared[tracks[0].id]=(now+30,source)
         return tracks
+
+    async def related(self, seed, exclude_ids, exclude_titles):
+        # YouTube's own radio mix for the seed video; drop already-played ids and same-song title variants.
+        result = await self.job('related', seed.id, related_title=seed.title)
+        out = []
+        for item in result.get('items', []):
+            try:
+                track = Track.parse(item, seed.requester)
+            except MediaError:
+                continue
+            if track.id in exclude_ids: continue
+            if same_song(track.title, seed.title): continue
+            if any(same_song(track.title, t) for t in exclude_titles): continue
+            if track.duration > self.max_seconds: continue
+            out.append(track)
+        return out
 
     async def download(self, track, destination):
         cached=self.prepared.pop(track.id,None)
