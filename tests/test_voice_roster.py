@@ -55,3 +55,25 @@ class VoiceRoster(unittest.TestCase):
             self.assertTrue(v.is_query(text),text)
         for text in ('Kristy Mayank ko VC join karne bolo','Kristy ek joke sunao','Kristy VC mein log bulao'):
             self.assertFalse(v.is_query(text),text)
+
+class ClarificationTests(unittest.TestCase):
+    def setUp(self):
+        self.c=v.Clarifications()
+        self.m=S(guild=S(id=1),channel=S(id=2),author=S(id=3),content='<#20>',reference=S(message_id=10))
+        self.c.remember(self.m,S(id=10))
+    def test_exact_reply_or_same_channel_pending(self):
+        self.assertTrue(self.c.matches(self.m));self.m.reference=None;self.assertTrue(self.c.matches(self.m))
+    def test_other_user_channel_guild_reply_rejected(self):
+        for obj in (self.m.author,self.m.channel,self.m.guild):
+            old=obj.id;obj.id=999;self.assertFalse(self.c.matches(self.m));obj.id=old
+        self.m.reference.message_id=99;self.assertFalse(self.c.matches(self.m))
+    def test_expired_consumed_and_unrelated(self):
+        self.c.items[self.c.key(self.m)]=(0,10);self.assertFalse(self.c.matches(self.m))
+        self.c.remember(self.m,S(id=10));self.m.content='say <#20>';self.assertFalse(self.c.matches(self.m))
+        self.m.content='<#20>';self.c.forget(self.m);self.assertFalse(self.c.matches(self.m))
+    def test_bare_mention_without_pending_is_not_question(self):
+        self.assertFalse(v.is_query('<#20>'));self.c.forget(self.m);self.assertFalse(self.c.matches(self.m))
+    def test_multiple_selection_routes_to_snapshot_rejection(self):
+        self.m.content='<#20> <#21>';self.assertTrue(self.c.matches(self.m))
+    def test_capacity(self):
+        self.c.capacity=1;self.m.author.id=4;self.c.remember(self.m,S(id=11));self.assertEqual(len(self.c.items),1)
