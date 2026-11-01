@@ -20,6 +20,7 @@ FAILURES = {
     'DURATION_LIMIT': 'This video exceeds the allowed duration.',
     'EXTRACT_FAILED': 'Audio extraction failed. This item was not played.',
     'HTTP_FAILED': 'The audio download request failed. This item was not played.',
+    'NETWORK_FAILED': 'The audio connection failed. This item was not played.',
     'NETWORK_TIMEOUT': 'The audio request timed out. This item was not played.',
     'BAD_AUDIO': 'The source did not return supported WebM/Opus audio.',
     'SIZE_LIMIT': 'This audio exceeds the download size limit.',
