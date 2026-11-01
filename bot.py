@@ -137,7 +137,18 @@ def describe_stickers(message):
 intents = discord.Intents.default()
 intents.message_content = True  # also switch this ON in the Discord developer portal!
 intents.members = True          # for new-member welcomes: enable "Server Members Intent" in the portal too
-client = discord.Client(intents=intents)
+class KristyClient(discord.Client):
+    async def close(self):
+        if getattr(self, 'music', None):
+            await self.music.close()
+        await super().close()
+
+client = KristyClient(intents=intents)
+# Disabled by default until separately approved deployment/setup.
+client.music = None
+if os.getenv('MUSIC_ENABLED') == '1':
+    from music.integration import Music
+    client.music = Music(client)
 
 # One shared HTTP session for AI API calls
 _groq_session = None
@@ -1164,6 +1175,18 @@ async def on_ready():
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
     announcements.start(client)
+    if client.music:
+        await client.music.ready()
+
+@client.event
+async def on_voice_state_update(member, before, after):
+    if client.music:
+        await client.music.voice_changed(member, before, after)
+
+@client.event
+async def on_disconnect():
+    if client.music:
+        await client.music.gateway_disconnected()
 
 def is_bot_owner(author):
     """Check the configured owner ID, or use the documented name fallback."""
@@ -1222,6 +1245,7 @@ async def on_message(message):
     if not should_respond(message):
         return
 
+    music_context = client.music.context(message.channel) if client.music else ""
     user_id = message.author.id
     speaker = message.author.display_name
 
@@ -1298,6 +1322,9 @@ async def on_message(message):
             # when a gif rides along, the brain is TOLD about it, so she can
             # never contradict the gif she just sent
             extra = gif_note(gif_desc) if gif_url else ""
+            if client.music:
+                if music_context:
+                    extra = (extra + "\n" + music_context).strip()
 
             async with message.channel.typing():
                 image_parts = []
@@ -1398,8 +1425,12 @@ async def on_message(message):
     # learn from this exchange in the background, after the reply is already out
     if content and reply not in FALLBACK_LINES and reply != EMPTY_REPLY_FALLBACK:
         buf = _pending.setdefault(user_id, [])
-        buf.append((speaker, content[:300]))
-        buf.append((BOT_NAME, reply[:300]))
+        if music_context:
+            from music.memory import durable_exchange
+            buf.extend(durable_exchange(speaker, content, BOT_NAME, reply, music_context))
+        else:
+            buf.append((speaker, content[:300]))
+            buf.append((BOT_NAME, reply[:300]))
         del buf[:-12]  # keep at most the last 6 exchanges
         maybe_schedule_extraction(user_id, speaker, content, message.channel)
 
