@@ -289,6 +289,21 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
                 await self.bot.think(555000)
         self.assertEqual(len(session.calls),1);groq.assert_not_awaited()
 
+    async def test_schedule_preview_through_addressed_message_no_ai_or_send(self):
+        import datetime
+        from timed_messages import Store
+        store=Store(pathlib.Path(self._tmp.name)/'scheduled.json')
+        m=self.msg('Kristy schedule 10 minute baad | here | Mayank | Match shuru karo')
+        m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        m.created_at=datetime.datetime.now(datetime.timezone.utc)
+        m.channel=self.dest();m.channel.name="gaming";self.guild.unavailable=False;self.guild.get_channel=lambda cid:m.channel
+        self.bot.client.music=None
+        with patch.object(self.bot._schedule_commands,'store',store), patch.object(self.bot.client,'get_guild',return_value=self.guild), patch.object(self.bot.client,'is_ready',return_value=True), patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
+            await self.bot.on_message(m)
+        brain.assert_not_awaited();m.channel.send.assert_not_awaited()
+        self.assertEqual(store.load()[0]['status'],'preview');self.assertEqual(store.load()[0]['targets'],[2])
+        self.assertFalse(m.reply.call_args.kwargs['allowed_mentions'].everyone)
+
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
             m=self.msg(text)
