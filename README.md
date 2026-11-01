@@ -296,3 +296,11 @@ partial or falsely empty list. Discord has no separate REST roster refresh here:
 this is the gateway snapshot at handling time, not a guarantee nobody joins or
 leaves just after it. Webhooks, bots, code, quotes and forwarded snapshots do not
 trigger roster lookup. Music, summons and diary controls are unchanged.
+
+If Kristy asks which VC, you can answer with only its native #mention in the
+same text channel within two minutes, or reply directly to that clarification
+with the mention. This pending question belongs only to that requester/server/
+text channel. A reply to some other message does not select a VC for it; quoted,
+forwarded or prose-only answers are not interpreted as roster selections. The
+selection is consumed on lookup and the normal current access/readiness checks
+run again. After expiry, ask the full question with the VC mention again.
