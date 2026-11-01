@@ -41,6 +41,7 @@ from persona import SYSTEM_PROMPT
 from gifs import GIFS, CHARACTER_GIFS
 import diary
 import aliases
+import retrying
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -147,6 +148,11 @@ intents.message_content = True  # also switch this ON in the Discord developer p
 intents.members = True          # for new-member welcomes: enable "Server Members Intent" in the portal too
 class KristyClient(discord.Client):
     async def close(self):
+        tasks = list(globals().get("_bg_tasks", ()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if getattr(self, 'music', None):
             await self.music.close()
         await super().close()
@@ -1216,35 +1222,10 @@ def with_diary(prompt, diary_block):
     return f"{prompt}\n\n{diary_block}" if diary_block else prompt
 
 async def gemini_generate(payload, url=GEMINI_URL):
-    """One generateContent call, returning the decoded response.
-
-    Different models accept different generationConfig knobs (the Gemini 3
-    models disagree on which thinkingLevel values are valid, and a lite model
-    may reject responseMimeType). If the model rejects an optional field
-    (HTTP 400 naming it), drop that field and retry, so a GEMINI_MODEL switch
-    never silently breaks her. Anything else raises.
-    """
     session = await groq_session()
-    timeout = aiohttp.ClientTimeout(total=30)
-    headers = {"x-goog-api-key": GEMINI_API_KEY}
-    generation = payload.get("generationConfig")
-    for _attempt in range(3):
-        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status == 200:
-                return data
-            if resp.status == 400 and generation:
-                err = str(data).lower().replace("_", "")
-                for field in ("thinkingConfig", "responseMimeType"):
-                    if field in generation and field.lower() in err:
-                        log.warning("Model rejected generationConfig.%s; retrying without it", field)
-                        generation.pop(field)
-                        break
-                else:
-                    raise RuntimeError(f"Gemini API {resp.status}: {data}")
-                continue
-            raise RuntimeError(f"Gemini API {resp.status}: {data}")
-    raise RuntimeError("Gemini API: model rejected all optional config fields")
+    return await retrying.post_json(session, url, label="Gemini",
+        headers={"x-goog-api-key": GEMINI_API_KEY}, payload=payload)
+
 
 async def call_extractor(prompt):
     """One small, low-temperature AI call that returns raw text (JSON expected)."""
@@ -1265,12 +1246,9 @@ async def call_extractor(prompt):
         "max_tokens": 600,
         "temperature": 0.2,
     }
-    async with session.post(GROQ_CHAT_URL, json=payload,
-                            headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=timeout) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(f"Groq API {resp.status}: {data}")
-        return data["choices"][0]["message"]["content"] or ""
+    data = await retrying.post_json(session, GROQ_CHAT_URL, label="Groq(extractor)",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, payload=payload)
+    return data["choices"][0]["message"]["content"] or ""
 
 def _requeue_exchanges(user_id, exchanges):
     """Put failed-extraction exchanges back on the pending buffer so a later
@@ -1291,7 +1269,7 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
     """
     global _extract_busy
     confirming = user_id in _save_pending
-    attempts = 2 if confirming else 1
+    attempts = 1  # network retries share one independent three-call budget
     ok = False
     try:
         for attempt in range(attempts):
@@ -1299,7 +1277,8 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
                 await asyncio.sleep(SAVE_RETRY_DELAY)
             try:
                 mem = diary.load(user_id)
-                raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
+                async with retrying.request_scope():
+                    raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
                 name, facts, parsed = diary.parse_extraction(raw)
                 if not parsed:
                     raise ValueError(f"extractor returned unusable output: {raw[:160]!r}")
@@ -1316,7 +1295,7 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
                 break
             except Exception as e:
                 log.warning("Diary extraction attempt %d/%d failed for %s: %s",
-                            attempt + 1, attempts, user_id, e)
+                            attempt + 1, attempts, user_id, type(e).__name__)
         if ok:
             if confirming:
                 _save_pending.discard(user_id)
@@ -1389,14 +1368,8 @@ async def think_groq(channel_id, diary_block="", extra_system=""):
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=30)
-    async with session.post(GROQ_CHAT_URL, json=payload, headers=headers, timeout=timeout) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(f"Groq API {resp.status}: {data}")
-        reply_text = (data["choices"][0]["message"]["content"] or "").strip()
-        if not reply_text:
-            log.warning("Groq returned an empty completion (HTTP %s): %s", resp.status, data)
-        return reply_text
+    data = await retrying.post_json(session, GROQ_CHAT_URL, label="Groq", headers=headers, payload=payload)
+    return (data["choices"][0]["message"]["content"] or "").strip()
 
 async def think_gemini(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Main brain: ask Gemini (generateContent REST) for Kristy's next line."""
@@ -1440,11 +1413,12 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
     if not reply_text:
         # blocked prompt (promptFeedback), safety finishReason, empty parts, etc.
         log.warning(
-            "Gemini returned no text (finishReason=%s): %s",
-            (candidate or {}).get("finishReason"), data,
+            "Gemini returned no text (finishReason=%s)",
+            (candidate or {}).get("finishReason"),
         )
     return reply_text
 
+@retrying.operation
 async def fetch_search_results(query):
     """Ask the web about a query and return a compact digest for the brain.
 
@@ -1464,10 +1438,7 @@ async def fetch_search_results(query):
         headers["X-Tavily-Access-Mode"] = "keyless"
     session = await groq_session()
     timeout = aiohttp.ClientTimeout(total=20)
-    async with session.post(TAVILY_SEARCH_URL, json=payload, headers=headers, timeout=timeout) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(f"Tavily API {resp.status}: {data}")
+    data = await retrying.post_json(session, TAVILY_SEARCH_URL, label="Tavily", headers=headers, payload=payload)
     answer = (data.get("answer") or "").strip()
     lines = []
     if answer:
@@ -1551,6 +1522,7 @@ async def maybe_model_search(channel_id, reply, diary_block, extra="", image_par
         return "abhi search nahi ho paya, isliye main guess nahi karungi 🥺 thodi der baad phir pooch na."
     return "i couldn't search just now, so i don't want to guess. try again in a bit?"
 
+@retrying.operation
 async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     """Gemini is the main brain; Groq is the fallback.
 
@@ -1566,7 +1538,7 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
         except Exception as e:
             if not GROQ_API_KEY:
                 raise
-            log.warning("Gemini brain failed, falling back to Groq: %s", e)
+            log.warning("Gemini brain failed, falling back to Groq: %s", type(e).__name__)
     return await think_groq(channel_id, diary_block, extra_system)
 
 @client.event
@@ -1738,7 +1710,7 @@ async def on_message(message):
                 if music_context:
                     extra = (extra + "\n" + music_context).strip()
 
-            async with message.channel.typing():
+            async with retrying.request_scope(), message.channel.typing():
                 image_parts = []
                 if GEMINI_API_KEY and has_image:  # Groq fallback: silently text-only
                     try:
@@ -1780,7 +1752,7 @@ async def on_message(message):
                                 mark_search_used()  # only successful searches spend the cap
                             except Exception as e:
                                 search_error = "web search failed"
-                                log.warning("Web search failed: %s", e)
+                                log.warning("Web search failed: %s", type(e).__name__)
                         if search_error:
                             # Never silently fall back to an answer that could be
                             # mistaken for researched current information.
@@ -1795,7 +1767,7 @@ async def on_message(message):
                         reply = await think(message.channel.id, diary_block, image_parts, extra)
                         reply = await maybe_model_search(message.channel.id, reply, diary_block, extra, image_parts)
                 except Exception as e:
-                    log.warning("AI brain error: %s", e)
+                    log.warning("AI brain error: %s", type(e).__name__)
                     reply = random.choice(FALLBACK_LINES)
                 reply = MODEL_SEARCH_RE.sub("", reply or "").strip()
                 reaction, reply = extract_reaction(reply)
