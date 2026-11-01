@@ -42,6 +42,7 @@ from gifs import GIFS, CHARACTER_GIFS
 import diary
 import aliases
 import retrying
+import self_diary
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -50,6 +51,10 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+# Resolve self-diary storage after .env has loaded, without changing credentials.
+self_diary.PATH = self_diary.Path(os.getenv("SELF_DIARY_FILE") or
+    (self_diary.Path(os.getenv("MEMORY_DIR") or self_diary.Path(__file__).resolve().parent / "memory") / "kristy-lessons.json"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("kristy")
@@ -1207,6 +1212,60 @@ async def handle_summon(message, content):
     await _summon_reply(message, f"bhej diya {dest.mention} mein ✅")
 
 
+async def handle_self_diary(message, content):
+    # Direct human messages only. Feedback can contain negation, unlike
+    # action_text's summon grammar, but quoted/forwarded content is excluded.
+    if (not getattr(message, 'guild', None) or getattr(message.author, 'bot', False) or getattr(message, 'webhook_id', None)
+            or getattr(message, 'message_snapshots', None)
+            or re.search(r'[`"“”]|(?:^|\n)\s*>|https?://', content)):
+        return False
+    text = _addressed_text(content).strip().rstrip('.!')
+    command = re.fullmatch(r'lesson\s+(suggest|approve|delete|list|reset)(?:\s+([\w-]+))?', text, re.I)
+    lesson = self_diary.correction_lesson(text) if command is None else None
+    if not command and not lesson:
+        return False
+    action, value = (command.group(1).lower(), command.group(2)) if command else ('suggest', lesson)
+    # No username/display-name fallback for policy activation or deletion.
+    owner = bool(OWNER_ID and str(message.author.id) == OWNER_ID)
+    if action != 'suggest' and not owner:
+        await _alias_reply(message, 'Ye lesson review sirf configured owner kar sakte hain. OWNER_ID set na ho toh pehle woh set karna hoga.')
+        return True
+    try:
+        if action == 'suggest':
+            if value not in self_diary.LESSONS:
+                await _alias_reply(message, 'Lesson IDs: ' + ', '.join(self_diary.LESSONS))
+                return True
+            status, entry_id = self_diary.suggest(message.guild.id, value, message.author.id,
+                                                 message.channel.id, message.id)
+            if status == 'full':
+                reply = 'Self-diary ki 100 entries bhar gayi hain. Owner pehle purana lesson delete karein; kuch khud se nahi hataungi.'
+            elif status == 'active':
+                reply = f'Lesson {entry_id} is server mein pehle se approved hai.'
+            else:
+                reply = f'Lesson {entry_id}: {self_diary.LESSONS[value][0]}. Review ke liye pending hai; owner ka OK milne par hi apply hoga. Owner: Kristy lesson approve {entry_id}'
+        elif action == 'list' and value is None:
+            entries = [e for e in self_diary.load()['entries'] if e['guild'] == message.guild.id]
+            lines = [f"{e['id']} | {e['status']} | {e['lesson']} | by {e['by']} | channel {e['channel']} | message {e['message']} | time {e['at']} | approver {e.get('approved_by', '-')}" for e in entries]
+            # Discord-safe chunks, no mention syntax and no other guild's rows.
+            reply = '\n'.join(lines) or 'Is server ki self-diary abhi khaali hai.'
+            for chunk in chunk_reply(reply):
+                await message.reply(chunk, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return True
+        elif action in ('approve', 'delete') and value and value.isdigit():
+            ok = self_diary.change(message.guild.id, int(value), action, message.author.id)
+            reply = ('Lesson approve ho gaya; isi server ke agle replies se apply hoga.' if action == 'approve' else 'Lesson delete ho gaya.') if ok else 'Ye lesson ID is server mein nahi mili.'
+        elif action == 'reset' and value == 'confirm':
+            self_diary.reset(message.guild.id)
+            reply = 'Is server ki self-diary reset ho gayi. Members ki diaries nahi badli.'
+        else:
+            reply = 'Use: lesson suggest ID / lesson list / lesson approve NUMBER / lesson delete NUMBER / lesson reset confirm'
+        await _alias_reply(message, reply)
+    except (OSError, ValueError, TypeError):
+        log.warning('Self diary persistence failed')
+        await _alias_reply(message, 'Self-diary save/read nahi hua. Koi success confirm nahi karungi; baad mein try karna.')
+    return True
+
+
 def should_respond(message):
     """Reply when @mentioned, replied to, or name-dropped."""
     if client.user in message.mentions:
@@ -1632,6 +1691,9 @@ async def on_message(message):
         content = EMPTY_MESSAGE_PROMPT
         history[message.channel.id].append((speaker, user_id, content))
 
+    if await handle_self_diary(message, content):
+        return
+
     # "forget me": delete this member's diary file, no AI call needed
     if diary.wants_forget(content):
         _forget_epoch[user_id] = _forget_epoch.get(user_id, 0) + 1
@@ -1665,6 +1727,7 @@ async def on_message(message):
     # load this member's diary (fail-open: any problem just means no diary block)
     try:
         diary_block = diary.prompt_block(diary.load(user_id), speaker)
+        diary_block += self_diary.prompt(message.guild.id)
     except Exception as e:
         log.warning("Diary load failed for %s: %s", user_id, e)
         diary_block = ""
