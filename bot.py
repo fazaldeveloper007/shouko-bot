@@ -1759,6 +1759,8 @@ async def on_message(message):
         return
     if await _schedule_commands.handle(message, _addressed_text(content), client, action_text):
         return
+    if client.music and await client.music.natural(message, _addressed_text(content)):
+        return
 
     # Read actual current voice states in code; never ask the model to guess.
     if roster_followup or (action_text(message, content, question=True) is not None and voice_roster.is_query(content)):
