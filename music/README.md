@@ -8,7 +8,7 @@ One existing Python Discord client owns the main gateway. Each active guild has 
 
 Ordinary voice channels only. Music commands must be invoked from that VC's built-in text chat. Only members currently in that same VC may use controls; another VC cannot hijack an active guild player. No music output or music-state context goes to ordinary standalone text channels. When transient music context is injected into a reply, that bot reply is omitted from diary extraction, and current-playback clauses are filtered from the member text. Other personal facts/preferences from VC chat still use the existing diary pipeline. The music runtime context itself is never added to the diary input.
 
-Regular YouTube video/audio-only, not YouTube Music or Bloomee. No AI calls in music search/queue/playback/control. Normal conversational chat still uses the existing AI brain, with current-track context only in the connected VC chat. Natural-language chat cannot operate the player.
+Regular YouTube video/audio-only, not YouTube Music or Bloomee. No AI calls in music search/queue/playback/control. Normal conversational chat still uses the existing AI brain, with current-track context only in the connected VC chat. Only one natural-language bridge exists: "Kristy <title> bajao/play/laga do" in the VC text chat runs the same code path as /play (first result; queue if busy). No AI decides or controls anything.
 
 ## Commands and buttons
 
