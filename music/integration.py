@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 from .player import Manager, MusicError
 from .media import MediaError
+from . import natural
 from .ui import answer, callback_error, queue_embed, player_panel, Results, clean
 
 log = logging.getLogger('kristy.music')
@@ -17,6 +18,7 @@ class Music:
         self.manager.panel_builder = lambda p, status: player_panel(self.manager, p, status)
         self.tree = app_commands.CommandTree(client)
         self.synced = False
+        self.busy = set()
         self.register()
 
     def register(self):
@@ -89,6 +91,42 @@ class Music:
             if action != 'queue': await answer(interaction, 'Done.', ephemeral=True)
         except Exception as exc:
             await callback_error(interaction, exc)
+
+    async def natural(self, message, text):
+        """'Kristy <title> bajao' in a VC's own text chat: same path and
+        checks as /play (first search result; queue behind a playing track,
+        start when idle). Returns True when the message was handled."""
+        if (not text or getattr(message.channel, 'type', None) != discord.ChannelType.voice
+                or getattr(message.author, 'bot', False) or getattr(message, 'webhook_id', None)
+                or getattr(message, 'message_snapshots', None)):
+            return False
+        query = natural.parse(text)
+        if query is None:
+            return False
+        key = (message.guild.id, message.author.id)
+        if key in self.busy: return True
+        self.busy.add(key)
+        try:
+            if not query:
+                await message.reply('Kaunsa gaana? Naam bhi bolo.', mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                return True
+            self.manager.caller_channel(message.author, message.channel)
+            tracks = await self.manager.media.search(query, message.author.id)
+            p = await self.manager.get(message.author, message.channel, join=True)
+            self.manager.caller_channel(message.author, message.channel)
+            waiting = bool(p.current is not None or p.queue)
+            await p.add(tracks[0])
+            await message.reply(('Queue mein: ' if waiting else 'Laga rahi hoon: ') + clean(tracks[0].title), mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            if not p.closed and p.channel.id == message.channel.id:
+                await self.manager.panel(p)
+        except Exception as exc:
+            from .ui import ERROR_TEXT
+            reply = str(exc) if isinstance(exc, (MusicError, MediaError)) else ERROR_TEXT
+            try: await message.reply(reply, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            except Exception: pass
+        finally:
+            self.busy.discard(key)
+        return True
 
     async def _repost(self, interaction):
         # After a public command reply, re-post the player card so it stays at the chat bottom.
