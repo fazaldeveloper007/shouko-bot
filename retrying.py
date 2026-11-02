@@ -152,8 +152,14 @@ async def post_json(session, url, *, label, headers, payload, timeout=20, valida
                         raise RequestError(label, status, reason='retry_after')
                 elif status != 200 and status not in (408, 500, 502, 503, 504):
                     raise RequestError(label, status, reason='permanent_http')
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            log.warning('%s failed attempt=%d/3 status=%s reason=transport', label, budget.used, status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Error class separates DNS/connect/TLS/timeout failures in logs.
+            # Keys travel in headers, which aiohttp exceptions never include.
+            detail = type(exc).__name__
+            cause = getattr(exc, 'os_error', None)
+            if cause is not None:
+                detail += f'({getattr(cause, "errno", None) or type(cause).__name__})'
+            log.warning('%s failed attempt=%d/3 status=%s reason=transport error=%s', label, budget.used, status, detail)
         if budget.used >= 3 or wait >= budget.seconds():
             break
         log.warning('%s transient failure; attempt %d/3', label, budget.used)
