@@ -1,4 +1,4 @@
-"""One-shot, preview-confirmed messages. Single process only; no send retries."""
+"""One-shot timed messages, saved on request (no confirm step). Single process only; no send retries."""
 import asyncio
 import datetime as dt
 import json
@@ -80,12 +80,13 @@ class Store:
     def expire(self,data,now):
         for e in data:
             if e['status']=='preview' and now>e['expires']:e.update(status='cancelled',reason='preview_expired')
-    def create(self, *, guild,author,source,dest,targets,body,due,now):
+    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None):
         data=self.load();self.expire(data,now)
         active=[e for e in data if e['status'] in ACTIVE]
         if len(active)>=1000 or sum(e['guild']==guild for e in active)>=50 or sum(e['author']==author and e['guild']==guild for e in active)>=10:
             raise ValueError('Schedule limit: 10/member, 50/server, 1000 total active previews/jobs.')
-        e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='preview',reason='awaiting_confirmation')
+        e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='scheduled' if armed else 'preview',reason='confirmed' if armed else 'awaiting_confirmation')
+        if core:e['core']=core
         data.append(e);self.save(data);return e
     def control(self,ident,guild,author,action,now,owner=False):
         data=self.load();self.expire(data,now)
@@ -115,9 +116,19 @@ def access(client,e):
     return dest,targets
 
 
+def clean_wording(text):
+    """AI-written reminder wording is untrusted: one short plain line, no
+    mentions, links, or command markers. None means use the saved fallback."""
+    if not isinstance(text,str):return None
+    text=' '.join(text.split()).strip('"\' ')
+    if not 3<=len(text)<=300 or re.search(r'[@<>]|https?://|\[\[|www\.',text):return None
+    return text
+
+
 class Worker:
-    def __init__(self,client,store,late_seconds=120,connected=lambda:True):
+    def __init__(self,client,store,late_seconds=120,connected=lambda:True,rewrite=None,rewrite_timeout=8):
         self.client,self.store,self.late=client,store,late_seconds
+        self.rewrite,self.rewrite_timeout=rewrite,rewrite_timeout
         self.task=None;self.halted=False;self.connected=connected
     def start(self):
         if not self.halted and (self.task is None or self.task.done()):self.task=asyncio.create_task(self.run())
@@ -159,6 +170,29 @@ class Worker:
             try:dest,targets=access(self.client,e)
             except ValueError:
                 e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
+            # AI wording is optional polish with an 8s cap. Any failure keeps
+            # the saved text, so delivery never depends on the API. After the
+            # wait, state is reread and deadline, cancel and access are all
+            # checked again; nothing is marked sent before Discord answers.
+            text=None
+            if self.rewrite and e.get('core'):
+                try:text=clean_wording(await asyncio.wait_for(self.rewrite(e['core']),self.rewrite_timeout))
+                except asyncio.CancelledError:raise
+                except Exception:text=None
+                clock=time.time() if now is None else now
+                data=self.store.load()
+                cur=next((x for x in data if x['id']==e['id']),None)
+                if cur is None or cur['status']!='scheduled':continue
+                e=cur
+                if clock-e['due']>self.late:
+                    e.update(status='missed',reason='late_over_2min');self.store.save(data);continue
+                if not self.connected() or not self.client.is_ready():return
+                try:dest,targets=access(self.client,e)
+                except ValueError:
+                    e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
+                if text:
+                    prefix=' '.join(f'<@{t}>' for t in e['targets'])
+                    e['body']=(prefix+'\n' if prefix else '')+text
             e.update(status='dispatching',reason='send_started');self.store.save(data)
             try:
                 sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=targets,roles=False,everyone=False,replied_user=False))
