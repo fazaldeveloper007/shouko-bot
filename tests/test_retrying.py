@@ -1,3 +1,4 @@
+import aiohttp
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -140,3 +141,21 @@ class OutputValidationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs('kristy.retry',level='INFO') as logs:
             await self.run_script([Response(200,{'secret':'TOKEN_MARKER'}),Response(200,self.gemini())])
         text=' '.join(logs.output);self.assertIn('attempt=2/3',text);self.assertIn('malformed_output',text);self.assertNotIn('TOKEN_MARKER',text)
+
+class TransportDiagnostics(unittest.IsolatedAsyncioTestCase):
+    async def call(self,s,**kw):
+        async with retrying.request_scope():
+            return await retrying.post_json(s,'https://example.invalid',label='Gemini',headers={},payload={},**kw)
+    async def test_timeout_logs_error_class(self):
+        s=Session([asyncio.TimeoutError(),Response(200,{'ok':1})])
+        with patch('retrying.asyncio.sleep',new=AsyncMock()):
+            with self.assertLogs('kristy.retry',level='INFO') as logs:
+                await self.call(s)
+        self.assertTrue(any('reason=transport error=TimeoutError' in line for line in logs.output))
+    async def test_connector_error_logs_class_and_errno(self):
+        err=aiohttp.ClientConnectorError(connection_key=None,os_error=OSError(111,'refused'))
+        s=Session([err,Response(200,{'ok':1})])
+        with patch('retrying.asyncio.sleep',new=AsyncMock()):
+            with self.assertLogs('kristy.retry',level='INFO') as logs:
+                await self.call(s)
+        self.assertTrue(any('reason=transport error=ClientConnectorError(111)' in line for line in logs.output))
