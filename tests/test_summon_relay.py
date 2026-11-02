@@ -301,7 +301,7 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bot._schedule_commands,'store',store), patch.object(self.bot.client,'get_guild',return_value=self.guild), patch.object(self.bot.client,'is_ready',return_value=True), patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
             await self.bot.on_message(m)
         brain.assert_not_awaited();m.channel.send.assert_not_awaited()
-        self.assertEqual(store.load()[0]['status'],'preview');self.assertEqual(store.load()[0]['targets'],[2])
+        self.assertEqual(store.load()[0]['status'],'scheduled');self.assertEqual(store.load()[0]['targets'],[2])
         self.assertFalse(m.reply.call_args.kwargs['allowed_mentions'].everyone)
 
     async def test_natural_reminder_and_samechannel_never_fallthrough_brain(self):
@@ -312,7 +312,7 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
             await self.bot.on_message(m)
             follow=self.msg('haan isi channel mein dena');follow.attachments=[];follow.stickers=[];follow.embeds=[];follow.reference=types.SimpleNamespace(message_id=444,resolved=None)
             await self.bot.on_message(follow)
-        brain.assert_not_awaited();self.assertIn('active nahi',follow.reply.call_args.args[0])
+        brain.assert_not_awaited();self.assertIn('Kab aur kya',follow.reply.call_args.args[0])
 
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
