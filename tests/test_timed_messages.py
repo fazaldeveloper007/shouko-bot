@@ -103,9 +103,8 @@ class Schedules(unittest.IsolatedAsyncioTestCase):
         msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock())
         guard=lambda *a,**kw:'ok'
         await commands.handle(msg,'schedule 10 minute baad | here | Mayank | hello, exact words',self.client,guard)
-        e=self.store.load()[0];self.assertEqual(e['status'],'preview');self.assertEqual(e['body'],'<@2>\nhello, exact words')
-        await commands.handle(msg,'schedule confirm '+e['id'],self.client,guard)
-        self.assertEqual(self.store.load()[0]['status'],'scheduled');self.dest.send.assert_not_awaited()
+        e=self.store.load()[0];self.assertEqual(e['status'],'scheduled');self.assertEqual(e['body'],'<@2>\nhello, exact words')
+        self.assertEqual(msg.reply.call_args.args[0],'OK');self.dest.send.assert_not_awaited()
     async def test_payload_mentions_rejected(self):
         commands=sc.Commands(self.store,lambda g,n:(self.target,False))
         msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock())
@@ -157,7 +156,7 @@ class RepairTests(Schedules):
         msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
         for text in ('reminder laga do 9:20 PM ka','10 min baad Mayank ko isi channel mein bula dena','9:20 PM pe message bhejna'):
             self.assertTrue(await commands.handle(msg,text,self.client,lambda *a,**kw:'ok'))
-            self.assertIn('active nahi',msg.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+            self.assertIn('Kab aur kya',msg.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
         self.assertTrue(commands.followup(msg,'haan isi channel mein dena'))
         self.assertTrue(await commands.handle(msg,'haan isi channel mein dena',self.client,lambda *a,**kw:'ok'))
         self.assertEqual(self.store.load(),[])
@@ -171,12 +170,12 @@ class RepairTests(Schedules):
         msg.reference=S(message_id=999);self.assertFalse(commands.followup(msg,'okay'))
         msg.reference=S(message_id=700);self.assertTrue(commands.followup(msg,'okay'))
         commands.pending[commands.key(msg)]=(0,700);self.assertFalse(commands.followup(msg,'okay'))
-    async def test_bounded_natural_self_reminder_creates_preview_only(self):
+    async def test_bounded_natural_self_reminder_saved_directly(self):
         commands=sc.Commands(self.store,lambda *a:(self.target,False))
         msg=S(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(),reference=None)
         await commands.handle(msg,'reminder 10 min baad: Paani pi lena',self.client,lambda *a,**kw:'ok')
-        self.assertEqual(self.store.load()[0]['status'],'preview');self.assertEqual(self.store.load()[0]['targets'],[1])
-        self.assertEqual(self.store.load()[0]['body'],'<@1>\nPaani pi lena')
+        self.assertEqual(self.store.load()[0]['status'],'scheduled');self.assertEqual(self.store.load()[0]['targets'],[1])
+        self.assertEqual(self.store.load()[0]['body'],'<@1>\nReminder: Paani pi lena')
     async def test_own_failed_status_without_body_destination_or_targets(self):
         e=self.arm();data=self.store.load();data[0].update(status='failed',reason='access_or_member_check_failed');self.store.save(data)
         del self.members[2]
@@ -209,17 +208,17 @@ class NaturalRepairTests(Schedules):
         message=self.msg()
         await self.commands().handle(message,'remind me here after 3 minute to play genshin',self.client,lambda *a,**kw:'ok')
         e=self.store.load()[0]
-        self.assertEqual(e['status'],'preview');self.assertEqual(e['targets'],[1])
+        self.assertEqual(e['status'],'scheduled');self.assertEqual(e['targets'],[1])
         self.assertEqual(e['dest'],20);self.assertEqual(e['source'],20)
-        self.assertEqual(e['body'],'<@1>\nplay genshin')
+        self.assertEqual(e['body'],'<@1>\nReminder: play genshin');self.assertEqual(e['core'],'play genshin')
         self.assertAlmostEqual(e['due'],message.created_at.timestamp()+180,delta=2)
-        self.assertIn('abhi armed nahi',message.reply.call_args.args[0])
+        self.assertEqual(message.reply.call_args.args[0],'OK')
     async def test_remind_me_explicit_channel_and_username_note(self):
         self.add_channel();message=self.msg()
         await self.commands().handle(message,'remind me after 5 minutes by tagging me (my username: fazal_techiudex07) <#21> pe ki mujhe Khaana Khane Jaana hoga',self.client,lambda *a,**kw:'ok')
         e=self.store.load()[0]
         self.assertEqual(e['dest'],21);self.assertEqual(e['targets'],[1])
-        self.assertEqual(e['body'],'<@1>\nmujhe Khaana Khane Jaana hoga')
+        self.assertEqual(e['body'],'<@1>\nReminder: mujhe Khaana Khane Jaana hoga')
     async def test_absent_channel_defaults_request_channel(self):
         message=self.msg()
         await self.commands().handle(message,'remind me after 10 minutes paani pi lena',self.client,lambda *a,**kw:'ok')
@@ -228,7 +227,7 @@ class NaturalRepairTests(Schedules):
         message=self.msg()
         await self.commands().handle(message,'OK Kristy remind me after 5 minutes to drink water',self.client,lambda *a,**kw:'ok')
         e=self.store.load()[0]
-        self.assertEqual(e['targets'],[1]);self.assertEqual(e['body'],'<@1>\ndrink water')
+        self.assertEqual(e['targets'],[1]);self.assertEqual(e['body'],'<@1>\nReminder: drink water')
     async def test_clock_times_convert_and_past_rejected(self):
         commands=self.commands();message=self.msg()
         self.assertEqual(commands.natural_parts('remind','me at 9:30 PM to sleep',message),['aaj 9:30 PM','here','sleep'])
@@ -239,23 +238,22 @@ class NaturalRepairTests(Schedules):
     async def test_missing_time_still_clarifies_no_job(self):
         message=self.msg()
         self.assertTrue(await self.commands().handle(message,'remind me to play genshin',self.client,lambda *a,**kw:'ok'))
-        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
-    async def test_natural_preview_confirm_fires_once(self):
+        self.assertIn('Kab aur kya',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+    async def test_natural_saved_fires_once(self):
         commands=self.commands();message=self.msg()
         await commands.handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
         e=self.store.load()[0]
-        await commands.handle(message,'schedule confirm '+e['id'],self.client,lambda *a,**kw:'ok')
         await self.worker.tick(e['due']);await self.worker.tick(e['due']+30)
         self.dest.send.assert_awaited_once()
-        self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nstretch')
+        self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nReminder: stretch')
     async def test_reversed_order_intent_clarifies_not_ai(self):
         message=self.msg()
         self.assertTrue(await self.commands().handle(message,'| here | fazallettee | unhe tag kardena 10 min baad ke khana khane Jana hai | <@2> |',self.client,lambda *a,**kw:'ok'))
-        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+        self.assertIn('Kab aur kya',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
     async def test_two_channel_mentions_clarify(self):
         self.add_channel();message=self.msg()
         await self.commands().handle(message,'remind me after 5 minutes <#20> <#21> kuch bhi',self.client,lambda *a,**kw:'ok')
-        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+        self.assertIn('Kab aur kya',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
     async def test_natural_body_markers_rejected(self):
         message=self.msg()
         await self.commands().handle(message,'remind me after 5 minutes @everyone uth ja',self.client,lambda *a,**kw:'ok')
@@ -266,3 +264,104 @@ class NaturalRepairTests(Schedules):
         e=self.store.load()[0]
         self.assertEqual(e['targets'],[2]);self.assertEqual(e['dest'],21)
         self.assertEqual(e['body'],'<@2>\nVC join kar lo, creator ne is time par bulaya hai.')
+
+
+class SimpleReminderTests(Schedules):
+    def commands(self,resolver=None):
+        return sc.Commands(self.store,resolver or (lambda g,n:(self.target,False)))
+    def msg(self,**kw):
+        d=dict(guild=self.guild,author=self.author,channel=self.dest,created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
+        d.update(kw);return S(**d)
+    async def test_remind_me_tagging_name_screenshot_case(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me tagging segment_35 after 10 minute to watch anime',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        self.assertEqual(e['targets'],[1,2]);self.assertEqual(e['body'],'<@1> <@2>\nReminder: watch anime')
+        self.assertNotIn('segment_35',e['body']);self.assertEqual(message.reply.call_args.args[0],'OK')
+    async def test_unknown_tag_name_saves_nothing(self):
+        message=self.msg()
+        await self.commands(lambda g,n:(None,True)).handle(message,'remind me tagging nobody after 10 minute to watch anime',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load(),[]);self.assertIn('nahi mila',message.reply.call_args.args[0])
+    async def test_reply_same_message_repeats_bot_payload_and_mentions(self):
+        ref=S(id=900,author=S(id=99,bot=True),channel=self.dest,content='<@2> arey suniye toh, update dijiye na.')
+        message=self.msg(reference=S(message_id=900,resolved=ref))
+        commands=self.commands();commands.bot_id=lambda:99
+        self.assertTrue(await commands.handle(message,'5 min Baad phirse same message dena',self.client,lambda *a,**kw:'ok'))
+        e=self.store.load()[0]
+        self.assertEqual(e['targets'],[2]);self.assertEqual(e['body'],'<@2>\narey suniye toh, update dijiye na.')
+        self.assertEqual(e['status'],'scheduled');self.assertEqual(e['dest'],20);self.assertNotIn('core',e)
+        self.assertEqual(message.reply.call_args.args[0],'OK')
+    async def test_repeat_refuses_other_members_message_and_broadcast(self):
+        commands=self.commands();commands.bot_id=lambda:99
+        for author,content in ((S(id=5,bot=False),'hello'),(S(id=99,bot=True),'@everyone hi'),(S(id=99,bot=True),'<#20> hi'),(S(id=99,bot=True),'<@404> hi')):
+            ref=S(id=900,author=author,channel=self.dest,content=content)
+            message=self.msg(reference=S(message_id=900,resolved=ref))
+            await commands.handle(message,'5 min baad same message dena',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load(),[])
+    async def test_ai_wording_used_and_failure_falls_back(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
+        due=self.store.load()[0]['due']
+        self.worker.rewrite=AsyncMock(return_value='  Stretch karne ka time ho gaya!  ')
+        await self.worker.tick(due)
+        self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nStretch karne ka time ho gaya!')
+        for bad in (AsyncMock(side_effect=RuntimeError()),AsyncMock(return_value='@everyone x'),AsyncMock(return_value='')):
+            self.store.path.unlink();message=self.msg()
+            await self.commands().handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
+            self.worker.rewrite=bad;self.dest.send.reset_mock();await self.worker.tick(self.store.load()[0]['due'])
+            self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nReminder: stretch')
+    async def test_ai_timeout_falls_back(self):
+        async def slow(core):await asyncio.sleep(5)
+        message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
+        self.worker.rewrite=slow;self.worker.rewrite_timeout=0.05
+        await self.worker.tick(self.store.load()[0]['due'])
+        self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nReminder: stretch')
+
+class SendTimeRecheckTests(SimpleReminderTests):
+    async def saved(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
+        return self.store.load()[0]
+    async def test_cancelled_during_wording_never_sends(self):
+        e=await self.saved()
+        async def cancel_then_text(core):
+            self.store.control(e['id'],10,1,'cancel',e['due']);return 'Stretch karo'
+        self.worker.rewrite=cancel_then_text;await self.worker.tick(e['due'])
+        self.dest.send.assert_not_awaited();self.assertEqual(self.store.load()[0]['status'],'cancelled')
+    async def test_deadline_rechecked_after_wording(self):
+        e=await self.saved();clock=[e['due']]
+        async def slow(core):clock[0]=e['due']+121;return 'Stretch karo'
+        self.worker.rewrite=slow
+        import timed_messages
+        with patch.object(timed_messages.time,'time',side_effect=lambda:clock[0]):
+            await self.worker.tick()
+        self.dest.send.assert_not_awaited();self.assertEqual(self.store.load()[0]['status'],'missed')
+    async def test_access_rechecked_after_wording(self):
+        e=await self.saved()
+        async def revoke(core):
+            self.dest.permissions_for=lambda m:S(view_channel=False,send_messages=True);return 'x y z'
+        self.worker.rewrite=revoke;await self.worker.tick(e['due'])
+        self.dest.send.assert_not_awaited();self.assertEqual(self.store.load()[0]['status'],'failed')
+    async def test_generation_cancelled_then_restart_sends_once_with_saved_text(self):
+        e=await self.saved()
+        async def boom(core):raise asyncio.CancelledError()
+        self.worker.rewrite=boom
+        with self.assertRaises(asyncio.CancelledError):await self.worker.tick(e['due'])
+        self.dest.send.assert_not_awaited();self.assertEqual(self.store.load()[0]['status'],'scheduled')
+        self.assertEqual(self.store.load()[0]['body'],'<@1>\nReminder: stretch')
+        self.worker.rewrite=None;await self.worker.tick(e['due']+5);await self.worker.tick(e['due']+6)
+        self.dest.send.assert_awaited_once();self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nReminder: stretch')
+        self.assertEqual(self.store.load()[0]['status'],'sent')
+    async def test_not_marked_sent_before_discord_answers(self):
+        e=await self.saved();seen=[]
+        async def send(*a,**k):seen.append(self.store.load()[0]['status']);return S(id=5)
+        self.dest.send.side_effect=send;await self.worker.tick(e['due'])
+        self.assertEqual(seen,['dispatching']);self.assertEqual(self.store.load()[0]['status'],'sent')
+    async def test_bare_remind_name_does_not_tag_anyone_and_me_is_explicit(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me tagging segment_35 after 10 minute to watch anime',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load()[0]['targets'],[1,2])
+        self.store.path.unlink()
+        await self.commands().handle(message,'remind after 10 minute to watch anime',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load()[0]['targets'],[1])
