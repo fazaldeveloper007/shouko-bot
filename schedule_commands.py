@@ -1,4 +1,4 @@
-"""Strict preview-confirmed timed messages; content after | is literal data."""
+"""Timed messages saved on a clear request (no confirm step); content after | is literal data."""
 import re
 import time
 
@@ -6,13 +6,11 @@ INTENT = re.compile(r"\b(remind(?:er)?|schedule|timer|yaad\s+dila(?:na|do|dena)?
 import discord
 import timed_messages as tm
 
-HELP = ('Schedule format:\nKristy schedule 10 minute baad | here | Mayank, Naiyo | Exact message\n'
-        'Kristy schedule kal 8 PM | #text-channel | @member | VC join kar lo\n'
-        'Kristy remind 10 minute baad | here | apna reminder\n'
-        'Kristy summon kal 8 PM | #text-channel | Mayank, Naiyo\n'
-        'Ya seedha aise bhi: Kristy remind me after 10 minutes to drink water\n'
-        'Kristy schedule confirm ID / schedule list / schedule cancel ID\n'
-        'Doosre channel mein bhejna ho tabhi native #text-channel mention chahiye; warna request wale channel mein jayega. Targets comma/aur se separate. Preview ke bina kuch arm nahi hoga.')
+HELP = ('Kristy remind me 10 min baad pani peene\n'
+        'Kristy remind me tagging Mayank 10 min baad to watch anime\n'
+        'Kristy schedule kal 8 PM | #text-channel | Mayank, Naiyo | message\n'
+        'Kisi message ko reply karke: 5 min baad same message dena\n'
+        'schedule list / schedule cancel ID')
 
 # Natural free-form time phrases, converted into the strict deterministic
 # grammar before parsing. Bare clock times resolve to today only; a passed
@@ -24,6 +22,9 @@ _NATURAL_TIME = [
     (re.compile(r'\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', re.I), lambda m: f'aaj {m[1]}:{m[2] or "00"} {m[3]}'),
     (re.compile(r'\b(\d{1,2}):(\d{2})\s*(am|pm)\b', re.I), lambda m: f'aaj {m[1]}:{m[2]} {m[3]}'),
 ]
+_TAG_NAME = re.compile(r'\b(?:tag(?:ging|ged)?|ping(?:ing|ed)?)\s+(?!(?:me|mujhe|mujhko|mujko|humhe|humko)\b)@?([\w.\-]+)', re.I)
+_NAME_LIST = re.compile(r'\s*(?:,|\band\b|\baur\b)\s*@?([\w.\-]+)', re.I)
+REPEAT = re.compile(r'\b(?:same|wahi|wohi)\b', re.I)
 _SELF_WORDS = {'me', 'mujhe', 'mujhko', 'mujko', 'humhe', 'humko'}
 _CONNECTORS = {'to', 'ki', 'ke', 'ko', 'ka', 'pe', 'par', 'per', 'that', 'mein', 'me', 'se', 'karke', 'please', 'plz', 'ok', 'okay', 'aur', 'ya'}
 _HERE_WORDS = re.compile(r'\b(?:here|yahan|yahi|isi\s+channel(?:\s+(?:mein|me|pe|par))?|is\s+channel(?:\s+(?:mein|me|pe|par))?)\b', re.I)
@@ -47,7 +48,7 @@ def _strip_lead(text):
 class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
-        self.pending={};self.health=lambda:'unknown'
+        self.pending={};self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
     def key(self,message):return message.guild.id,message.channel.id,message.author.id
     def followup(self,message,text):
         now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
@@ -57,9 +58,30 @@ class Commands:
     async def reply(self,message,text):
         return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
     async def clarify(self,message):
-        sent=await self.reply(message,'Abhi schedule save/active nahi hua. Exact time, destination, targets aur message chahiye. Neeche format se preview banao; sirf okay/same channel bolne se job arm nahi hota.\n'+HELP)
+        sent=await self.reply(message,'Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene')
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
         self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None))
+
+    def tag_names(self,text,guild):
+        """'tagging X' / 'tag X, Y' -> (<@id> strings, text without them).
+        An unresolvable name is an error, never left in the message body."""
+        found=[]
+        while True:
+            m=_TAG_NAME.search(text)
+            if not m:break
+            names=[m[1].strip('.,!')];end=m.end()
+            while True:
+                n=_NAME_LIST.match(text,end)
+                if not n:break
+                cand=n[1].strip('.,!')
+                if self.resolver(guild,cand)[0] is None:break
+                names.append(cand);end=n.end()
+            for name in names:
+                member=self.resolver(guild,name)[0]
+                if member is None or member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
+                found.append(f'<@{member.id}>')
+            text=text[:m.start()]+' '+text[end:]
+        return found,text
 
     def natural_parts(self,kind,rest,message):
         """Free-form remind/schedule/summon -> strict parts, or None when the
@@ -81,15 +103,20 @@ class Commands:
                 break
         if when is None:return None
         mentions=re.findall(r'<@!?(\d+)>',text)
-        if kind=='remind' and mentions:return None  # multi-target: use strict format
         text=re.sub(r'<@!?\d+>',' ',text)
+        tagged,text=self.tag_names(text,message.guild)
+        mentions+=[t[2:-1] for t in tagged]
         text=_TAG_WORDS.sub(' ',text)
         text=_HERE_WORDS.sub(' ',text)
         self_target=bool(re.search(r'\b(?:me|mujhe|mujhko|mujko|humhe|humko)\b',text,re.I))
         body=_strip_lead(text).strip(' .,!')
         if body and not any(t.strip('.,!').casefold() not in _COMMAND_FILLER for t in body.split()):body=''
-        if kind=='remind':
+        if kind=='remind' and not mentions:
             return [when,dest,body] if body else None
+        if kind=='remind':
+            # 'remind me tagging X': author (only if 'me') plus the tagged people.
+            if not body:return None
+            kind='schedule'
         targets=list(dict.fromkeys(mentions))
         if self_target and str(message.author.id) not in targets:targets.insert(0,str(message.author.id))
         if kind=='summon':
@@ -97,12 +124,70 @@ class Commands:
         if not body:return None
         return [when,dest,', '.join(f'<@{t}>' for t in targets) or 'none',body]
 
+    async def referenced(self,message):
+        ref=message.reference
+        target=getattr(ref,'resolved',None)
+        if target is None or not hasattr(target,'content'):
+            try:target=await message.channel.fetch_message(ref.message_id)
+            except Exception:return None
+        return target
+
+    async def repeat(self,message,text):
+        """'<time> baad same message dena' as a reply: re-send the replied-to
+        message (Kristy's own or the requester's own) in the same channel.
+        The quoted text is data only: its mentions become targets, nothing in
+        it is executed, and broadcast/channel/command markers are refused."""
+        time_part=None;rest=text
+        for pattern,convert in _NATURAL_TIME:
+            m=pattern.search(rest)
+            if m:time_part=convert(m) if convert else m[0].strip();break
+        if time_part is None:
+            await self.clarify(message);return True
+        try:
+            ref=await self.referenced(message)
+            if ref is None or getattr(getattr(ref,'channel',None),'id',None)!=message.channel.id:
+                await self.clarify(message);return True
+            bot_id=self.bot_id() if self.bot_id else None
+            if ref.author.id not in (bot_id,message.author.id):
+                raise ValueError('Sirf Kristy ka ya tumhara apna message repeat kar sakti hoon.')
+            guild=message.guild
+            ids=list(dict.fromkeys(int(i) for i in re.findall(r'<@!?(\d+)>',ref.content or '')))
+            body=re.sub(r'<@!?\d+>',' ',ref.content or '')
+            body=' '.join(body.split())
+            if not body:
+                await self.clarify(message);return True
+            if len(body)>1000 or re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
+                raise ValueError('Is message ko repeat nahi kar sakti (mention/command/lamba text).')
+            targets=[]
+            for i in ids:
+                member=guild.get_member(i)
+                if member is None or member.bot:raise ValueError('Message ka koi tagged member ab verify nahi hua.')
+                targets.append(member)
+            if len(targets)>5:raise ValueError('Maximum 5 targets.')
+            anchor=getattr(message,'created_at',None)
+            if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
+            now=time.time();due=tm.parse_time(time_part,anchor)
+            if due<=now:raise ValueError('Time nikal gaya; naya time do.')
+            full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
+            draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=message.channel.id,targets=[t.id for t in targets],body=full,due=due)
+            tm.access(self.client_for_access,draft)
+            self.store.create(**draft,now=now,armed=True)
+            await self.reply(message,'OK')
+        except (ValueError,TypeError) as exc:
+            await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
+        except OSError:
+            await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
+        return True
+
     async def handle(self,message,text,client,guard):
+        self.client_for_access=client
         # Guard command/header, not literal payload (quotes in a user-authored
         # message are data). No AI or quoted old messages can call this handler.
         header=text.split('|',1)[0]
         if guard(message,header,question=True) is None:return False
         m=re.match(r'^(?:(?:ok+|okay|hey|please|plz|bhai|toh|abhi|kristy)[\s,]+)*(schedule|remind(?:er)?|summon)\b\s*(.*)$',text,re.I|re.S)
+        if not m and getattr(message,'reference',None) is not None and REPEAT.search(text):
+            return await self.repeat(message,text)
         if not m:
             if INTENT.search(text) or self.followup(message,text):
                 await self.clarify(message);return True
@@ -147,6 +232,8 @@ class Commands:
                 if found is None:
                     await self.clarify(message);return True
                 parts=found
+            reminder=kind=='remind'
+            if reminder and len(parts)==4:kind='schedule'
             when,destination=parts[:2]
             anchor=getattr(message,'created_at',None)
             if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
@@ -171,12 +258,14 @@ class Commands:
             if not body or len(body)>1000:raise ValueError('Exact message 1-1000 characters ka do.')
             if re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
                 raise ValueError('Payload mein mention/command markers nahi; tags sirf target field se do.')
+            core=None
+            if reminder:core=body;body=f'Reminder: {body}'
             full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
-            draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due)
+            draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core)
             tm.access(client,draft)
-            entry=self.store.create(**draft,now=now)
+            self.store.create(**draft,now=now,armed=True)
             self.pending.pop(self.key(message),None)
-            await self.reply(message,f"Preview {entry['id']} (abhi armed nahi):\n{tm.shown(due)}\nDestination: {discord.utils.escape_markdown(dest.name)} (ID {dest.id})\nExact outgoing text:\n{full}\n\nIsi channel mein 2 minute ke andar: Kristy schedule confirm {entry['id']}\nBot chalni chahiye. 15-second check cadence; 2 minute se zyada late -> missed, no catch-up. 10 jobs/member, 50/server, max30days. Unknown send outcome par automatic retry nahi, duplicate ping se bachne ke liye.")
+            await self.reply(message,'OK')
         except (ValueError,TypeError) as exc:
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch arm nahi hua.')
         except OSError:
