@@ -321,7 +321,8 @@ answer/fallback is sent; screenshot timestamps alone cannot count attempts.
 
 ## Preview-confirmed reminders and timed messages
 
-One-shot only, for every human member. Examples (the `|` separators are required):
+One-shot only, for every human member. Examples (the `|` separators are
+required in this strict form; natural one-line requests below also work):
 
 ```text
 Kristy schedule 10 minute baad | here | Mayank, Naiyo | Match shuru karte hain
@@ -414,8 +415,25 @@ Only the creator's exact `schedule confirm ID` arms the unchanged preview.
 A bounded short form also works:
 `Kristy reminder 10 min baad: Paani pi lena`
 This creates a current-channel self-reminder **preview**, not an armed job.
-Unclear clock dates/times, missing message text, targets or destination still
-need the explicit format. This is not unrestricted natural-language extraction.
+
+Natural one-line requests also create previews, for example
+`Kristy remind me after 5 minutes to play genshin`,
+`Kristy remind me kal 8 PM paani pi lena`, or with a different destination
+`Kristy remind me after 10 minutes #gaming-chat pe ki VC join karna hai`
+(native channel mention). Without a channel mention the delivery goes to the
+channel where it was requested; a native `#channel` mention is only needed for
+a different destination. "Remind me" tags the requester from the message
+itself; no typed username is needed or trusted. Leading filler like "OK Kristy"
+is tolerated. Supported natural times: `after N minutes/hours`,
+`N minute/ghante baad`, `aaj/today/kal/tomorrow H[:MM] AM/PM` and
+`at H[:MM] AM/PM` (today only; a passed time is rejected, never moved to
+tomorrow). Multi-target reminders and summons with native member mentions use
+the same parsing; anything genuinely ambiguous still gets the "not saved/active"
+clarification instead of a guessed job. A body made only of command filler
+("reminder laga do 9:20 PM ka") is treated as missing, not saved as text.
+Unclear clock dates/times and incomplete requests still need the explicit
+format. This is bounded phrase extraction, not unrestricted natural-language
+scheduling.
 
 Use `Kristy schedule status JOB_ID` or `Kristy schedule list` to see your saved
 jobs and worker health, without message bodies or destination/member identifiers.
