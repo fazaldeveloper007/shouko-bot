@@ -2,7 +2,7 @@
 import re
 import time
 
-INTENT = re.compile(r"\b(remind(?:er)?|schedule|timer|yaad\s+dila(?:na|do|dena)?|reminder\s+laga)\b|\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b.*\b(?:bhej|bol|bula|tag|ping|message)|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*\b(?:bhej|bol|bula|tag|ping|message)", re.I)
+INTENT = re.compile(r"\b(remind(?:er)?|schedule|timer|yaad\s+dila(?:na|do|dena)?|reminder\s+laga)\b|\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b.*\b(?:bhej|bol|bula|tag|ping|message)|\b(?:bhej\w*|bol\w*|bula\w*|tag\w*|ping\w*|yaad\s+dila\w*|message)\b[^\n|]*\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*\b(?:bhej|bol|bula|tag|ping|message)", re.I)
 import discord
 import timed_messages as tm
 
@@ -10,8 +10,38 @@ HELP = ('Schedule format:\nKristy schedule 10 minute baad | here | Mayank, Naiyo
         'Kristy schedule kal 8 PM | #text-channel | @member | VC join kar lo\n'
         'Kristy remind 10 minute baad | here | apna reminder\n'
         'Kristy summon kal 8 PM | #text-channel | Mayank, Naiyo\n'
+        'Ya seedha aise bhi: Kristy remind me after 10 minutes to drink water\n'
         'Kristy schedule confirm ID / schedule list / schedule cancel ID\n'
-        'Native #text-channel mention select karo; targets comma/aur se separate. Preview ke bina kuch arm nahi hoga.')
+        'Doosre channel mein bhejna ho tabhi native #text-channel mention chahiye; warna request wale channel mein jayega. Targets comma/aur se separate. Preview ke bina kuch arm nahi hoga.')
+
+# Natural free-form time phrases, converted into the strict deterministic
+# grammar before parsing. Bare clock times resolve to today only; a passed
+# time is rejected by tm.parse_time, never silently moved to tomorrow.
+_NATURAL_TIME = [
+    (re.compile(r'\bafter\s+(\d+)\s*(min(?:ute)?s?|hours?)\b', re.I), lambda m: f'{m[1]} {m[2]} baad'),
+    (re.compile(r'\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b', re.I), None),
+    (re.compile(r'\b(?:aaj|today|kal|tomorrow)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b', re.I), None),
+    (re.compile(r'\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', re.I), lambda m: f'aaj {m[1]}:{m[2] or "00"} {m[3]}'),
+    (re.compile(r'\b(\d{1,2}):(\d{2})\s*(am|pm)\b', re.I), lambda m: f'aaj {m[1]}:{m[2]} {m[3]}'),
+]
+_SELF_WORDS = {'me', 'mujhe', 'mujhko', 'mujko', 'humhe', 'humko'}
+_CONNECTORS = {'to', 'ki', 'ke', 'ko', 'ka', 'pe', 'par', 'per', 'that', 'mein', 'me', 'se', 'karke', 'please', 'plz', 'ok', 'okay', 'aur', 'ya'}
+_HERE_WORDS = re.compile(r'\b(?:here|yahan|yahi|isi\s+channel(?:\s+(?:mein|me|pe|par))?|is\s+channel(?:\s+(?:mein|me|pe|par))?)\b', re.I)
+_TAG_WORDS = re.compile(r'\b(?:by\s+)?tag(?:ging|ed)?\b|\bping(?:ing|ed)?\b', re.I)
+# Scheduling-command filler: a body made only of these has no payload.
+_COMMAND_FILLER = _SELF_WORDS | _CONNECTORS | {'laga', 'lagana', 'lagao', 'set', 'karo', 'kar', 'karna', 'do', 'dena', 'dijiye', 'rakh', 'rakho', 'rakhna', 'chahiye', 'hai', 'hain', 'tha', 'thi', 'bhej', 'bhejna', 'bhejo', 'bol', 'bolna', 'bolo', 'bula', 'bulana', 'bulao', 'message', 'remind', 'reminder', 'yaad', 'dila', 'dilana', 'ek', 'mera', 'meri', 'mere', 'liye', 'na'}
+
+
+def _strip_lead(text):
+    """Leading self-references are targets; connectors before the payload are
+    filler. A self word after a connector is payload ('ki mujhe khana...')."""
+    tokens = text.split(); index = 0; seen_connector = False
+    while index < len(tokens):
+        word = tokens[index].strip('.,!').casefold()
+        if not seen_connector and word in _SELF_WORDS: index += 1
+        elif word in _CONNECTORS: seen_connector = True; index += 1
+        else: break
+    return ' '.join(tokens[index:])
 
 
 class Commands:
@@ -31,12 +61,48 @@ class Commands:
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
         self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None))
 
+    def natural_parts(self,kind,rest,message):
+        """Free-form remind/schedule/summon -> strict parts, or None when the
+        request is genuinely ambiguous. Identity comes from the message
+        author, never from a typed username. Everything still lands as an
+        unarmed preview showing the exact outgoing text."""
+        text=rest
+        dests=re.findall(r'<#(\d+)>',text)
+        if len(dests)>1:return None
+        dest=f'<#{dests[0]}>' if dests else 'here'
+        text=re.sub(r'<#\d+>',' ',text)
+        text=re.sub(r'\([^)]*\buser\s*name\b[^)]*\)',' ',text,flags=re.I)
+        when=None
+        for pattern,convert in _NATURAL_TIME:
+            m=pattern.search(text)
+            if m:
+                when=convert(m) if convert else m[0].strip()
+                text=text[:m.start()]+' '+text[m.end():]
+                break
+        if when is None:return None
+        mentions=re.findall(r'<@!?(\d+)>',text)
+        if kind=='remind' and mentions:return None  # multi-target: use strict format
+        text=re.sub(r'<@!?\d+>',' ',text)
+        text=_TAG_WORDS.sub(' ',text)
+        text=_HERE_WORDS.sub(' ',text)
+        self_target=bool(re.search(r'\b(?:me|mujhe|mujhko|mujko|humhe|humko)\b',text,re.I))
+        body=_strip_lead(text).strip(' .,!')
+        if body and not any(t.strip('.,!').casefold() not in _COMMAND_FILLER for t in body.split()):body=''
+        if kind=='remind':
+            return [when,dest,body] if body else None
+        targets=list(dict.fromkeys(mentions))
+        if self_target and str(message.author.id) not in targets:targets.insert(0,str(message.author.id))
+        if kind=='summon':
+            return [when,dest,', '.join(f'<@{t}>' for t in targets)] if targets else None
+        if not body:return None
+        return [when,dest,', '.join(f'<@{t}>' for t in targets) or 'none',body]
+
     async def handle(self,message,text,client,guard):
         # Guard command/header, not literal payload (quotes in a user-authored
         # message are data). No AI or quoted old messages can call this handler.
         header=text.split('|',1)[0]
         if guard(message,header,question=True) is None:return False
-        m=re.match(r'^(schedule|remind(?:er)?|summon)\b\s*(.*)$',text,re.I|re.S)
+        m=re.match(r'^(?:(?:ok+|okay|hey|please|plz|bhai|toh|abhi|kristy)[\s,]+)*(schedule|remind(?:er)?|summon)\b\s*(.*)$',text,re.I|re.S)
         if not m:
             if INTENT.search(text) or self.followup(message,text):
                 await self.clarify(message);return True
@@ -77,7 +143,10 @@ class Commands:
                 return True
             parts=[x.strip() for x in rest.split('|')]
             if len(parts)!=(3 if kind in ('remind','summon') else 4):
-                await self.clarify(message);return True
+                found=self.natural_parts(kind,rest,message)
+                if found is None:
+                    await self.clarify(message);return True
+                parts=found
             when,destination=parts[:2]
             anchor=getattr(message,'created_at',None)
             if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
