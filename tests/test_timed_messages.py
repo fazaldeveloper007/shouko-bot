@@ -192,3 +192,77 @@ class RepairTests(Schedules):
         await self.worker.tick(100)
         self.assertEqual(self.dest.send.await_count,10)
         self.assertTrue(all(e['status']=='sent' for e in self.store.load()))
+
+class NaturalRepairTests(Schedules):
+    def commands(self):
+        return sc.Commands(self.store,lambda *a:(self.target,False))
+    def msg(self):
+        return S(guild=self.guild,author=self.author,channel=self.dest,
+                 created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
+    def add_channel(self,cid=21,name='gaming-chat'):
+        ch=S(id=cid,guild=self.guild,type=discord.ChannelType.text,name=name,send=AsyncMock(return_value=S(id=78)))
+        ch.permissions_for=lambda m:S(view_channel=True,send_messages=True)
+        channels={20:self.dest,cid:ch}
+        self.guild.get_channel=lambda c:channels.get(c)
+        return ch
+    async def test_remind_me_here_after_minutes(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me here after 3 minute to play genshin',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        self.assertEqual(e['status'],'preview');self.assertEqual(e['targets'],[1])
+        self.assertEqual(e['dest'],20);self.assertEqual(e['source'],20)
+        self.assertEqual(e['body'],'<@1>\nplay genshin')
+        self.assertAlmostEqual(e['due'],message.created_at.timestamp()+180,delta=2)
+        self.assertIn('abhi armed nahi',message.reply.call_args.args[0])
+    async def test_remind_me_explicit_channel_and_username_note(self):
+        self.add_channel();message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes by tagging me (my username: fazal_techiudex07) <#21> pe ki mujhe Khaana Khane Jaana hoga',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        self.assertEqual(e['dest'],21);self.assertEqual(e['targets'],[1])
+        self.assertEqual(e['body'],'<@1>\nmujhe Khaana Khane Jaana hoga')
+    async def test_absent_channel_defaults_request_channel(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me after 10 minutes paani pi lena',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load()[0]['dest'],20)
+    async def test_leading_filler_before_keyword(self):
+        message=self.msg()
+        await self.commands().handle(message,'OK Kristy remind me after 5 minutes to drink water',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        self.assertEqual(e['targets'],[1]);self.assertEqual(e['body'],'<@1>\ndrink water')
+    async def test_clock_times_convert_and_past_rejected(self):
+        commands=self.commands();message=self.msg()
+        self.assertEqual(commands.natural_parts('remind','me at 9:30 PM to sleep',message),['aaj 9:30 PM','here','sleep'])
+        self.assertEqual(commands.natural_parts('remind','me kal 8 PM call karna',message),['kal 8 PM','here','call karna'])
+        anchor=dt.datetime(2026,11,2,19,0,tzinfo=tm.IST)
+        self.assertEqual(dt.datetime.fromtimestamp(tm.parse_time('aaj 9:30 PM',anchor),tm.IST).isoformat(),'2026-11-02T21:30:00+05:30')
+        with self.assertRaises(ValueError):tm.parse_time('aaj 6 PM',anchor)
+    async def test_missing_time_still_clarifies_no_job(self):
+        message=self.msg()
+        self.assertTrue(await self.commands().handle(message,'remind me to play genshin',self.client,lambda *a,**kw:'ok'))
+        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+    async def test_natural_preview_confirm_fires_once(self):
+        commands=self.commands();message=self.msg()
+        await commands.handle(message,'remind me after 5 minutes to stretch',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        await commands.handle(message,'schedule confirm '+e['id'],self.client,lambda *a,**kw:'ok')
+        await self.worker.tick(e['due']);await self.worker.tick(e['due']+30)
+        self.dest.send.assert_awaited_once()
+        self.assertEqual(self.dest.send.call_args.args[0],'<@1>\nstretch')
+    async def test_reversed_order_intent_clarifies_not_ai(self):
+        message=self.msg()
+        self.assertTrue(await self.commands().handle(message,'| here | fazallettee | unhe tag kardena 10 min baad ke khana khane Jana hai | <@2> |',self.client,lambda *a,**kw:'ok'))
+        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+    async def test_two_channel_mentions_clarify(self):
+        self.add_channel();message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes <#20> <#21> kuch bhi',self.client,lambda *a,**kw:'ok')
+        self.assertIn('active nahi',message.reply.call_args.args[0]);self.assertEqual(self.store.load(),[])
+    async def test_natural_body_markers_rejected(self):
+        message=self.msg()
+        await self.commands().handle(message,'remind me after 5 minutes @everyone uth ja',self.client,lambda *a,**kw:'ok')
+        self.assertEqual(self.store.load(),[])
+    async def test_natural_summon_with_mentions(self):
+        self.add_channel();message=self.msg()
+        await self.commands().handle(message,'summon kal 8 PM <@2> <#21>',self.client,lambda *a,**kw:'ok')
+        e=self.store.load()[0]
+        self.assertEqual(e['targets'],[2]);self.assertEqual(e['dest'],21)
+        self.assertEqual(e['body'],'<@2>\nVC join kar lo, creator ne is time par bulaya hai.')
