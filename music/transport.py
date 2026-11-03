@@ -5,6 +5,7 @@ import os
 import pathlib
 import secrets
 import discord
+from .diagnostics import engine_code, engine_diag
 
 class VoiceFailure(Exception):
     pass
@@ -27,6 +28,7 @@ class Bridge(discord.VoiceProtocol):
         self.seen = set()
         self.close_lock = asyncio.Lock()
         self.failure_reported = False
+        self.failure_code = None
         self.transitioning = False
 
     async def write(self, value):
@@ -98,7 +100,10 @@ class Bridge(discord.VoiceProtocol):
                 elif kind in ('transition_wait', 'transition_ready'):
                     self.transitioning = kind == 'transition_wait'
                 elif kind == 'failure':
-                    await self.failed('VOICE_ENGINE_FAILED')
+                    await self.failed('WORKER_' + engine_code(m.get('code')))
+                elif kind == 'play_failed':
+                    f = self.waiters.get(('playing', m.get('id')))
+                    if f and not f.done(): f.set_exception(TimeoutError())
                 elif kind in ('voice_ready', 'playing', 'ended', 'track_stopped', 'control'):
                     key = kind if kind == 'voice_ready' else (kind, m.get('id'))
                     f = self.waiters.get(key)
@@ -112,6 +117,8 @@ class Bridge(discord.VoiceProtocol):
                 await self.failed('VOICE_WORKER_EXITED')
 
     async def failed(self, code):
+        if not self.failure_code:
+            self.failure_code = code; engine_diag(code)
         for f in list(self.waiters.values()):
             if not f.done(): f.set_exception(VoiceFailure(code))
         if not self.failure_reported and self.state == 'ready':
