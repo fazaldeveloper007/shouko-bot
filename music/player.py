@@ -153,15 +153,16 @@ class GuildPlayer:
                     await self.manager.note(self, str(exc))
                 except TimeoutError:
                     # Slow start on a busy phone (worker ack, or transition wait) is
-                    # not a dead session: reset the worker's track, skip this one
-                    # and keep the VC. Repeated timeouts still end the session.
+                    # not a reason to leave: reset the worker's track and keep the VC.
+                    # Next track is tried; after 3 in a row Kristy stays connected,
+                    # idles and says so (Leave stays the only user-driven exit).
                     self.start_timeouts = getattr(self, 'start_timeouts', 0) + 1
                     emit('VOICE_PLAY','NETWORK_TIMEOUT')
-                    try:
-                        if self.start_timeouts >= 3: raise RuntimeError()
-                        await self.bridge.stop_track()
-                    except Exception:
-                        await self.manager.remove(self, 'Playback failed. Queue cleared; join again for a fresh session.')
+                    try: await self.bridge.stop_track()
+                    except Exception: emit('SKIP','WORKER_FAILED')
+                    if self.start_timeouts >= 3:
+                        self.start_timeouts = 0
+                        await self.manager.note(self, 'Voice engine is slow to start tracks. Staying in VC; try playing again in a moment.')
                         return
                     await self.manager.note(self, 'That track was slow to start; skipped it.')
                 except Exception:
@@ -242,12 +243,20 @@ class GuildPlayer:
                 try:
                     await self.bridge.stop_track()
                 except TimeoutError:
-                    # A slow worker ack is not a dead worker: retry once before
-                    # treating Skip/Stop as a reason to tear the session down.
                     emit('SKIP','ACK_TIMEOUT')
                     await self.bridge.stop_track()
-            except BaseException as exc:
-                emit('SKIP','CANCELLED' if isinstance(exc, asyncio.CancelledError) else 'WORKER_FAILED')
+            except TimeoutError:
+                # Worker did not answer twice. Not a reason to leave the VC: stay
+                # connected, say so, and let the user retry. A truly dead worker
+                # still ends through Bridge failure -> engine_failed.
+                emit('SKIP','WORKER_FAILED')
+                async with self.lock:
+                    self.interrupting = False; self.current = None; self.paused = False
+                await self.manager.note(self, 'Skip did not register (voice engine is slow). Still in VC; press Skip again.')
+                await self.manager.panel(self)
+                return
+            except BaseException:
+                emit('SKIP','CANCELLED')
                 self.interrupting = False
                 await self.manager.remove(self)
                 raise
