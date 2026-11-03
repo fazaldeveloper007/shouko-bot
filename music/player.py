@@ -8,7 +8,7 @@ import time
 import discord
 from .media import Media, MediaError
 from .transport import Bridge, VoiceFailure
-from .diagnostics import emit
+from .diagnostics import emit, engine_label
 
 class MusicError(Exception): pass
 
@@ -58,7 +58,8 @@ class GuildPlayer:
         emit('VOICE_CONNECT','OK',elapsed=time.monotonic()-began)
 
     async def engine_failed(self):
-        await self.manager.remove(self, 'Voice connection failed. Queue cleared; request /joinvckristy to start a fresh session.')
+        code = engine_label(getattr(self.bridge, 'failure_code', None))
+        await self.manager.remove(self, f'Voice connection failed ({code}). Queue cleared; request /joinvckristy to start a fresh session.')
 
     def _prefetch_start(self):
         # Download the next queued track in the background while the current one plays.
