@@ -139,16 +139,16 @@ class SkipTests(unittest.IsolatedAsyncioTestCase):
         p,mgr=await self.build(True,0,stop_failures=1)
         await p.interrupt();await asyncio.sleep(.1)
         self.assertFalse(p.closed);self.assertIsNotNone(p.current)
-    async def test_dead_worker_still_closes_session(self):
+    async def test_unresponsive_worker_does_not_leave_vc(self):
         p,mgr=await self.build(True,0,stop_failures=2)
-        with self.assertRaises(TimeoutError):await p.interrupt()
-        self.assertTrue(p.closed)
-
+        await p.interrupt()
+        self.assertFalse(p.closed);mgr.note.assert_awaited()
     async def test_slow_play_ack_after_skip_keeps_vc_and_moves_on(self):
         for autoplay,queued in ((True,0),(False,3)):
             p,mgr=await self.build(autoplay,queued);p.bridge.pt=1
             await p.interrupt();await asyncio.sleep(.3)
             self.assertFalse(p.closed,(autoplay,queued));self.assertIsNotNone(p.current,(autoplay,queued))
-    async def test_repeated_play_timeouts_end_session(self):
+    async def test_repeated_play_timeouts_stay_in_vc_and_idle(self):
         p,mgr=await self.build(True,0,play_timeouts=99);await asyncio.sleep(.5)
-        self.assertTrue(p.closed)
+        self.assertFalse(p.closed);self.assertIsNone(p.current)
+        self.assertIn('Staying in VC',mgr.note.await_args.args[1])
