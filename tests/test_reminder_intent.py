@@ -128,6 +128,67 @@ class Intent(Base):
         m=self.msg(dt.datetime.now(dt.timezone.utc));self.cmd.intent=None
         await self.run_msg(m,'remind me here after 3 minute to play genshin');self.assertEqual(self.store.load()[0]['core'],'play genshin')
 
+class Grounding(Base):
+    """Mocked extraction only: these test the code's checks, not model quality."""
+    def at(self,mins=20):
+        t=dt.datetime.now(dt.timezone.utc).astimezone(IST).replace(second=0,microsecond=0)+dt.timedelta(minutes=mins)
+        return t,f"{t.strftime('%I').lstrip('0')}:{t.strftime('%M')} {t.strftime('%p')}"
+    async def attempt(self,text,intent,when=None):
+        self.cmd.pending.clear();self.ai(intent);m=self.msg(when or dt.datetime.now(dt.timezone.utc));await self.run_msg(m,text);return m
+    async def test_clock_normalisations_equal(self):
+        t,c=self.at()
+        for w in (f'aaj {c}',f'{t.date().isoformat()} {t.strftime("%H:%M")}'):
+            self.store.save([])
+            await self.attempt(f'remind me at {c.lower()} for tea',{'action':'remind','when':w,'task':'tea','tag_names':[]})
+            self.assertEqual(len(self.store.load()),1,w)
+            self.assertAlmostEqual(self.store.load()[0]['due'],t.timestamp(),delta=1)
+    async def test_explicit_clock_beats_parenthetical_approx(self):
+        t,c=self.at(20)
+        await self.attempt(f'remind me at {c} (almost after 19 minute) for tea',{'action':'remind','when':'19 minute baad','task':'tea','tag_names':[]})
+        self.assertEqual(self.store.load(),[])  # model chose the approximation: refused
+        await self.attempt(f'remind me at {c} (almost after 19 minute) for tea',{'action':'remind','when':f'aaj {c}','task':'tea','tag_names':[]})
+        self.assertAlmostEqual(self.store.load()[0]['due'],t.timestamp(),delta=1)
+    async def test_conflicting_exact_times_ask(self):
+        t,c=self.at(20)
+        m=await self.attempt(f'remind me at {c} and after 5 minute for tea',{'action':'remind','when':'5 minute baad','task':'tea','tag_names':[]})
+        self.assertEqual(self.store.load(),[]);self.assertIn('alag time',m.reply.call_args.args[0])
+    async def test_recombined_digits_do_not_pass(self):
+        t,c=self.at(20)
+        await self.attempt(f'remind me at {c} to call 2 friends',{'action':'remind','when':'2 minute baad','task':'call friends','tag_names':[]})
+        self.assertEqual(self.store.load(),[])
+        await self.attempt('remind me at 3 to call 30 friends',{'action':'remind','when':'aaj 3:30 PM','task':'call friends','tag_names':[]})
+        self.assertEqual(self.store.load(),[])
+    async def test_followup_time_counts_from_followup_message(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        self.ai({'action':'need_info','question':'Kab?'},{'action':'remind','when':'10 minute baad','task':'tea','tag_names':[]})
+        await self.run_msg(self.msg(t0),'remind me to drink tea')
+        t1=t0+dt.timedelta(seconds=100)
+        await self.run_msg(self.msg(t1,ref=S(message_id=700)),'in 10 minutes')
+        self.assertAlmostEqual(self.store.load()[0]['due'],t1.timestamp()+600,delta=1)
+    async def test_tag_names_must_be_user_words(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        await self.attempt('remind me in 5 minute about Mayank birthday cake',{'action':'remind','when':'5 minute baad','task':'Mayank birthday cake','tag_names':['Mayank']})
+        self.assertEqual(self.store.load(),[])
+        await self.attempt('remind me in 5 minute tag Mayank for standup',{'action':'remind','when':'5 minute baad','task':'standup','tag_names':['Mayank']})
+        self.assertEqual(self.store.load()[0]['targets'],[1,2])
+    async def test_model_cannot_remove_author_tag(self):
+        await self.attempt('remind me in 5 minute for standup',{'action':'remind','when':'5 minute baad','task':'standup','tag_names':[],'tag_author':False})
+        self.assertEqual(self.store.load()[0]['targets'],[1])
+        self.store.save([])
+        await self.attempt("remind me in 5 minute for standup, don't tag me",{'action':'remind','when':'5 minute baad','task':'standup','tag_names':[],'tag_author':False})
+    async def test_channel_mention_only_with_destination_words(self):
+        self.guild.get_channel=lambda c:self.dest if c in (20,21) else None
+        await self.attempt('remind me in 5 minute to check <#21> rules',{'action':'remind','when':'5 minute baad','task':'check rules','tag_names':[]})
+        self.assertEqual(self.store.load(),[])
+        await self.attempt('remind me in 5 minute in <#20> to drink water',{'action':'remind','when':'5 minute baad','task':'drink water','tag_names':[]})
+        self.assertEqual(self.store.load()[0]['dest'],20)
+    async def test_invented_task_and_casual_chat(self):
+        await self.attempt('remind me in 5 minute please',{'action':'remind','when':'5 minute baad','task':'submit the tax return','tag_names':[]})
+        self.assertEqual(self.store.load(),[])
+        self.cmd.pending.clear();self.calls=[];self.ai({'action':'remind','when':'5 minute baad','task':'x','tag_names':[]})
+        self.assertFalse(await self.run_msg(self.msg(dt.datetime.now(dt.timezone.utc)),'lol that anime in 5 minutes was wild'))
+        self.assertEqual(self.calls,[])  # no keyword: the model is never asked
+
 async def run(t,m,text):return await t.cmd.handle(m,text,t.client,guard)
 
 class Guard(unittest.TestCase):
@@ -136,3 +197,12 @@ class Guard(unittest.TestCase):
         self.assertTrue(sc.false_promise('remind me','Reminder set for 3:30 pm'))
         self.assertFalse(sc.false_promise('hello','I\'ll remind you later'))
         self.assertFalse(sc.false_promise('what is a reminder','a reminder is a note'))
+
+class Outage(Base):
+    async def test_outage_simple_strict_form_still_saves_but_clause_text_does_not(self):
+        self.ai(RuntimeError('down'))
+        await self.run_msg(self.msg(dt.datetime.now(dt.timezone.utc)),'remind me 10 minute baad pani peene')
+        self.assertEqual(self.store.load()[0]['core'],'pani peene')
+        self.ai(RuntimeError('down'));m=self.msg(dt.datetime.now(dt.timezone.utc))
+        await self.run_msg(m,'remind me at 11:00 pm (almost after 19 minute) for lunch, also tag me')
+        self.assertEqual(len(self.store.load()),1);self.assertIn('save nahi hua',m.reply.call_args.args[0])
