@@ -23,6 +23,21 @@ async function run(mode){
  if(mode==='timeout'){await new Promise(r=>setTimeout(r,60));assert(packets.some(p=>p.code==='DAVE_WAIT_FAILED'));return;}
  d.session.ready=true;d.lastTransitionId=0;privacy=true;await new Promise(r=>setTimeout(r,8));assert(packets.some(p=>p.type==='voice_ready'));
  if(mode==='path_escape'){send({type:'play',id:'1234567890abcdef',path:'/tmp/outside.webm'});assert(packets.some(p=>p.code==='INVALID_COMMAND'));return;}
+ const ID1='1234567890abcdef',ID2='abcdef1234567890',P='/tmp/media-test/track-1234.webm';
+ const fails=()=>packets.filter(p=>p.type==='failure');
+ if(mode==='play_while_playing'){send({type:'play',id:ID1,path:P});send({type:'play',id:ID2,path:P});assert.deepEqual(fails(),[]);assert(packets.some(p=>p.type==='playing'&&p.id===ID2));send({type:'stop'});return;}
+ if(mode==='play_in_idle_gap_when_dave_not_encrypted'){
+  send({type:'play',id:ID1,path:P});send({type:'stop_track',id:'stop'});
+  d.session.ready=false;const before=packets.filter(p=>p.type==='playing').length;
+  send({type:'play',id:ID2,path:P});assert.deepEqual(fails(),[],'play must not kill the engine');assert.equal(packets.filter(p=>p.type==='playing').length,before);
+  d.session.ready=true;d.lastTransitionId=7;await new Promise(r=>setTimeout(r,12));
+  assert(packets.some(p=>p.type==='playing'&&p.id===ID2));assert.deepEqual(fails(),[]);send({type:'stop'});return;}
+ if(mode==='play_never_encrypted_reports_play_failed_not_failure'){
+  d.session.ready=false;send({type:'play',id:ID1,path:P});await new Promise(r=>setTimeout(r,80));
+  assert(packets.some(p=>p.type==='play_failed'&&p.id===ID1));assert.deepEqual(fails().filter(p=>p.code==='INVALID_COMMAND'),[]);return;}
+ if(mode==='stop_track_cancels_pending_play'){
+  d.session.ready=false;send({type:'play',id:ID1,path:P});send({type:'stop_track',id:'stop'});d.session.ready=true;d.lastTransitionId=9;await new Promise(r=>setTimeout(r,12));
+  assert(!packets.some(p=>p.type==='playing'));assert.deepEqual(fails(),[]);send({type:'stop'});return;}
  for(let i=0;i<2;i++){
   send({type:'play',id:'1234567890abcdef',path:'/tmp/media-test/track-1234.webm'});assert(packets.some(p=>p.type==='playing'));
   send({type:'pause',id:'pause'});send({type:'resume',id:'resume'});assert(packets.filter(p=>p.type==='control' && p.ok).length>=2);
@@ -35,6 +50,6 @@ async function run(mode){
 }
 (async()=>{
  const d=new native.DAVESession(1,'333333333333333333','222222222222222222',{});d.reinit();assert.equal(d.session.ready,false);assert(!d.voicePrivacyCode);d.destroy();console.log('PASS real native initial-not-ready');
- for(const mode of ['invalid_init','timeout','path_escape','two_tracks_controls_transition_resume','transition_timeout']){await run(mode);console.log('PASS actual worker',mode);}
+ for(const mode of ['invalid_init','timeout','path_escape','two_tracks_controls_transition_resume','transition_timeout','play_while_playing','play_in_idle_gap_when_dave_not_encrypted','play_never_encrypted_reports_play_failed_not_failure','stop_track_cancels_pending_play']){await run(mode);console.log('PASS actual worker',mode);}
  console.log('NO_LOGIN_NO_NETWORK_WORKER_SUITE_PASS');
 })().catch(e=>{console.error(e);process.exitCode=1;});
