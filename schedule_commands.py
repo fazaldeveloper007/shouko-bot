@@ -45,6 +45,65 @@ def _strip_lead(text):
     return ' '.join(tokens[index:])
 
 
+
+_CLOCK=re.compile(r"\b(?:(aaj|today|kal|tomorrow)\s+)?(?:at\s+|@\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",re.I)
+_CLOCK24=re.compile(r"(?<![\d:-])(?:(\d{4}-\d{2}-\d{2})\s+|(?:at\s+)?)([01]?\d|2[0-3]):([0-5]\d)\b(?!\s*(?:am|pm))",re.I)
+_REL=re.compile(r"\b(?:after|in)\s+(\d+)\s*(min(?:ute)?s?|hours?|hrs?)\b|\b(\d+)\s*(min(?:ute)?s?|hours?|hrs?|ghant[ae])\s+baad\b",re.I)
+_APPROX=re.compile(r"(?:almost|around|approx\w*|about|nearly|lagbhag|takriban|roughly|~)\W*$",re.I)
+
+def _tagged_in(text):
+    """Names the user wrote after a tag/ping word ('tag Mayank, Naiyo')."""
+    out=[]
+    for m in _TAG_NAME.finditer(text):
+        out.append(m[1].strip('.,!'));end=m.end()
+        while True:
+            n=_NAME_LIST.match(text,end)
+            if not n:break
+            out.append(n[1].strip('.,!'));end=n.end()
+    return out
+
+def time_candidates(text,anchor):
+    """Time expressions the USER wrote, as (due, when_string, anchor, kind, approximate)."""
+    found=[]
+    local=anchor.astimezone(tm.IST)
+    def add(when,m,kind):
+        try:due=tm.parse_time(when,anchor)
+        except ValueError:return
+        before=text[max(0,m.start()-25):m.start()]
+        approx=bool(_APPROX.search(before)) or before.count('(')>before.count(')')
+        found.append((due,when,anchor,kind,approx))
+    for m in _CLOCK.finditer(text):
+        h=int(m[2]);mi=m[3] or '00'
+        if not 1<=h<=12:continue
+        add(f"{m[1] or 'aaj'} {h}:{mi} {m[4]}",m,'clock')
+    for m in _CLOCK24.finditer(text):
+        add(f"{m[1] or local.date().isoformat()} {int(m[2])}:{m[3]}",m,'clock')
+    for m in _REL.finditer(text):
+        n,unit=(m[1],m[2]) if m[1] else (m[3],m[4])
+        add(f"{n} {'minute' if unit.lower().startswith('min') else 'hour'} baad",m,'rel')
+    return found
+
+def pick_time(ai_when,sources):
+    """(when_string, anchor) the user's own words support AND the model agrees with;
+    otherwise (None, short question). Latest source with a time wins."""
+    for text,anchor in reversed(sources):
+        cands=time_candidates(text,anchor)
+        if not cands:continue
+        clocks=[c for c in cands if c[3]=='clock'];rels=[c for c in cands if c[3]=='rel']
+        if clocks:
+            pool=clocks
+            if any(not r[4] and abs(r[0]-clocks[0][0])>120 for r in rels):
+                return None,'Do alag time dikh rahe hain. Exact time kaunsa? Jaise: aaj 3:30 PM'
+        else:pool=rels
+        if len({round(c[0]) for c in pool})>1 and max(c[0] for c in pool)-min(c[0] for c in pool)>1:
+            return None,'Ek se zyada time dikh rahe hain. Exact time ek hi likho.'
+        due,when,a,_,_=pool[0]
+        try:agreed=abs(tm.parse_time(ai_when,a)-due)<=1
+        except ValueError:agreed=False
+        if not agreed:return None,'Time clearly samajh nahi aaya. Kab chahiye? Jaise: aaj 3:30 PM'
+        return (when,a),None
+    return None,'Kab? Time likho, jaise: aaj 3:30 PM ya 10 minute baad'
+
 class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
@@ -190,7 +249,7 @@ class Commands:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
         return True
 
-    async def ai_request(self,message,text,client):
+    async def ai_request(self,message,text,client,fallback=None,kind='remind'):
         """The model only UNDERSTANDS the request (structured intent). Every
         effect is decided here: time via tm.parse_time against the ORIGINAL
         message time, targets resolved to real members, same channel unless a
@@ -210,6 +269,16 @@ class Commands:
         if self.intent is None:
             await self.clarify(message,request=request,anchor=anchor);return True
         if not isinstance(intent,dict) or intent.get('action') not in ('remind','need_info','none'):
+            parts=fallback() if fallback else None
+            if parts:
+                try:
+                    await self._commit(message,client,kind,parts,time.time(),getattr(message,'created_at',None))
+                    self.pending.pop(self.key(message),None)
+                except (ValueError,TypeError) as exc:
+                    await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
+                except OSError:
+                    await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
+                return True
             await self.clarify(message,'Abhi samajh nahi paayi, reminder save nahi hua. Time aur kya yaad dilana hai ek line mein likho.',request,anchor);return True
         action=intent['action']
         if action=='none':return False
@@ -223,29 +292,49 @@ class Commands:
             names=intent.get('tag_names') or []
             if not isinstance(when,str) or not isinstance(task,str) or not isinstance(names,list) or len(names)>5:raise TypeError
             when=' '.join(when.split());task=' '.join(task.split()).strip(' .,!')
-            if not task or not when or len(when)>40:
+            if not task or not when or len(when)>40 or len(task)>300:
                 await self.clarify(message,'Kab aur kya? Time aur reminder ka kaam ek line mein likho.',request,anchor);return True
-            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}\s+\S+',when):
-                # the model may not invent a time the user never wrote
-                have={int(n) for n in re.findall(r'\d+',request)}
-                if any(int(n) not in have for n in re.findall(r'\d+',when)):
-                    await self.clarify(message,'Time clearly samajh nahi aaya. Kab chahiye? Jaise: aaj 3:30 PM',request,anchor);return True
+            # The task must be the user's own words, not a model invention.
+            words=[w for w in re.findall(r"[\w']+",task.casefold()) if len(w)>=3]
+            low=request.casefold()
+            if not words or sum(w in low for w in words)*2<len(words):
+                await self.clarify(message,'Kya yaad dilana hai? Ek line mein likho.',request,anchor);return True
+            # The time comes from the user's words (clock or duration), computed
+            # here; the model's `when` only has to AGREE with it.
+            sources=[(orig,anchor)] if orig else []
+            sources.append((text,getattr(message,'created_at',None) or anchor))
+            chosen,problem=pick_time(when,sources)
+            if chosen is None:
+                await self.clarify(message,problem,request,anchor);return True
+            when,when_anchor=chosen
             dests=re.findall(r'<#(\d+)>',request)
             if len(dests)>1:raise ValueError('Ek hi destination channel do.')
+            if dests and not re.search(rf'(?:\b(?:in|to|on|at)\s+<#{dests[0]}>|<#{dests[0]}>\s*(?:mein|me|pe|par|channel)\b|\bchannel\s+<#{dests[0]}>)',request,re.I):
+                await self.clarify(message,'Kis channel mein bhejna hai? "<#channel> mein" likho, ya bina channel ke yahin bhejti hoon.',request,anchor);return True
             dest=f'<#{dests[0]}>' if dests else 'here'
             targets=[str(message.author.id)]
-            targets+=re.findall(r'<@!?(\d+)>',request)
+            mentioned=re.findall(r'<@!?(\d+)>',request)
+            for m_id in mentioned:
+                if not re.search(rf'\b(?:tag(?:ging)?|ping(?:ing)?)\s+(?:[\w.\-]+\s*(?:,|and|aur)\s*)*<@!?{m_id}>',request,re.I):
+                    await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor);return True
+            targets+=mentioned
             for name in names:
                 if not isinstance(name,str) or not name.strip() or len(name)>40:raise TypeError
-                member=self.resolver(message.guild,name.strip().lstrip('@'))[0]
+                clean=name.strip().lstrip('@')
+                # a tagged person must be named after a tag/ping word in the user's text
+                if not any(clean.casefold()==n.casefold() for n in _tagged_in(request)):
+                    await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor);return True
+                member=self.resolver(message.guild,clean)[0]
                 if member is None or member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
                 targets.append(str(member.id))
             targets=list(dict.fromkeys(targets))
-            if len(targets)==1 and intent.get('tag_author',True) is not False:
+            # the model cannot drop the author's tag unless the user said so
+            tag_author=not (intent.get('tag_author') is False and re.search(r"(?:don't|do not|dont|mat|without|no)\s+tag|tag\s+(?:mat|nahi|nhi)",request,re.I))
+            if len(targets)==1 and tag_author:
                 parts=[when,dest,task];kind='remind'
             else:
                 parts=[when,dest,', '.join(f'<@{t}>' for t in targets),task];kind='schedule'
-            await self._commit(message,client,kind,parts,time.time(),anchor)
+            await self._commit(message,client,kind,parts,time.time(),when_anchor)
             self.pending.pop(self.key(message),None)
         except (ValueError,TypeError) as exc:
             self.pending.pop(self.key(message),None)
@@ -340,6 +429,11 @@ class Commands:
                 return True
             parts=[x.strip() for x in rest.split('|')]
             if len(parts)!=(3 if kind in ('remind','summon') else 4):
+                if self.intent is not None:
+                    # AI understands first; strict parser only if the AI is unavailable
+                    # and the text has no clause (parentheses, tag/ping) it could mangle.
+                    fb=lambda:None if re.search(r'[()]|\b(?:tag|ping)',rest,re.I) else self.natural_parts(kind,rest,message)
+                    return await self.ai_request(message,text,client,fb,kind)
                 found=self.natural_parts(kind,rest,message)
                 if found is None:
                     return await self.ai_request(message,text,client)
