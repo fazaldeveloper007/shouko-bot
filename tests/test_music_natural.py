@@ -90,3 +90,65 @@ class RealPlayerRace(unittest.IsolatedAsyncioTestCase):
         finally:
             if p.task:await asyncio.gather(p.task,return_exceptions=True)
             p.temp.cleanup()
+
+class SkipTests(unittest.IsolatedAsyncioTestCase):
+    """Real GuildPlayer run loop; fake worker bridge with the real ack semantics."""
+    async def build(self,autoplay,queued,stop_failures=0,stop_exc=TimeoutError,play_timeouts=0):
+        import types
+        from music.player import Manager, GuildPlayer
+        from music.media import Track
+        class Bridge:
+            def __init__(s):s.waiters={};s.transitioning=False;s.leave_confirmed=True;s.n=0;s.playing=None;s.fail=stop_failures;s.pt=play_timeouts
+            async def play(s,path):
+                if s.pt>0:s.pt-=1;raise TimeoutError()
+                assert not s.playing,'worker would reject play while playing'
+                s.n+=1;f=asyncio.get_running_loop().create_future();s.waiters[('ended',s.n)]=f;s.playing=s.n;return s.n,f
+            async def stop_track(s):
+                if s.fail>0:s.fail-=1;raise stop_exc()
+                s.playing=None
+                for k,f in list(s.waiters.items()):
+                    if not f.done():f.cancel()
+                    s.waiters.pop(k,None)
+            async def disconnect(s,force=False):return True
+        mgr=Manager(types.SimpleNamespace());mgr.note=AsyncMock();mgr.panel=AsyncMock()
+        async def dl(track,path,background=False):path.write_bytes(b'x')
+        k=[0]
+        async def related(seed,ids,titles):
+            k[0]+=1;return [Track('relatedvid%d'%k[0],'rel%d'%k[0],20,1)]
+        mgr.media=types.SimpleNamespace(download=dl,related=related,max_bytes=1)
+        c=types.SimpleNamespace(id=20,guild=types.SimpleNamespace(id=10),send=AsyncMock(),members=[])
+        p=GuildPlayer(mgr,c);p.bridge=Bridge();mgr.players[10]=p;p.autoplay=autoplay
+        for i in range(queued):await p.add(Track('queuedvid%02d'%i,'q%d'%i,20,1))
+        if not queued:await p.add(Track('jNQXAC9IVRw','first',20,1))
+        await asyncio.sleep(.1)
+        async def cleanup():
+            p.closed=True
+            if p.task:p.task.cancel();await asyncio.gather(p.task,return_exceptions=True)
+            p.temp.cleanup()
+        self.addAsyncCleanup(cleanup)
+        return p,mgr
+    async def test_skip_never_leaves_with_or_without_queue_and_autoplay(self):
+        for autoplay in (False,True):
+            for queued in (0,2):
+                p,mgr=await self.build(autoplay,queued)
+                before=p.current.title;await p.interrupt();await asyncio.sleep(.1)
+                self.assertFalse(p.closed,(autoplay,queued))
+                if queued or autoplay:self.assertNotEqual(p.current and p.current.title,before)
+                mgr.note.assert_not_awaited()
+    async def test_slow_worker_ack_is_retried_not_a_leave(self):
+        p,mgr=await self.build(True,0,stop_failures=1)
+        await p.interrupt();await asyncio.sleep(.1)
+        self.assertFalse(p.closed);self.assertIsNotNone(p.current)
+    async def test_dead_worker_still_closes_session(self):
+        p,mgr=await self.build(True,0,stop_failures=2)
+        with self.assertRaises(TimeoutError):await p.interrupt()
+        self.assertTrue(p.closed)
+
+    async def test_slow_play_ack_after_skip_keeps_vc_and_moves_on(self):
+        for autoplay,queued in ((True,0),(False,3)):
+            p,mgr=await self.build(autoplay,queued);p.bridge.pt=1
+            await p.interrupt();await asyncio.sleep(.3)
+            self.assertFalse(p.closed,(autoplay,queued));self.assertIsNotNone(p.current,(autoplay,queued))
+    async def test_repeated_play_timeouts_end_session(self):
+        p,mgr=await self.build(True,0,play_timeouts=99);await asyncio.sleep(.5)
+        self.assertTrue(p.closed)
