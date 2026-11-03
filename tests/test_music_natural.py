@@ -152,3 +152,11 @@ class SkipTests(unittest.IsolatedAsyncioTestCase):
         p,mgr=await self.build(True,0,play_timeouts=99);await asyncio.sleep(.5)
         self.assertFalse(p.closed);self.assertIsNone(p.current)
         self.assertIn('Staying in VC',mgr.note.await_args.args[1])
+
+class EngineDiagTests(unittest.TestCase):
+    def test_engine_codes_are_fixed_names_only(self):
+        from music.diagnostics import engine_label
+        self.assertEqual(engine_label('WORKER_INVALID_COMMAND'),'INVALID_COMMAND')
+        self.assertEqual(engine_label('VOICE_REMOVED'),'VOICE_REMOVED')
+        self.assertEqual(engine_label('WORKER_token=abc123'),'OTHER')
+        self.assertEqual(engine_label(None),'OTHER')
