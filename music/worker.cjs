@@ -73,17 +73,27 @@ function message(m){
   if(m.kind==='state' && m.data.user_id===config.user){if(m.data.channel_id!==config.channel)return fail('VOICE_STATE_CHANGED');methods.onVoiceStateUpdate(m.data);}
   else if(m.kind==='server')methods.onVoiceServerUpdate(m.data);
  }else if(m.type==='play'){
-  if(!ready || ending || !encrypted(connection) || playingId || typeof m.id!=='string' || !/^[a-f0-9]{16}$/.test(m.id))throw Error();
-  const p=safePath(m.path);playingId=m.id;userPaused=false;
-  stream=fs.createReadStream(p);stream.on('error',()=>fail('MEDIA_READ_FAILED'));
-  resource=v.createAudioResource(stream,{inputType:v.StreamType.WebmOpus});
-  player=v.createAudioPlayer({behaviors:{noSubscriber:v.NoSubscriberBehavior.Stop}});
-  player.on('error',()=>fail('PLAYER_FAILED'));
-  player.on('stateChange',(old,s)=>{
-   if(s.status===v.AudioPlayerStatus.Playing && playingId)out({type:'playing',id:playingId});
-   if(old.status!==v.AudioPlayerStatus.Idle && s.status===v.AudioPlayerStatus.Idle && playingId)stopTrack(true);
-  });
-  connection.subscribe(player);player.play(resource);
+  if(!ready || ending || typeof m.id!=='string' || !/^[a-f0-9]{16}$/.test(m.id))throw Error();
+  const p=safePath(m.path);
+  // A play that arrives while a track is still marked playing, or while the DAVE
+  // session is momentarily not encrypted (e.g. someone joined/left the VC in the
+  // idle gap after a skip) replaces/waits instead of killing the whole engine.
+  if(playingId)stopTrack();
+  playingId=m.id;userPaused=false;
+  const begin=()=>{
+   if(ending || playingId!==m.id)return;
+   stream=fs.createReadStream(p);stream.on('error',()=>fail('MEDIA_READ_FAILED'));
+   resource=v.createAudioResource(stream,{inputType:v.StreamType.WebmOpus});
+   player=v.createAudioPlayer({behaviors:{noSubscriber:v.NoSubscriberBehavior.Stop}});
+   player.on('error',()=>fail('PLAYER_FAILED'));
+   player.on('stateChange',(old,s)=>{
+    if(s.status===v.AudioPlayerStatus.Playing && playingId)out({type:'playing',id:playingId});
+    if(old.status!==v.AudioPlayerStatus.Idle && s.status===v.AudioPlayerStatus.Idle && playingId)stopTrack(true);
+   });
+   connection.subscribe(player);player.play(resource);
+  };
+  if(encrypted(connection))begin();
+  else waitEncrypted(connection,{timeoutMs:6000}).then(begin).catch(()=>{if(!ending && playingId===m.id){playingId=null;out({type:'play_failed',id:m.id});}});
  }else if(m.type==='pause' || m.type==='resume'){
   if(!player || !playingId) return out({type:'control',id:m.id,ok:false});
   userPaused=m.type==='pause';
