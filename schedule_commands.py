@@ -48,19 +48,30 @@ def _strip_lead(text):
 class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
-        self.pending={};self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
+        self.pending={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
     def key(self,message):return message.guild.id,message.channel.id,message.author.id
-    def followup(self,message,text):
+    def pending_item(self,message):
         now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
         item=self.pending.get(self.key(message))
         ref=getattr(message,'reference',None)
-        return bool(item and (ref is None or getattr(ref,'message_id',None)==item[1]) and re.fullmatch(r'(?:(?:haan?|ha|okay|ok|yes)\s+)?(?:haan?|ha|okay|ok|confirm|yes|isi channel mein(?: dena)?|same channel|yahi(?: channel)?)[ .!]*',text,re.I))
+        if item and ref is not None and getattr(ref,'message_id',None)!=item[1]:return None
+        return item
+    def followup(self,message,text,addressed=True):
+        """A reply to our own clarification (same guild/channel/author, within
+        2 minutes). Anything said then goes to the intent step with the original
+        request; the model may say it is unrelated and normal chat continues."""
+        item=self.pending_item(message)
+        if not item:return False
+        ref=getattr(message,'reference',None)
+        return ref is not None or bool(addressed)
     async def reply(self,message,text):
         return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
-    async def clarify(self,message):
-        sent=await self.reply(message,'Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene')
+    async def clarify(self,message,text='Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene',request=None,anchor=None):
+        """Ask a short question and remember the ORIGINAL request text and its
+        message time, so the user's answer completes that request."""
+        sent=await self.reply(message,text)
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
-        self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None))
+        self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
 
     def tag_names(self,text,guild):
         """'tagging X' / 'tag X, Y' -> (<@id> strings, text without them).
@@ -179,6 +190,107 @@ class Commands:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
         return True
 
+    async def ai_request(self,message,text,client):
+        """The model only UNDERSTANDS the request (structured intent). Every
+        effect is decided here: time via tm.parse_time against the ORIGINAL
+        message time, targets resolved to real members, same channel unless a
+        native #channel mention is in the user's own text, and nothing is
+        confirmed to the user before the job is on disk."""
+        self.client_for_access=client
+        item=self.pending_item(message)
+        orig,anchor=(item[2],item[3]) if item else (None,None)
+        anchor=anchor or getattr(message,'created_at',None)
+        request=(orig+'\n'+text) if orig else text
+        if anchor is None:
+            await self.reply(message,'Original message ka time verify nahi hua; kuch save nahi hua.');return True
+        intent=None
+        if self.intent is not None:
+            try:intent=await self.intent(orig,text,anchor)
+            except Exception:intent=None
+        if self.intent is None:
+            await self.clarify(message,request=request,anchor=anchor);return True
+        if not isinstance(intent,dict) or intent.get('action') not in ('remind','need_info','none'):
+            await self.clarify(message,'Abhi samajh nahi paayi, reminder save nahi hua. Time aur kya yaad dilana hai ek line mein likho.',request,anchor);return True
+        action=intent['action']
+        if action=='none':return False
+        if action=='need_info':
+            q=intent.get('question')
+            q=' '.join(q.split())[:150] if isinstance(q,str) and q.strip() else 'Kab aur kya?'
+            q=re.sub(r'<[@#]|@(?:everyone|here)','',q)
+            await self.clarify(message,q,request,anchor);return True
+        try:
+            when,task=intent.get('when'),intent.get('task')
+            names=intent.get('tag_names') or []
+            if not isinstance(when,str) or not isinstance(task,str) or not isinstance(names,list) or len(names)>5:raise TypeError
+            when=' '.join(when.split());task=' '.join(task.split()).strip(' .,!')
+            if not task or not when or len(when)>40:
+                await self.clarify(message,'Kab aur kya? Time aur reminder ka kaam ek line mein likho.',request,anchor);return True
+            if not re.fullmatch(r'\d{4}-\d{2}-\d{2}\s+\S+',when):
+                # the model may not invent a time the user never wrote
+                have={int(n) for n in re.findall(r'\d+',request)}
+                if any(int(n) not in have for n in re.findall(r'\d+',when)):
+                    await self.clarify(message,'Time clearly samajh nahi aaya. Kab chahiye? Jaise: aaj 3:30 PM',request,anchor);return True
+            dests=re.findall(r'<#(\d+)>',request)
+            if len(dests)>1:raise ValueError('Ek hi destination channel do.')
+            dest=f'<#{dests[0]}>' if dests else 'here'
+            targets=[str(message.author.id)]
+            targets+=re.findall(r'<@!?(\d+)>',request)
+            for name in names:
+                if not isinstance(name,str) or not name.strip() or len(name)>40:raise TypeError
+                member=self.resolver(message.guild,name.strip().lstrip('@'))[0]
+                if member is None or member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
+                targets.append(str(member.id))
+            targets=list(dict.fromkeys(targets))
+            if len(targets)==1 and intent.get('tag_author',True) is not False:
+                parts=[when,dest,task];kind='remind'
+            else:
+                parts=[when,dest,', '.join(f'<@{t}>' for t in targets),task];kind='schedule'
+            await self._commit(message,client,kind,parts,time.time(),anchor)
+            self.pending.pop(self.key(message),None)
+        except (ValueError,TypeError) as exc:
+            self.pending.pop(self.key(message),None)
+            await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
+        except OSError:
+            await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
+        return True
+
+    async def _commit(self,message,client,kind,parts,now,anchor):
+        guild=message.guild
+        reminder=kind=='remind'
+        if reminder and len(parts)==4:kind='schedule'
+        when,destination=parts[:2]
+        if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
+        due=tm.parse_time(when,anchor)
+        if due<=now:raise ValueError('Time nikal gaya; naya time do.')
+        if destination.casefold()=='here':dest=message.channel
+        elif re.fullmatch(r'<#\d+>',destination):dest=guild.get_channel(int(destination[2:-1]))
+        else:raise ValueError('Destination here ya ek native #text-channel mention hona chahiye.')
+        if dest is None:raise ValueError('Destination is server mein verify nahi hua.')
+        targets=[]
+        if kind=='remind':targets=[message.author];body=parts[2]
+        else:
+            raw_targets=parts[2]
+            body='VC join kar lo, creator ne is time par bulaya hai.' if kind=='summon' else parts[3]
+            if raw_targets.casefold() not in ('none','koi nahi'):
+                for raw in re.split(r'\s*,\s*|\s+aur\s+|\s+and\s+',raw_targets):
+                    native=re.fullmatch(r'<@!?(\d+)>',raw)
+                    member=guild.get_member(int(native[1])) if native else self.resolver(guild,raw)[0]
+                    if member is None or member.bot:raise ValueError('Target unclear/bot/left: exact username ya native member mention do.')
+                    if member.id not in [t.id for t in targets]:targets.append(member)
+        if len(targets)>5:raise ValueError('Maximum 5 targets, ek hi scheduled ping per job.')
+        if not body or len(body)>1000:raise ValueError('Exact message 1-1000 characters ka do.')
+        if re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
+            raise ValueError('Payload mein mention/command markers nahi; tags sirf target field se do.')
+        core=None
+        if reminder:core=body;body=f'Reminder: {body}'
+        full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
+        draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core)
+        tm.access(client,draft)
+        self.store.create(**draft,now=now,armed=True)
+        self.pending.pop(self.key(message),None)
+        await self.reply(message,'OK')
+
+
     async def handle(self,message,text,client,guard):
         self.client_for_access=client
         # Guard command/header, not literal payload (quotes in a user-authored
@@ -189,8 +301,8 @@ class Commands:
         if not m and getattr(message,'reference',None) is not None and REPEAT.search(text):
             return await self.repeat(message,text)
         if not m:
-            if INTENT.search(text) or self.followup(message,text):
-                await self.clarify(message);return True
+            if INTENT.search(text) or self.pending_item(message):
+                return await self.ai_request(message,text,client)
             return False
         kind,rest=m[1].lower(),m[2].strip()
         if kind=='reminder':kind='remind'
@@ -230,44 +342,18 @@ class Commands:
             if len(parts)!=(3 if kind in ('remind','summon') else 4):
                 found=self.natural_parts(kind,rest,message)
                 if found is None:
-                    await self.clarify(message);return True
+                    return await self.ai_request(message,text,client)
                 parts=found
-            reminder=kind=='remind'
-            if reminder and len(parts)==4:kind='schedule'
-            when,destination=parts[:2]
-            anchor=getattr(message,'created_at',None)
-            if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
-            due=tm.parse_time(when,anchor)
-            if due<=now:raise ValueError('Time nikal gaya; naya time do.')
-            if destination.casefold()=='here':dest=message.channel
-            elif re.fullmatch(r'<#\d+>',destination):dest=guild.get_channel(int(destination[2:-1]))
-            else:raise ValueError('Destination here ya ek native #text-channel mention hona chahiye.')
-            if dest is None:raise ValueError('Destination is server mein verify nahi hua.')
-            targets=[]
-            if kind=='remind':targets=[message.author];body=parts[2]
-            else:
-                raw_targets=parts[2]
-                body='VC join kar lo, creator ne is time par bulaya hai.' if kind=='summon' else parts[3]
-                if raw_targets.casefold() not in ('none','koi nahi'):
-                    for raw in re.split(r'\s*,\s*|\s+aur\s+|\s+and\s+',raw_targets):
-                        native=re.fullmatch(r'<@!?(\d+)>',raw)
-                        member=guild.get_member(int(native[1])) if native else self.resolver(guild,raw)[0]
-                        if member is None or member.bot:raise ValueError('Target unclear/bot/left: exact username ya native member mention do.')
-                        if member.id not in [t.id for t in targets]:targets.append(member)
-            if len(targets)>5:raise ValueError('Maximum 5 targets, ek hi scheduled ping per job.')
-            if not body or len(body)>1000:raise ValueError('Exact message 1-1000 characters ka do.')
-            if re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
-                raise ValueError('Payload mein mention/command markers nahi; tags sirf target field se do.')
-            core=None
-            if reminder:core=body;body=f'Reminder: {body}'
-            full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
-            draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core)
-            tm.access(client,draft)
-            self.store.create(**draft,now=now,armed=True)
-            self.pending.pop(self.key(message),None)
-            await self.reply(message,'OK')
+            await self._commit(message,client,kind,parts,now,getattr(message,'created_at',None))
         except (ValueError,TypeError) as exc:
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch arm nahi hua.')
         except OSError:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
         return True
+
+
+_PROMISE=re.compile(r"\b(?:i(?:'ll| will)|main|mai)\b[^.\n]{0,40}\b(?:remind|yaad\s+dila)|\b(?:set|laga\w*|save\w*)\b[^.\n]{0,20}\breminder\b|\breminder\b[^.\n]{0,20}\b(?:set|laga\s?(?:di|diya|dungi)|save)",re.I)
+def false_promise(user_text,reply):
+    """A chat reply that promises a reminder in a turn where no job was saved."""
+    return bool(re.search(r'remind|yaad\s+dila|schedule',user_text or '',re.I) and _PROMISE.search(reply or ''))
+NOT_SAVED='Reminder save nahi hua. Time aur kya yaad dilana hai ek line mein likho, jaise: Kristy remind me 10 min baad pani peene'
