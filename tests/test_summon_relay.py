@@ -305,14 +305,14 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(m.reply.call_args.kwargs['allowed_mentions'].everyone)
 
     async def test_natural_reminder_and_samechannel_never_fallthrough_brain(self):
-        m=self.msg('Kristy reminder laga do 9:20 PM ka');m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
+        m=self.msg('Kristy reminder laga do 9:20 PM ka');m.created_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc);m.attachments=[];m.stickers=[];m.embeds=[];m.reference=None
         m.reply.return_value=types.SimpleNamespace(id=444)
         self.bot.client.music=None
-        with patch.object(self.bot,'think',new_callable=AsyncMock) as brain:
+        with patch.object(self.bot,'think',new_callable=AsyncMock) as brain, patch.object(self.bot,'call_extractor',new=AsyncMock(side_effect=RuntimeError('down'))):
             await self.bot.on_message(m)
             follow=self.msg('haan isi channel mein dena');follow.attachments=[];follow.stickers=[];follow.embeds=[];follow.reference=types.SimpleNamespace(message_id=444,resolved=None)
             await self.bot.on_message(follow)
-        brain.assert_not_awaited();self.assertIn('Kab aur kya',follow.reply.call_args.args[0])
+        brain.assert_not_awaited();self.assertIn('save nahi hua',follow.reply.call_args.args[0])
 
     async def test_roster_quote_and_forward_not_read(self):
         for text in ('Kristy `VC mein kaun hai?`', '> Kristy VC mein kaun hai?'):
