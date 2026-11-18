@@ -642,7 +642,7 @@ SEARCH_RE = re.compile(
     r"|\b(?:try|please|can\s+you|could\s+you)\s+(?:search|google|look\s+up)\b"
     r"|\bpata\s+kar(o|ke|na)?\b|\bsearch\s+(?:kar|karo|karke|kar\s+do)\b"
     r"|\b(latest|current|new|next|upcoming)\s+(news|updates?|patch|version|banners?|"
-    r"characters?|regions?|events?|codes?|meta|leaks?|livestream)\b"
+    r"characters?|regions?|events?|codes?|meta|leaks?|livestream|lineup)\b"
     r"|\b(latest|current|new|next|upcoming)\s+(genshin\s+)?(version|patch|banner|update|leak|news)\b"
     r"|\b(?:upcoming|future|next|coming|leaks?)\b.{0,50}\b(?:genshin|version|v?\d+\.\d+|patch|banner|update)\b"
     r"|\b(?:upcoming|future|next|coming)\b.{0,40}\b(?:v?\d+\.\d+(?:\.\d+)?|version|patch)\b"
@@ -653,6 +653,9 @@ SEARCH_RE = re.compile(
     r"|\b(?:genshin\s+)?(?:version|patch)\s*v?\d+\.\d+(?:\.\d+)?\b"
     r"|\b(?:in|for)\s+v?\d+\.\d+(?:\.\d+)?\b"
     r"|\bbanners?\s+(schedule|kab|kb)\b|\bmeta\s+(rn|right\s+now|abhi)\b"
+    r"|\b(kaun\s*sa|kaun\s*si|konsa|konsi)\b.{0,25}\b(banners?|updates?|patches|versions?|events?|leaks?|meta|lineup|codes?|drip)\b"
+    r"|\b(banners?|updates?|patches|versions?|events?|leaks?|meta|lineup|drip)\b.{0,25}\b(chal\s+rah[ai]|aa\s+rah[ai]|aaya|aayi)\b"
+    r"|\bv?\d+\.\d+(?:\.\d+)?\b.{0,30}\b(aa\s+rah[ai]|aayega|aayegi)\b"
     r"|\b(genshin\s+)?(news|leaks?|updates?)\s+(bata|batao|kya|suna|suno|dikha)\b"
     r"|\bkab\s+(release|launch|aayega|aayegi|ayega|ayegi|hoga|hogi|aa\s+raha|aa\s+rahi)\b"
     r"|\brelease\s+date\b|\bredeem\s+codes?\b|\bpromo\s+codes?\b"
@@ -671,10 +674,22 @@ _SEARCH_GUIDE_WORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A first-person status update ("build kar raha hu apna hutao") is not a
+# request: don't spend a forced web search on it. Anything question-shaped
+# still routes normally, and the model-driven [[search:]] marker fallback is
+# untouched - the model can always still choose to search.
+_FIRST_PERSON_PROGRESSIVE_RE = re.compile(
+    r"\b(?:kar|bana)\s+rah[ai]\s+h(?:u|oon|un)\b", re.IGNORECASE)
+_QUESTIONISH_RE = re.compile(
+    r"\?|\bkya\b|\bbata(?:o|iye|na)?\b|\bkaun|\bkons[ai]\b|\bkaise\b|\bsuggest",
+    re.IGNORECASE)
+
 def looks_like_search(text):
     t = text or ""
     if SEARCH_RE.search(t):
         return True
+    if _FIRST_PERSON_PROGRESSIVE_RE.search(t) and not _QUESTIONISH_RE.search(t):
+        return False
     if _SEARCH_GUIDE_WORDS_RE.search(t) and (
         _GENSHIN_TOPIC_RE.search(t) or detect_character_mention(t)
     ):
@@ -1695,8 +1710,9 @@ async def gemini_generate(payload, url=GEMINI_URL, validate=None):
     # provider's implicit prefix cache absorbing the static prompt?
     usage = data.get("usageMetadata") if isinstance(data, dict) else None
     if usage:
-        log.info("Gemini usage: in=%s out=%s cached=%s",
+        log.info("Gemini usage: in=%s out=%s think=%s cached=%s",
                  usage.get("promptTokenCount"), usage.get("candidatesTokenCount"),
+                 usage.get("thoughtsTokenCount", 0),
                  usage.get("cachedContentTokenCount", 0))
     return data
 
