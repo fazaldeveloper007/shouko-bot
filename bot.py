@@ -1808,6 +1808,77 @@ async def _proactive_opener(history_lines):
     return text[:400]
 
 
+_proactive_inflight = set()  # pending keys currently being processed (loop or event kick)
+
+
+async def _proactive_answer_pending(ch, p, label):
+    """AI verdict -> strict recheck -> one post for a single due pending.
+
+    Shared by the 60s scheduler and the zero-grace event kick, so both
+    paths apply exactly the same guards. Returns True when she posted."""
+    key = f"{p['channel_id']}:{p['author_id']}"
+    if key not in _proactive.state["pending"]:
+        return False  # cancelled or answered since it was picked up
+    hist = [f"{a}: {c}" for a, _id, c in list(history.get(ch.id, []))[-15:]]
+    verdict = await _proactive_decide(p["content"], str(p["author_id"]), hist)
+    if not verdict or verdict["answered"] or not verdict["can_help"] or not verdict["reply"]:
+        reason = ("undecidable" if not verdict else
+                  "already answered" if verdict["answered"] else
+                  "cannot help" if not verdict["can_help"] else "empty reply")
+        log.info("proactive: pending %s dropped (%s)", key, reason)
+        _proactive.drop(key)  # answered, unhelpable, or undecidable: let it go
+        return False
+    # final rechecks right before speaking: a reply may have landed, or the
+    # pending may have been cancelled, while the AI was thinking
+    try:
+        recent = [m async for m in ch.history(limit=10)]
+    except Exception:
+        recent = []
+    if any(getattr(getattr(m, "reference", None), "message_id", None) == p["message_id"]
+           for m in recent):
+        log.info("proactive: pending %s dropped (answered while deciding)", key)
+        _proactive.drop(key)
+        return False
+    if key not in _proactive.state["pending"]:
+        log.info("proactive: pending %s dropped (cancelled while deciding)", key)
+        return False
+    text = verdict["reply"]
+    if proactive.MENTIONS:
+        text = f"<@{p['author_id']}> " + text
+    try:
+        await ch.send(text, allowed_mentions=discord.AllowedMentions(
+            users=proactive.MENTIONS, everyone=False, roles=False))
+        _proactive.mark_posted(ch.id, key)
+        log.info("proactive: posted help in #%s", label)
+        return True
+    except Exception:
+        log.exception("proactive: send failed in #%s", label)
+        _proactive.drop(key)
+        return False
+
+
+async def _proactive_kick(ch, label):
+    """Zero-grace path: a fresh help bid is eligible immediately, so process
+    it now instead of waiting for the next scheduler tick. Same guards as
+    the loop (enabled, quiet hours, caps/cooldown, verdict, rechecks); the
+    60s loop stays on as the fallback sweeper for anything a kick missed."""
+    if not proactive.ENABLED or _proactive is None:
+        return
+    if _proactive.quiet_now() or not _proactive.allowed_today(ch.id):
+        return
+    for p in _proactive.due(ch.id):
+        key = f"{p['channel_id']}:{p['author_id']}"
+        if key in _proactive_inflight:
+            continue
+        _proactive_inflight.add(key)
+        try:
+            await _proactive_answer_pending(ch, p, label)
+        except Exception:
+            log.exception("proactive: kick failed for pending %s", key)
+        finally:
+            _proactive_inflight.discard(key)
+
+
 async def _proactive_loop():
     """Once a minute: due pendings -> AI verdict -> strict recheck -> one post."""
     await client.wait_until_ready()
@@ -1823,38 +1894,16 @@ async def _proactive_loop():
                     # consume the daily cap/cooldown ahead of a real asker
                     for p in _proactive.due(ch.id):
                         key = f"{p['channel_id']}:{p['author_id']}"
-                        hist = [f"{a}: {c}" for a, _id, c in list(history.get(ch.id, []))[-15:]]
-                        verdict = await _proactive_decide(p["content"], str(p["author_id"]), hist)
-                        if not verdict or verdict["answered"] or not verdict["can_help"] or not verdict["reply"]:
-                            reason = ("undecidable" if not verdict else
-                                      "already answered" if verdict["answered"] else
-                                      "cannot help" if not verdict["can_help"] else "empty reply")
-                            log.info("proactive: pending %s dropped (%s)", key, reason)
-                            _proactive.drop(key)  # answered, unhelpable, or undecidable: let it go
-                            continue
-                        # final recheck right before speaking: a reply may have
-                        # landed while the AI was thinking
+                        if key in _proactive_inflight:
+                            continue  # the event kick is already processing it
+                        _proactive_inflight.add(key)
                         try:
-                            recent = [m async for m in ch.history(limit=10)]
+                            if await _proactive_answer_pending(ch, p, label):
+                                posted = True
                         except Exception:
-                            recent = []
-                        if any(getattr(getattr(m, "reference", None), "message_id", None) == p["message_id"]
-                               for m in recent):
-                            log.info("proactive: pending %s dropped (answered while deciding)", key)
-                            _proactive.drop(key)
-                            continue
-                        text = verdict["reply"]
-                        if proactive.MENTIONS:
-                            text = f"<@{p['author_id']}> " + text
-                        try:
-                            await ch.send(text, allowed_mentions=discord.AllowedMentions(
-                                users=proactive.MENTIONS, everyone=False, roles=False))
-                            _proactive.mark_posted(ch.id, key)
-                            posted = True
-                            log.info("proactive: posted help in #%s", label)
-                        except Exception:
-                            log.exception("proactive: send failed in #%s", label)
-                            _proactive.drop(key)
+                            log.exception("proactive: pending %s processing failed", key)
+                        finally:
+                            _proactive_inflight.discard(key)
                     if posted:
                         continue  # one post per channel per cycle
                     # quiet-channel opener: one conversation starter after a long idle
@@ -2390,6 +2439,11 @@ async def on_message(message):
         stored = f"{reply_hint(message)} {stored_text(message, content)}".strip()[:300]
         record_message(message.channel.id, message.author.display_name, message.author.id, stored)
 
+    roster_followup = (action_text(message, content, question=True) is not None
+                       and _roster_clarifications.matches(message))
+    schedule_followup = (action_text(message, content, question=True) is not None
+                         and _schedule_commands.followup(message, _addressed_text(content), should_respond(message)))
+
     # Proactive unanswered-help tracking (allowed channels only, default OFF):
     # this message cancels pendings it actually addresses, then may itself
     # become a pending help bid. Hard rules live in proactive.py.
@@ -2398,14 +2452,16 @@ async def on_message(message):
             reply_to = getattr(getattr(message, "reference", None), "message_id", None)
             _proactive.cancel_if_addressed(message.channel.id, message.author.id, reply_to)
             _proactive.note_activity(message.channel.id)
-            _proactive.track(message.channel.id, message.id, message.author.id, content)
+            if _proactive.track(message.channel.id, message.id, message.author.id, content):
+                # Zero intentional wait: a fresh bid is eligible right away,
+                # unless this message is about to get her direct reply.
+                if (proactive.GRACE_MINUTES == 0 and not roster_followup
+                        and not schedule_followup and not should_respond(message)):
+                    _label = next((l for l, c in _proactive_channels.items()
+                                   if c.id == message.channel.id), str(message.channel.id))
+                    asyncio.create_task(_proactive_kick(message.channel, _label))
         except Exception:
             log.warning("proactive: tracking failed in channel %s", message.channel.id)
-
-    roster_followup = (action_text(message, content, question=True) is not None
-                       and _roster_clarifications.matches(message))
-    schedule_followup = (action_text(message, content, question=True) is not None
-                         and _schedule_commands.followup(message, _addressed_text(content), should_respond(message)))
     if roster_followup or schedule_followup or should_respond(message):
         # A direct trigger supersedes every pending continuation window in
         # this channel; her reply below arms a fresh one if it asks something.
