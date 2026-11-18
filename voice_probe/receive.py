@@ -16,6 +16,21 @@ from dotenv import load_dotenv
 from music.transport import Bridge, VoiceFailure
 
 
+class ProbeError(RuntimeError):
+    """Fixed public reason code; never carries exception text or credentials."""
+    pass
+
+
+def report_error(error, stage):
+    code = str(error) if isinstance(error, ProbeError) else {
+        discord.LoginFailure: "DISCORD_LOGIN_REJECTED",
+        discord.PrivilegedIntentsRequired: "DISCORD_INTENTS_REJECTED",
+        FileNotFoundError: "NODE_NOT_FOUND",
+        asyncio.TimeoutError: "TIMEOUT",
+    }.get(type(error), "UNEXPECTED_" + type(error).__name__)
+    print(f"PROBE_ERROR stage={stage} code={code}", flush=True)
+
+
 def worker_env():
     allowed = ('PATH', 'HOME', 'TMPDIR', 'PREFIX', 'LD_LIBRARY_PATH', 'LD_PRELOAD')
     return {k: os.environ[k] for k in allowed if k in os.environ}
@@ -129,24 +144,50 @@ async def console_line():
 
 async def run(requester, guild_id=None):
     if not sys.stdin.isatty():
-        raise RuntimeError('Run manually in a terminal; piped/background input is disabled')
+        raise ProbeError('TERMINAL_REQUIRED')
+    print("PROBE_STAGE preflight (no Discord connection yet)", flush=True)
     check = await asyncio.create_subprocess_exec(
         'node', '-e', "require('@discordjs/voice');require('@snazzah/davey');require('opusscript')",
         cwd=pathlib.Path(__file__).parent, env=worker_env(), stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL)
-    if await asyncio.wait_for(check.wait(), 10) != 0:
-        print('STOP: probe dependencies missing. Run npm ci --ignore-scripts in voice_probe first.')
-        return
+    try:
+        status = await asyncio.wait_for(check.wait(), 10)
+    except BaseException:
+        if check.returncode is None:
+            check.kill()
+        await check.wait()
+        raise
+    if status != 0:
+        raise ProbeError('NODE_DEPENDENCIES_UNAVAILABLE')
     load_dotenv(ROOT / '.env')
     token = os.getenv('DISCORD_TOKEN', '')
     if not token:
-        raise RuntimeError('DISCORD_TOKEN missing from existing .env (do not paste it in chat)')
+        raise ProbeError('DISCORD_TOKEN_UNAVAILABLE')
     intents = discord.Intents.none()
     intents.guilds = True
     intents.voice_states = True
     client = discord.Client(intents=intents)
     launched = False
     bridge = None
+    cleaned = False
+    async def cleanup():
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        if bridge is None:
+            print('PROBE_JOIN_NOT_REQUESTED: this run made no VC join request; existing bot VC state is not asserted.', flush=True)
+        else:
+            left = False
+            try:
+                left = await bridge.disconnect(force=True)
+            except BaseException:
+                # No success claim on cleanup failure. Kill any remaining helper.
+                if bridge.p is not None and bridge.p.returncode is None:
+                    bridge.p.kill()
+                    await bridge.p.wait()
+            print('LEAVE_CONFIRMED' if left else 'LEAVE_UNCONFIRMED: manually disconnect bot from VC before restart.', flush=True)
+        await client.close()
 
     @client.event
     async def on_ready():
@@ -154,6 +195,7 @@ async def run(requester, guild_id=None):
         if launched:
             return  # no automatic recording/restart on reconnect
         launched = True
+        stage = "VC_SELECTION"
         try:
             candidates = []
             for guild in client.guilds:
@@ -175,14 +217,18 @@ async def run(requester, guild_id=None):
             print(f'Requester {requester}; guild {channel.guild.id}; channel {channel.id}.')
             print('No audio is saved, transcribed or sent to AI. Metrics only. Normal bot must be stopped.')
             print('Type START within 60s to join and receive YOUR voice for at most 20s. Anything else cancels.')
+            stage = 'AWAITING_MANUAL_START'
             if await asyncio.wait_for(console_line(), 60) != 'START':
                 return
             if not safe_members(channel, requester, client.user.id):
                 print('STOP: VC membership changed before start.')
                 return
+            stage = 'VC_JOIN_AFTER_START'
+            print('PROBE_STAGE VC_JOIN_AFTER_START', flush=True)
             bridge = ProbeBridge(client, channel, requester)
             await channel.connect(cls=lambda c, ch: bridge, timeout=25, reconnect=False,
                                   self_deaf=False, self_mute=True)
+            stage = 'RECEIVING'
             print('RECEIVE READY: speak now. Type STOP + Enter (or Ctrl+C) to end early; auto-stop in 20s.')
             stop = asyncio.create_task(console_line())
             try:
@@ -199,19 +245,16 @@ async def run(requester, guild_id=None):
                 stop.cancel()
                 await asyncio.gather(stop, return_exceptions=True)
         except asyncio.TimeoutError:
-            print('STOP: timeout; no retry. Check VC state before retrying manually.')
+            report_error(ProbeError('TIMEOUT'), stage)
         except Exception as error:
             # Exception type only: third-party exception text can contain auth/transport data.
-            print('STOP: probe failed (' + type(error).__name__ + '). No automatic retry.')
+            report_error(error, stage)
             if bridge is not None and bridge.result.done():
                 result = bridge.result.result()
                 print('RECEIVE_RESULT ' + json.dumps({k: result.get(k, 0) for k in
                       ('code', 'packets', 'samples', 'nonzeroSamples', 'peak')}))
         finally:
-            if bridge is not None:
-                left = await bridge.disconnect(force=True)
-                print('LEAVE_CONFIRMED' if left else 'LEAVE_UNCONFIRMED: manually disconnect bot from VC before restart.')
-            await client.close()
+            await cleanup()
             print('Test ended; decoder released, no audio files created. Restart your normal bot.')
 
     @client.event
@@ -223,11 +266,10 @@ async def run(requester, guild_id=None):
                 except Exception:
                     pass
     try:
+        print('PROBE_STAGE DISCORD_LOGIN (voice join remains gated by START)', flush=True)
         await asyncio.wait_for(client.start(token, reconnect=False), 120)
     finally:
-        if bridge is not None:
-            await bridge.disconnect(force=True)
-        await client.close()
+        await cleanup()
 
 
 if __name__ == '__main__':
@@ -240,5 +282,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('Stopped manually; restart your normal bot after checking it left VC.')
     except Exception as error:
-        print('Probe did not start (' + type(error).__name__ + '). No retry.')
+        report_error(error, 'STARTUP_OR_GATEWAY')
+        print('No automatic retry. If no VC_JOIN_AFTER_START line appeared, this run did not request a VC join. Check existing VC state manually before restarting.')
         sys.exit(1)
