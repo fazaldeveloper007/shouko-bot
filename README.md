@@ -17,7 +17,11 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
   game results, ...) go into her memory as context - she never replies to bots, so no loops.
   Reply to any message (a bot's too) and ask her about it and she reads that message's text,
   embeds and images; forwarded messages work the same way. Late-arriving link embeds are
-  folded into memory as they appear.
+  folded into memory as they appear. Embed images are fetched over https only, via Discord's
+  proxied URL when available. Animated content: PNG stickers are seen directly, APNG stickers
+  and GIFs are seen as their first frame (GIFs need `pip install pillow`; without it they stay
+  text markers), Lottie stickers stay name-only. Unsupported types (SVG etc.) are skipped as
+  images so they can never break a reply.
 - **Keeps speakers untangled in busy chats**: every remembered line carries its author's name,
   and replies are stored with a "[replying to NAME: ...]" note, so when several people talk
   at once she knows who said what and which message an answer belongs to.
@@ -156,12 +160,16 @@ likes, running jokes and things they asked her to remember. She uses it naturall
 ### Long-term channel memory (rolling recap)
 
 Beyond the live 20-message history, every line that falls out of history is buffered and,
-every 12 such lines, folded into a short AI-written recap per channel (`recap.py`,
-`memory/channel-recaps.json`). The recap rides along in her context, so she remembers earlier
-topics, jokes and shared media without a bigger prompt. One extra small AI call per 12
-overflowed messages; failures just retry later and never break chat. Recaps are per channel,
-so servers never see each other's memory. Chat lines - including other bots' posts - are
-always treated as data, never as instructions.
+every 12 such lines, folded into an AI-written recap per channel (`recap.py`,
+`memory/channel-recaps.json`, capped at 2400 chars per channel and 200 channels).
+The recap keeps attributed facts (who said/decided/shared what, media included), keeps the
+newer version when something is corrected, and is instructed never to store passwords, tokens
+or phone numbers. It rides along in her context, so she remembers earlier topics, jokes and
+shared media. Cost: one extra small AI call per 12 overflowed messages, plus ~2400 chars of
+prompt per reply; failures just retry later and never break chat. Recaps are per channel, so
+servers never see each other's memory. It builds forward from the moment of deploy - chat from
+before that is gone. Chat lines - including other bots' posts - are always treated as data,
+never as instructions.
 
 ## Web search (live answers)
 
