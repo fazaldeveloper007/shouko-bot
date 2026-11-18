@@ -1818,6 +1818,45 @@ async def _proactive_loop():
                 for label, ch in _proactive_channels.items():
                     if not _proactive.allowed_today(ch.id):
                         continue
+                    posted = False
+                    # pending questions come first: an opener must never
+                    # consume the daily cap/cooldown ahead of a real asker
+                    for p in _proactive.due(ch.id):
+                        key = f"{p['channel_id']}:{p['author_id']}"
+                        hist = [f"{a}: {c}" for a, _id, c in list(history.get(ch.id, []))[-15:]]
+                        verdict = await _proactive_decide(p["content"], str(p["author_id"]), hist)
+                        if not verdict or verdict["answered"] or not verdict["can_help"] or not verdict["reply"]:
+                            reason = ("undecidable" if not verdict else
+                                      "already answered" if verdict["answered"] else
+                                      "cannot help" if not verdict["can_help"] else "empty reply")
+                            log.info("proactive: pending %s dropped (%s)", key, reason)
+                            _proactive.drop(key)  # answered, unhelpable, or undecidable: let it go
+                            continue
+                        # final recheck right before speaking: a reply may have
+                        # landed while the AI was thinking
+                        try:
+                            recent = [m async for m in ch.history(limit=10)]
+                        except Exception:
+                            recent = []
+                        if any(getattr(getattr(m, "reference", None), "message_id", None) == p["message_id"]
+                               for m in recent):
+                            log.info("proactive: pending %s dropped (answered while deciding)", key)
+                            _proactive.drop(key)
+                            continue
+                        text = verdict["reply"]
+                        if proactive.MENTIONS:
+                            text = f"<@{p['author_id']}> " + text
+                        try:
+                            await ch.send(text, allowed_mentions=discord.AllowedMentions(
+                                users=proactive.MENTIONS, everyone=False, roles=False))
+                            _proactive.mark_posted(ch.id, key)
+                            posted = True
+                            log.info("proactive: posted help in #%s", label)
+                        except Exception:
+                            log.exception("proactive: send failed in #%s", label)
+                            _proactive.drop(key)
+                    if posted:
+                        continue  # one post per channel per cycle
                     # quiet-channel opener: one conversation starter after a long idle
                     if _proactive.opener_due(ch.id):
                         hist = [f"{a}: {c}" for a, _id, c in list(history.get(ch.id, []))[-15:]]
@@ -1831,35 +1870,6 @@ async def _proactive_loop():
                             except Exception:
                                 log.exception("proactive: opener send failed in #%s", label)
                                 _proactive.mark_posted(ch.id, f"opener:{ch.id}")  # don't retry-storm
-                            continue  # posted (or tried) an opener: help bids next cycle
-                    for p in _proactive.due(ch.id):
-                        key = f"{p['channel_id']}:{p['author_id']}"
-                        hist = [f"{a}: {c}" for a, _id, c in list(history.get(ch.id, []))[-15:]]
-                        verdict = await _proactive_decide(p["content"], str(p["author_id"]), hist)
-                        if not verdict or verdict["answered"] or not verdict["can_help"] or not verdict["reply"]:
-                            _proactive.drop(key)  # answered, unhelpable, or undecidable: let it go
-                            continue
-                        # final recheck right before speaking: a reply may have
-                        # landed while the AI was thinking
-                        try:
-                            recent = [m async for m in ch.history(limit=10)]
-                        except Exception:
-                            recent = []
-                        if any(getattr(getattr(m, "reference", None), "message_id", None) == p["message_id"]
-                               for m in recent):
-                            _proactive.drop(key)
-                            continue
-                        text = verdict["reply"]
-                        if proactive.MENTIONS:
-                            text = f"<@{p['author_id']}> " + text
-                        try:
-                            await ch.send(text, allowed_mentions=discord.AllowedMentions(
-                                users=proactive.MENTIONS, everyone=False, roles=False))
-                            _proactive.mark_posted(ch.id, key)
-                            log.info("proactive: posted help in #%s", label)
-                        except Exception:
-                            log.exception("proactive: send failed in #%s", label)
-                            _proactive.drop(key)
         except Exception:
             log.exception("proactive: loop error")
         await asyncio.sleep(60)
@@ -2678,6 +2688,13 @@ async def on_message(message):
         await try_reaction(message, reaction)
         # arm the continuation window only after the reply actually went out
         _continuity.note_bot_reply(message.channel.id, user_id, reply)
+        # her direct reply answers any pending help bid from this member here,
+        # so the proactive loop never double-answers it at the next tick
+        if _proactive is not None and message.channel.id in {c.id for c in _proactive_channels.values()}:
+            try:
+                _proactive.cancel_addressed_by_reply(message.channel.id, user_id, message.id)
+            except Exception:
+                log.warning("proactive: pending cancel failed in channel %s", message.channel.id)
         if _t_brain is not None:
             log.info("reply timing: channel=%s wait=%.1fs prep=%.1fs brain=%.1fs total=%.1fs",
                      message.channel.id, _t_wait, _t_prep - (_t0 + _t_wait),
