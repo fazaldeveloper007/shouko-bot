@@ -20,6 +20,7 @@ class StartupDiagnostics(unittest.IsolatedAsyncioTestCase):
     async def test_missing_token_is_named_without_login_or_secrets(self):
         stack = self.common()
         stack.enter_context(patch.dict(probe.os.environ, {}, clear=True))
+        stack.enter_context(patch.object(probe, 'normal_bot_dotenv', return_value=None))
         stack.enter_context(patch.object(probe.pathlib.Path, 'read_text', side_effect=FileNotFoundError))
         stack.enter_context(patch.object(probe.pathlib.Path, 'stat', side_effect=FileNotFoundError))
         client = stack.enter_context(patch.object(probe.discord, 'Client'))
