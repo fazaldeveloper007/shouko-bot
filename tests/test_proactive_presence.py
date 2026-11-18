@@ -145,6 +145,23 @@ class ProactiveRules(unittest.TestCase):
         t[0] += 2
         self.assertTrue(p2.allowed_today(10))
 
+    def test_grace_default_is_approved_5_minutes(self):
+        m = self.load()
+        self.assertEqual(m.GRACE_MINUTES, 5)
+
+    def test_opener_idle_clock(self):
+        m = self.load()
+        t = [1000.0]
+        p = m.Proactive(state=m.Proactive()._default(), now=lambda: t[0])
+        p.seed_activity(10)
+        self.assertFalse(p.opener_due(10))          # just booted: never an instant opener
+        t[0] += m.OPENER_IDLE_HOURS * 3600 - 1
+        self.assertFalse(p.opener_due(10))          # not yet
+        t[0] += 2
+        self.assertTrue(p.opener_due(10))           # idle long enough
+        p.note_activity(10)                          # human spoke: clock resets
+        self.assertFalse(p.opener_due(10))
+
     def test_quiet_hours_overnight_window(self):
         m = self.load()
         late = datetime.datetime(2026, 11, 18, 23, 30, tzinfo=m.IST)
