@@ -15,11 +15,14 @@ summarizer prompt says so, and the brain is told so too.
 
 import json
 import os
+import time
 from pathlib import Path
 
 RECAP_EVERY = 12       # overflowed lines between recap updates
-RECAP_MAX_CHARS = 900  # hard cap on the stored recap
+RECAP_MAX_CHARS = 2400 # hard cap on the stored recap: bounded, but room for
+                       # attributed facts instead of a thin gist
 PENDING_CAP = 30       # buffered lines kept if updates keep failing
+CHANNEL_CAP = 200      # stored channel recaps; least-recently-active evicted
 AUTHOR_CHARS = 40
 LINE_CHARS = 300
 
@@ -57,16 +60,31 @@ def get(channel_id):
     return text if isinstance(text, str) else ""
 
 
+def _evict():
+    """Bound disk/memory: keep only the CHANNEL_CAP most recently active channels."""
+    cache = _load()
+    if len(cache) <= CHANNEL_CAP:
+        return
+    def activity(item):
+        state = item[1]
+        return state.get("updated", 0) if isinstance(state, dict) else 0
+    for cid, _state in sorted(cache.items(), key=activity)[: len(cache) - CHANNEL_CAP]:
+        cache.pop(cid, None)
+
+
 def note(channel_id, author, line):
     """Buffer one line that fell out of live history.
 
     Returns True exactly when a recap update should be scheduled now.
     """
     cid = str(channel_id)
-    state = _load().setdefault(cid, {"recap": "", "pending": []})
+    cache = _load()
+    state = cache.setdefault(cid, {"recap": "", "pending": []})
+    state["updated"] = time.time()
     pending = state.setdefault("pending", [])
     pending.append([str(author)[:AUTHOR_CHARS], str(line)[:LINE_CHARS]])
     del pending[:-PENDING_CAP]
+    _evict()
     due = len(pending) >= RECAP_EVERY and cid not in _running
     if due or len(pending) % 5 == 0:
         _save()
@@ -85,6 +103,7 @@ async def update(channel_id, summarize):
     _running.add(cid)
     try:
         state = _load().setdefault(cid, {"recap": "", "pending": []})
+        state["updated"] = time.time()
         lines = state.get("pending") or []
         if not lines:
             return
