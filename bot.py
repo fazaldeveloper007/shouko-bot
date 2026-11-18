@@ -39,6 +39,7 @@ import logging
 import time
 import json
 import datetime as _dt
+from urllib.parse import urlsplit, urljoin
 from collections import defaultdict, deque
 
 import aiohttp
@@ -165,6 +166,9 @@ EMPTY_MESSAGE_PROMPT = "[sent a message with no text]"
 
 try:  # optional: lets her SEE a GIF's first frame instead of just its marker
     from PIL import Image as _PILImage
+    # Decompression-bomb guard: a tiny GIF can decode to huge pixels. Pillow
+    # raises DecompressionBombError past this; _gif_first_frame catches it.
+    _PILImage.MAX_IMAGE_PIXELS = 20_000_000
 except Exception:  # Pillow not installed: GIFs stay text markers, nothing breaks
     _PILImage = None
 
@@ -175,16 +179,63 @@ GEMINI_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp",
 _GIF_MAGICS = (b"GIF87a", b"GIF89a")
 
 
-def _https(url):
-    """Only https URLs are ever fetched: no plain-http or scheme tricks."""
-    return url if isinstance(url, str) and url.startswith("https://") else None
+def _safe_image_host(url):
+    """True only for Discord's own media hosts, over https.
+
+    https alone is no boundary: an attacker-controlled embed image URL could
+    point at localhost, a private IP or cloud metadata (SSRF). Only Discord's
+    CDN, media host and embed-image proxies are ever fetched, and redirects
+    may only stay inside this same allowlist.
+    """
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return False
+    host = (urlsplit(url).hostname or "").lower()
+    if host in ("cdn.discordapp.com", "media.discordapp.net"):
+        return True
+    return host.startswith("images-ext-") and host.endswith(".discordapp.net")
 
 
 def _embed_media_url(media):
-    """Discord's proxied URL first (stable, scanned host), else the raw https URL."""
+    """Discord's proxied URL first (stable, scanned host); a raw embed URL only
+    when it is itself on an allowlisted Discord host, else None (never fetched)."""
     if media is None:
         return None
-    return _https(getattr(media, "proxy_url", None)) or _https(getattr(media, "url", None))
+    for cand in (getattr(media, "proxy_url", None), getattr(media, "url", None)):
+        if _safe_image_host(cand):
+            return cand
+    return None
+
+
+async def _download_image(session, url):
+    """GET an allowlisted image URL: at most 2 redirects, each re-validated
+    against the allowlist, body streamed with a hard byte cap (resp.read()
+    would pull an unbounded body into memory). Returns (data, mime) or None."""
+    hops = 0
+    while url and hops <= 2:
+        try:
+            timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT)
+            async with session.get(url, timeout=timeout, allow_redirects=False) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    nxt = urljoin(url, resp.headers.get("Location") or "")
+                    url = nxt if _safe_image_host(nxt) else None
+                    hops += 1
+                    continue
+                if resp.status != 200:
+                    log.warning("Image download failed (HTTP %s): %s", resp.status, url)
+                    return None
+                mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                chunks, size = [], 0
+                async for chunk in resp.content.iter_chunked(65536):
+                    size += len(chunk)
+                    if size > MAX_IMAGE_BYTES:
+                        log.warning("Skipping oversized image (%d+ bytes): %s", size, url)
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks), mime
+        except Exception as e:
+            log.warning("Image download failed for %s: %s", url, e)
+            return None
+    return None
 
 
 def _gif_first_frame(data):
@@ -239,18 +290,22 @@ def _image_urls(message):
             log.warning("Skipping oversized attachment (%d bytes): %s",
                         att.size, getattr(att, "url", "?"))
             continue
-        add(_https(getattr(att, "url", None)), mime)
+        url = getattr(att, "url", None)
+        add(url if _safe_image_host(url) else None, mime)
     for embed in getattr(message, "embeds", None) or []:  # pasted links + other bots' cards
         add(_embed_media_url(getattr(embed, "image", None)), None)
         add(_embed_media_url(getattr(embed, "thumbnail", None)), None)
     for st in getattr(message, "stickers", None) or []:  # stickers aren't attachments
         fmt = getattr(getattr(st, "format", None), "name", "")
+        url = getattr(st, "url", None)
+        if not _safe_image_host(url):
+            continue
         if fmt == "png":
-            add(_https(getattr(st, "url", None)), "image/png")
+            add(url, "image/png")
         elif fmt == "apng":
-            add(_https(getattr(st, "url", None)), "image/apng")  # seen as its first frame
+            add(url, "image/apng")  # seen as its first frame
         elif fmt == "gif":
-            add(_https(getattr(st, "url", None)), "image/gif")   # first frame needs Pillow
+            add(url, "image/gif")   # first frame needs Pillow
         # Lottie stickers are vector JSON: no renderable frame, name-only in memory
     return urls
 
@@ -939,27 +994,19 @@ async def collect_image_parts(message, limit=None):
     if not urls:
         return parts
     session = await groq_session()
-    timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT)
     for url, mime in urls[:(limit or MAX_IMAGES)]:
-        try:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status != 200:
-                    log.warning("Image download failed (HTTP %s): %s", resp.status, url)
-                    continue
-                mime = mime or (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                data = await resp.read()
-                if len(data) > MAX_IMAGE_BYTES:
-                    log.warning("Skipping oversized image (%d bytes): %s", len(data), url)
-                    continue
-                final = _finalize_image(data, mime)
-                if final is None:
-                    log.warning("Skipping unsupported image (%s): %s", mime or "unknown type", url)
-                    continue
-                data, mime = final
-                parts.append({"inline_data": {"mime_type": mime,
-                                              "data": base64.b64encode(data).decode("ascii")}})
-        except Exception as e:
-            log.warning("Image download failed for %s: %s", url, e)
+        got = await _download_image(session, url)
+        if got is None:
+            continue
+        data, header_mime = got
+        final = _finalize_image(data, mime or header_mime)
+        if final is None:
+            log.warning("Skipping unsupported image (%s): %s",
+                        (mime or header_mime) or "unknown type", url)
+            continue
+        data, mime = final
+        parts.append({"inline_data": {"mime_type": mime,
+                                      "data": base64.b64encode(data).decode("ascii")}})
     return parts
 
 def extract_ping_request(text):
