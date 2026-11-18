@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import pathlib
+import shlex
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -142,6 +143,51 @@ async def console_line():
         loop.remove_reader(sys.stdin.fileno())
 
 
+def existing_token():
+    """Match documented launch env/.env, then literal Termux:Boot export only.
+
+    Never source/execute the boot script, interpolate shell expressions,
+    inspect other process environments, print or persist the credential.
+    """
+    load_dotenv(ROOT / '.env')
+    token = os.getenv('DISCORD_TOKEN', '').strip()
+    if token:
+        return token
+    boot = pathlib.Path.home() / '.termux/boot/start-shouko.sh'
+    try:
+        if boot.stat().st_size > 65536:
+            raise ProbeError('BOOT_SCRIPT_TOO_LARGE')
+        text = boot.read_text()
+    except FileNotFoundError:
+        raise ProbeError('EXISTING_TOKEN_SOURCE_NOT_FOUND') from None
+    except OSError:
+        raise ProbeError('BOOT_SCRIPT_UNREADABLE') from None
+    candidates = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith('export DISCORD_TOKEN=') or stripped.startswith('DISCORD_TOKEN=')):
+            continue
+        # Discord tokens are literal strings, not shell programs. Refuse dynamic
+        # values, chaining or continuation; do not attempt to repair/reconstruct.
+        if any(c in line for c in ('$', '`', ';', '|', '&', '<', '>', '\\')):
+            raise ProbeError('BOOT_TOKEN_ASSIGNMENT_NOT_LITERAL')
+        try:
+            words = shlex.split(stripped, comments=True, posix=True)
+        except ValueError:
+            raise ProbeError('BOOT_TOKEN_ASSIGNMENT_NOT_LITERAL') from None
+        if words and words[0] == 'export':
+            words = words[1:]
+        if len(words) != 1 or not words[0].startswith('DISCORD_TOKEN='):
+            raise ProbeError('BOOT_TOKEN_ASSIGNMENT_NOT_LITERAL')
+        value = words[0].partition('=')[2]
+        if not value or any(c.isspace() for c in value):
+            raise ProbeError('BOOT_TOKEN_ASSIGNMENT_NOT_LITERAL')
+        candidates.append(value)
+    if len(candidates) != 1:
+        raise ProbeError('BOOT_TOKEN_ASSIGNMENT_MISSING_OR_AMBIGUOUS')
+    return candidates[0]
+
+
 async def run(requester, guild_id=None, check_only=False):
     if not sys.stdin.isatty():
         raise ProbeError('TERMINAL_REQUIRED')
@@ -159,10 +205,7 @@ async def run(requester, guild_id=None, check_only=False):
         raise
     if status != 0:
         raise ProbeError('NODE_DEPENDENCIES_UNAVAILABLE')
-    load_dotenv(ROOT / '.env')
-    token = os.getenv('DISCORD_TOKEN', '')
-    if not token:
-        raise ProbeError('DISCORD_TOKEN_UNAVAILABLE')
+    token = existing_token()
     if check_only:
         print('PREFLIGHT_OK: terminal, Node modules and existing token available. No Discord login or voice join attempted.', flush=True)
         return
