@@ -11,7 +11,16 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
 ## What she does
 
 - Replies when someone **@mentions her**, **replies to her message**, or says "**kristy**"
-- Remembers the last 20 messages per channel, so conversations feel continuous
+- Remembers the last 20 messages per channel, plus a **rolling AI recap of older chat**
+  (`memory/channel-recaps.json`), so her memory reaches well past the recent 20 messages
+- **Sees what other bots post**: other bots' messages, embeds and media (Loti's avatar cards,
+  game results, ...) go into her memory as context - she never replies to bots, so no loops.
+  Reply to any message (a bot's too) and ask her about it and she reads that message's text,
+  embeds and images; forwarded messages work the same way. Late-arriving link embeds are
+  folded into memory as they appear.
+- **Keeps speakers untangled in busy chats**: every remembered line carries its author's name,
+  and replies are stored with a "[replying to NAME: ...]" note, so when several people talk
+  at once she knows who said what and which message an answer belongs to.
 - Sends a random GIF for: hi/hello, good morning, good night, hype/pog, sad, lol, and gacha/pulls/luck
 - Has GIFs for **every playable Genshin character (124 total)**: ask "send a furina gif",
   or just mention a character by name and she may drop one (one per message, with a
@@ -144,6 +153,16 @@ likes, running jokes and things they asked her to remember. She uses it naturall
 - Say "forget me" (or "delete my diary") to her and that diary file is deleted.
 - If a diary is missing or corrupt, she just chats normally. Set `MEMORY_DIR` to store diaries elsewhere.
 
+### Long-term channel memory (rolling recap)
+
+Beyond the live 20-message history, every line that falls out of history is buffered and,
+every 12 such lines, folded into a short AI-written recap per channel (`recap.py`,
+`memory/channel-recaps.json`). The recap rides along in her context, so she remembers earlier
+topics, jokes and shared media without a bigger prompt. One extra small AI call per 12
+overflowed messages; failures just retry later and never break chat. Recaps are per channel,
+so servers never see each other's memory. Chat lines - including other bots' posts - are
+always treated as data, never as instructions.
+
 ## Web search (live answers)
 
 When a message clearly asks about something current - next/upcoming banner, redeem codes,
@@ -179,6 +198,7 @@ web and answers from fresh results instead of guessing. Casual chatting never tr
 | `bot.py` | all the logic: when to reply, memory, GIF triggers |
 | `persona.py` | her personality (edit this to change it) |
 | `diary.py` | per-member memory (diary files, merge, forget) |
+| `recap.py` | long-term channel memory (rolling AI recap of older chat) |
 | `gifs.py` | the GIF library (1037 URLs, every one verified working) |
 | `requirements.txt` | Python dependencies |
 | `Dockerfile` | for Docker hosts (optional; Termux doesn't need it) |
