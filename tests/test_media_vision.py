@@ -27,6 +27,36 @@ def tiny_gif():
     return out.getvalue()
 
 
+class FakeResp:
+    """Minimal aiohttp response stand-in for _download_image tests."""
+
+    def __init__(self, status, headers, chunks=()):
+        self.status = status
+        self.headers = headers
+        self._chunks = list(chunks)
+        self.content = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def iter_chunked(self, n):
+        for c in self._chunks:
+            yield c
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def get(self, url, **kw):
+        self.calls.append(url)
+        return self._responses.pop(0)
+
+
 class MediaVision(unittest.IsolatedAsyncioTestCase):
     async def load(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -74,6 +104,69 @@ class MediaVision(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(m._embed_media_url(self.media(url='http://evil.example/x.png')))
         urls = m._image_urls(self.msg(attachments=[self.att('image/png', 'http://evil.example/x.png')]))
         self.assertEqual(urls, [])
+
+    # --- SSRF boundary: only Discord media hosts, bounded allowlisted redirects ---
+
+    async def test_host_allowlist(self):
+        m = await self.load()
+        self.assertTrue(m._safe_image_host('https://cdn.discordapp.com/attachments/1/2/x.png'))
+        self.assertTrue(m._safe_image_host('https://media.discordapp.net/stickers/1.png'))
+        self.assertTrue(m._safe_image_host('https://images-ext-1.discordapp.net/external/abc/x.png'))
+        for bad in ('https://tenor.com/x.gif',
+                    'https://169.254.169.254/latest/meta-data',
+                    'http://cdn.discordapp.com/x.png',            # plain http
+                    'https://cdn.discordapp.com.evil.com/x.png',  # lookalike suffix
+                    'https://images-ext-1.discordapp.net.evil.com/x.png',
+                    'https://localhost/x.png',
+                    'ftp://cdn.discordapp.com/x.png'):
+            self.assertFalse(m._safe_image_host(bad), bad)
+
+    async def test_raw_non_discord_embed_url_never_fetched(self):
+        m = await self.load()
+        # bot-built embed whose image URL is attacker-controlled, no proxy yet
+        media = self.media(url='https://tenor.com/view/x.gif', proxy=None)
+        self.assertIsNone(m._embed_media_url(media))
+        emb = types.SimpleNamespace(image=media, thumbnail=self.media(url=None))
+        self.assertEqual(m._image_urls(self.msg(embeds=[emb])), [])
+
+    async def test_download_follows_allowlisted_redirect_once(self):
+        m = await self.load()
+        sess = FakeSession([
+            FakeResp(302, {'Location': 'https://media.discordapp.net/x.png'}),
+            FakeResp(200, {'Content-Type': 'image/png'}, [b'\x89PNGdata']),
+        ])
+        got = await m._download_image(sess, 'https://cdn.discordapp.com/x.png')
+        self.assertEqual(got, (b'\x89PNGdata', 'image/png'))
+        self.assertEqual(len(sess.calls), 2)
+
+    async def test_download_rejects_redirect_off_allowlist(self):
+        m = await self.load()
+        sess = FakeSession([
+            FakeResp(302, {'Location': 'http://169.254.169.254/latest/meta-data'}),
+            FakeResp(200, {'Content-Type': 'text/plain'}, [b'secret']),
+        ])
+        got = await m._download_image(sess, 'https://cdn.discordapp.com/x.png')
+        self.assertIsNone(got)
+        self.assertEqual(len(sess.calls), 1)  # never fetched the redirect target
+
+    async def test_download_caps_streamed_body(self):
+        m = await self.load()
+        big = [b'x' * 65536] * (m.MAX_IMAGE_BYTES // 65536 + 2)
+        sess = FakeSession([FakeResp(200, {'Content-Type': 'image/png'}, big)])
+        self.assertIsNone(await m._download_image(sess, 'https://cdn.discordapp.com/big.png'))
+
+    async def test_gif_bomb_decode_failure_is_skipped(self):
+        m = await self.load()
+        if m._PILImage is None:
+            self.skipTest('Pillow not installed in this environment')
+        with patch.object(m._PILImage, 'open', side_effect=Exception('bomb')):
+            self.assertIsNone(m._gif_first_frame(tiny_gif()))
+
+    async def test_gif_decode_pixel_cap_set(self):
+        m = await self.load()
+        if m._PILImage is None:
+            self.skipTest('Pillow not installed in this environment')
+        self.assertEqual(m._PILImage.MAX_IMAGE_PIXELS, 20_000_000)
 
     async def test_image_urls_cover_attachment_embed_sticker(self):
         m = await self.load()
