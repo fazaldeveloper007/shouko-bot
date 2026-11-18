@@ -53,6 +53,7 @@ import retrying
 import self_diary
 import recap
 import proactive
+import continuity
 import voice_roster
 import timed_messages
 import schedule_commands
@@ -1698,6 +1699,11 @@ async def gemini_generate(payload, url=GEMINI_URL, validate=None):
 _proactive = None          # proactive.Proactive instance
 _proactive_channels = {}   # label -> discord channel (allowed set)
 
+# Conversation continuation (direct 1:1 only): when her reply ends with a
+# question, the asker's next message in that channel is treated as the
+# answer even without a name-drop. Hard fail-silent rules in continuity.py.
+_continuity = continuity.Continuity()
+
 PROACTIVE_DECIDE_PROMPT = (
     "A member of a Discord server asked something in a public channel and nobody "
     "has answered. Decide whether Kristy (a friendly server bot) should add her own "
@@ -2366,8 +2372,22 @@ async def on_message(message):
                        and _roster_clarifications.matches(message))
     schedule_followup = (action_text(message, content, question=True) is not None
                          and _schedule_commands.followup(message, _addressed_text(content), should_respond(message)))
-    if not roster_followup and not schedule_followup and not should_respond(message):
+    if roster_followup or schedule_followup or should_respond(message):
+        # A direct trigger supersedes every pending continuation window in
+        # this channel; her reply below arms a fresh one if it asks something.
+        _continuity.note_direct_trigger(message.channel.id, message.author.id)
+    elif _continuity.is_continuation(message.channel.id, message.author.id,
+                                     mentions_other=bool(message.mentions),
+                                     has_reference=message.reference is not None):
+        pass  # the pending answer from the member she just asked: reply normally
+    else:
+        # Not addressed to her - and interleaved chat voids pending windows.
+        _continuity.note_interruption(message.channel.id)
         return
+
+    # latency instrumentation: one log line per reply, no behavior change
+    _t0 = time.monotonic()
+    _t_wait = _t_prep = _t_brain = None
 
     music_context = client.music.context(message.channel) if client.music else ""
     user_id = message.author.id
@@ -2518,6 +2538,7 @@ async def on_message(message):
             # correctly-owned answers instead of duplicates or merges.
             lock_held = _channel_locks[message.channel.id]
             await lock_held.acquire()
+            _t_wait = time.monotonic() - _t0  # includes queueing behind another reply
             try:
                 async with retrying.request_scope(), message.channel.typing():
                     ref_has_image = ref_msg is not None and message_has_image(ref_msg)
@@ -2530,6 +2551,7 @@ async def on_message(message):
                         except Exception as e:
                             log.warning("Image collection failed: %s", e)
                             image_parts = []
+                    _t_prep = time.monotonic()  # reference/image fetch done; brain starts
                     try:
                         if looks_like_search(content):
                             search_error = None
@@ -2581,6 +2603,7 @@ async def on_message(message):
                         log.warning("AI brain error: class=%s status=%s reason=%s", type(e).__name__,
                                     getattr(e, "status", None), getattr(e, "reason", "local_error"))
                         reply = random.choice(FALLBACK_LINES)
+                    _t_brain = time.monotonic()
                     reply = MODEL_SEARCH_RE.sub("", reply or "").strip()
                     reaction, reply = extract_reaction(reply)
                     if not reply:
@@ -2629,6 +2652,12 @@ async def on_message(message):
         if gif_url:
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
         await try_reaction(message, reaction)
+        # arm the continuation window only after the reply actually went out
+        _continuity.note_bot_reply(message.channel.id, user_id, reply)
+        if _t_brain is not None:
+            log.info("reply timing: channel=%s wait=%.1fs prep=%.1fs brain=%.1fs total=%.1fs",
+                     message.channel.id, _t_wait, _t_prep - (_t0 + _t_wait),
+                     _t_brain - _t_prep, time.monotonic() - _t0)
     except Exception:
         log.exception("Failed to send reply in channel %s", message.channel.id)
 
