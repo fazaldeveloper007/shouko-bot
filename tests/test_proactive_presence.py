@@ -112,9 +112,15 @@ class ProactiveRules(unittest.TestCase):
         t = [1000.0]
         p = m.Proactive(state=m.Proactive()._default(), now=lambda: t[0])
         self.assertTrue(p.track(10, 100, 42, "best weapon for neuvillette?"))
-        self.assertEqual(p.due(10), [])
-        t[0] += m.GRACE_MINUTES * 60 + 1
-        self.assertEqual(len(p.due(10)), 1)
+        self.assertEqual(len(p.due(10)), 1)  # zero grace: due at the next tick
+        # the grace mechanism itself still works when configured
+        m5 = self.load({'PROACTIVE_GRACE_MINUTES': '5'})
+        p5 = m5.Proactive(state=m5.Proactive()._default(), now=lambda: t[0])
+        t[0] += 1
+        p5.track(10, 100, 42, "best weapon for neuvillette?")
+        self.assertEqual(p5.due(10), [])
+        t[0] += 5 * 60 + 1
+        self.assertEqual(len(p5.due(10)), 1)
 
     def test_cancel_only_on_real_address(self):
         m = self.load()
@@ -145,9 +151,19 @@ class ProactiveRules(unittest.TestCase):
         t[0] += 2
         self.assertTrue(p2.allowed_today(10))
 
-    def test_grace_default_is_approved_5_minutes(self):
+    def test_grace_default_is_zero(self):
         m = self.load()
-        self.assertEqual(m.GRACE_MINUTES, 5)
+        self.assertEqual(m.GRACE_MINUTES, 0)
+
+    def test_her_direct_reply_cancels_the_askers_pending(self):
+        m = self.load()
+        p = m.Proactive()
+        p.track(10, 100, 42, "best weapon for neuvillette?")
+        p.track(10, 101, 77, "koi team review karega?")
+        p.cancel_addressed_by_reply(10, 42, 100)
+        remaining = list(p.state["pending"].values())
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["author_id"], 77)
 
     def test_opener_idle_clock(self):
         m = self.load()
