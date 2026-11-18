@@ -39,6 +39,12 @@ The terminal shows the selected requester/guild/channel numeric IDs. Check them,
 
 After it ends, confirm Kristy left VC. If `LEAVE_UNCONFIRMED` appears, manually disconnect her before restarting the normal bot. Restart that bot using the usual command. No normal text/music code or settings are changed by the test.
 
+## Startup diagnostics
+
+Startup now prints fixed stages/reason codes, never raw third-party exception text. `TERMINAL_REQUIRED` means run directly in a terminal. `DISCORD_TOKEN_UNAVAILABLE` means the existing bot credential was not found in this process/root .env; do not paste or recreate credentials. Check how the normal bot loads its existing credential. `NODE_DEPENDENCIES_UNAVAILABLE` means the Node preflight could not load the installed modules. Unexpected errors show only their class and stage.
+
+No VC join is requested before terminal `START` and the `VC_JOIN_AFTER_START` marker. `PROBE_JOIN_NOT_REQUESTED` says only this run did not request a join, not that another bot process is absent. Any `LEAVE_UNCONFIRMED` requires manually checking/disconnecting the bot before restarting. Stop on a startup error and share only the fixed `PROBE_ERROR`/stage/leave lines. Do not repeatedly retry or share raw exception traces or .env.
+
 ## Reading the result
 
 Share only the `RECEIVE_RESULT` and leave-confirmation line, not `.env` or full gateway logs.
