@@ -16,6 +16,11 @@ from dotenv import load_dotenv
 from music.transport import Bridge, VoiceFailure
 
 
+def worker_env():
+    allowed = ('PATH', 'HOME', 'TMPDIR', 'PREFIX', 'LD_LIBRARY_PATH', 'LD_PRELOAD')
+    return {k: os.environ[k] for k in allowed if k in os.environ}
+
+
 def snowflake(value):
     if not value.isascii() or not value.isdigit() or not 15 <= len(value) <= 22:
         raise argparse.ArgumentTypeError('Expected a Discord numeric user ID')
@@ -42,8 +47,7 @@ class ProbeBridge(Bridge):
     async def connect(self, *, timeout, reconnect, self_deaf=False, self_mute=True):
         self.state = 'joining'
         self.future('voice_ready')
-        allowed = ('PATH', 'HOME', 'TMPDIR', 'PREFIX', 'LD_LIBRARY_PATH', 'LD_PRELOAD')
-        env = {k: os.environ[k] for k in allowed if k in os.environ}
+        env = worker_env()
         self.p = await asyncio.create_subprocess_exec(
             'node', str(pathlib.Path(__file__).with_name('worker.cjs')),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -128,7 +132,7 @@ async def run(requester, guild_id=None):
         raise RuntimeError('Run manually in a terminal; piped/background input is disabled')
     check = await asyncio.create_subprocess_exec(
         'node', '-e', "require('@discordjs/voice');require('@snazzah/davey');require('opusscript')",
-        cwd=pathlib.Path(__file__).parent, stdout=asyncio.subprocess.DEVNULL,
+        cwd=pathlib.Path(__file__).parent, env=worker_env(), stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL)
     if await asyncio.wait_for(check.wait(), 10) != 0:
         print('STOP: probe dependencies missing. Run npm ci --ignore-scripts in voice_probe first.')
