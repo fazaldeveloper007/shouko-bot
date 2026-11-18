@@ -264,13 +264,21 @@ and only if nobody answered does she add ONE short reply of her own - as
 herself, never pretending to be the person the question was addressed to. Any
 real answer (a reply to the message, or the asker following up) cancels it.
 
-Hard limits, all in `proactive.py`: 20-minute grace, 60-minute per-channel
-cooldown, max 3 posts per channel per day, quiet hours 23:00-08:00 IST, no
-@mentions unless `PROACTIVE_MENTIONS=1`, AI decides per case and stays quiet
-when it cannot genuinely help, a final re-check of the channel right before
-she speaks, and startup fails closed (feature disabled) if the Truth-Dare
-channel cannot be resolved to exactly one channel in the configured server.
-She never posts from private diary or memory - channel context only.
+Hard limits, all in `proactive.py`: 5-minute grace (Fazal-approved), 60-minute
+per-channel cooldown, max 3 posts per channel per day, quiet hours 23:00-08:00
+IST, no @mentions unless `PROACTIVE_MENTIONS=1`, AI decides per case and stays
+quiet when it cannot genuinely help, a final re-check of the channel right
+before she speaks, and startup fails closed (feature disabled) if the
+Truth-Dare channel cannot be resolved to exactly one channel in the configured
+server. She never posts from private diary or memory - channel context only.
+
+Same flag, second behavior: quiet-channel openers. If an allowed channel has
+no human message for 4+ hours during waking hours, she may start ONE
+conversation from that channel's recent public context - same shared 3/day
+cap, 1-hour gap and quiet hours, never any tags (mention strings are stripped
+even if the model tries). The idle clock starts at bot boot, so she never
+opens the moment she starts.
+
 `PROACTIVE_ENABLED` is unset/off by default; review the limits in
 `proactive.py` before turning it on.
 
