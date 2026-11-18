@@ -1689,8 +1689,16 @@ def usable_generation(text):
 
 async def gemini_generate(payload, url=GEMINI_URL, validate=None):
     session = await groq_session()
-    return await retrying.post_json(session, url, label="Gemini",
+    data = await retrying.post_json(session, url, label="Gemini",
         headers={"x-goog-api-key": GEMINI_API_KEY}, payload=payload, validate=validate)
+    # Content-free metadata: are we paying full input cost, or is the
+    # provider's implicit prefix cache absorbing the static prompt?
+    usage = data.get("usageMetadata") if isinstance(data, dict) else None
+    if usage:
+        log.info("Gemini usage: in=%s out=%s cached=%s",
+                 usage.get("promptTokenCount"), usage.get("candidatesTokenCount"),
+                 usage.get("cachedContentTokenCount", 0))
+    return data
 
 
 # --------------------------------------------------------------------------
