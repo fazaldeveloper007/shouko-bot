@@ -17,11 +17,13 @@ Built with Python + [discord.py](https://discordpy.readthedocs.io/) + the
   game results, ...) go into her memory as context - she never replies to bots, so no loops.
   Reply to any message (a bot's too) and ask her about it and she reads that message's text,
   embeds and images; forwarded messages work the same way. Late-arriving link embeds are
-  folded into memory as they appear. Embed images are fetched over https only, via Discord's
-  proxied URL when available. Animated content: PNG stickers are seen directly, APNG stickers
-  and GIFs are seen as their first frame (GIFs need `pip install pillow`; without it they stay
-  text markers), Lottie stickers stay name-only. Unsupported types (SVG etc.) are skipped as
-  images so they can never break a reply.
+  folded into memory as they appear. Embed images are fetched only from Discord's own media
+  hosts (CDN / media / images-ext proxies, https), with at most 2 redirects inside the same
+  allowlist and an 8MB streamed cap - attacker-controlled or private-network URLs are never
+  fetched. Animated content: PNG stickers are seen directly, APNG stickers and GIFs are seen
+  as their first frame (GIFs need `pip install pillow`; decoding is pixel-capped; without it
+  they stay text markers), Lottie stickers stay name-only. Unsupported types (SVG etc.) are
+  skipped as images so they can never break a reply.
 - **Keeps speakers untangled in busy chats**: every remembered line carries its author's name,
   and replies are stored with a "[replying to NAME: ...]" note, so when several people talk
   at once she knows who said what and which message an answer belongs to.
