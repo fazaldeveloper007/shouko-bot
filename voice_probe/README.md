@@ -41,7 +41,7 @@ After it ends, confirm Kristy left VC. If `LEAVE_UNCONFIRMED` appears, manually 
 
 ## Startup diagnostics
 
-Startup now prints fixed stages/reason codes, never raw third-party exception text. `TERMINAL_REQUIRED` means run directly in a terminal. `DISCORD_TOKEN_UNAVAILABLE` means the existing bot credential was not found in this process/root .env; do not paste or recreate credentials. Check how the normal bot loads its existing credential. `NODE_DEPENDENCIES_UNAVAILABLE` means the Node preflight could not load the installed modules. Unexpected errors show only their class and stage.
+Startup now prints fixed stages/reason codes, never raw third-party exception text. For local checks without any Discord login or VC join, run `python voice_probe/receive.py --user-id YOUR_DISCORD_USER_ID --check-only`. It exits after checking the terminal, Node modules and availability of the existing credential (never printing it). `TERMINAL_REQUIRED` means run directly in a terminal. `DISCORD_TOKEN_UNAVAILABLE` means the existing bot credential was not found in this process/root .env; do not paste or recreate credentials. Check how the normal bot loads its existing credential. `NODE_DEPENDENCIES_UNAVAILABLE` means the Node preflight could not load the installed modules. Unexpected errors show only their class and stage.
 
 No VC join is requested before terminal `START` and the `VC_JOIN_AFTER_START` marker. `PROBE_JOIN_NOT_REQUESTED` says only this run did not request a join, not that another bot process is absent. Any `LEAVE_UNCONFIRMED` requires manually checking/disconnecting the bot before restarting. Stop on a startup error and share only the fixed `PROBE_ERROR`/stage/leave lines. Do not repeatedly retry or share raw exception traces or .env.
 
