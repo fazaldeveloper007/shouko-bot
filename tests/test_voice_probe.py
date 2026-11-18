@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('receive_probe_test', ROOT / 'voice_probe/receive.py')
@@ -38,10 +38,44 @@ class Guards(unittest.TestCase):
             with self.assertRaises(Exception):
                 probe.snowflake(value)
 
+    def test_worker_and_preflight_do_not_inherit_credentials(self):
+        with patch.dict(probe.os.environ, {'DISCORD_TOKEN': 'DUMMY', 'GEMINI_API_KEY': 'DUMMY',
+                                         'GOOGLE_APPLICATION_CREDENTIALS': 'DUMMY', 'PATH': '/bin'}):
+            env = probe.worker_env()
+        self.assertNotIn('DISCORD_TOKEN', env)
+        self.assertNotIn('GEMINI_API_KEY', env)
+        self.assertNotIn('GOOGLE_APPLICATION_CREDENTIALS', env)
+        self.assertEqual(env['PATH'], '/bin')
+
     def test_background_launch_disabled_before_token_read(self):
         with patch.object(probe.sys.stdin, 'isatty', return_value=False):
             with self.assertRaises(RuntimeError):
                 asyncio.run(probe.run(42))
+
+
+class GatewayGuards(unittest.IsolatedAsyncioTestCase):
+    async def test_gateway_request_is_exact_and_membership_gated(self):
+        channel = Guards().channel([42])
+        channel.guild.id = 100
+        channel.guild.change_voice_state = AsyncMock()
+        client = types.SimpleNamespace(user=types.SimpleNamespace(id=99))
+        bridge = probe.ProbeBridge(client, channel, 42)
+        bridge.state = 'joining'
+        bridge.write = AsyncMock()
+        payload = {'op': 4, 'd': {'guild_id': '100', 'channel_id': '10'}}
+        await bridge.dispatch({'type': 'gateway_send', 'id': 1, 'payload': payload})
+        channel.guild.change_voice_state.assert_awaited_once_with(channel=channel, self_deaf=False, self_mute=True)
+        self.assertTrue(bridge.write.await_args.args[0]['ok'])
+        channel.guild.change_voice_state.reset_mock()
+        channel.guild.voice_states[77] = types.SimpleNamespace(channel=channel)
+        await bridge.dispatch({'type': 'gateway_send', 'id': 2, 'payload': payload})
+        channel.guild.change_voice_state.assert_not_awaited()
+        self.assertFalse(bridge.write.await_args.args[0]['ok'])
+        channel.guild.voice_states.pop(77)
+        payload['d']['channel_id'] = '999'
+        await bridge.dispatch({'type': 'gateway_send', 'id': 3, 'payload': payload})
+        channel.guild.change_voice_state.assert_not_awaited()
+        self.assertFalse(bridge.write.await_args.args[0]['ok'])
 
 
 HARNESS = r'''
