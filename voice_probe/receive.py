@@ -143,13 +143,29 @@ async def console_line():
         loop.remove_reader(sys.stdin.fileno())
 
 
+def normal_bot_dotenv():
+    """Same nearest-ancestor .env lookup as bot.py's bare load_dotenv().
+
+    Start at bot.py's directory, NOT this nested probe's directory or an
+    unrelated current working directory. Stop at the first existing file,
+    even when it lacks DISCORD_TOKEN, just as normal dotenv discovery does.
+    """
+    for directory in (ROOT, *ROOT.parents):
+        candidate = directory / '.env'
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def existing_token():
     """Match documented launch env/.env, then literal Termux:Boot export only.
 
     Never source/execute the boot script, interpolate shell expressions,
     inspect other process environments, print or persist the credential.
     """
-    load_dotenv(ROOT / '.env')
+    dotenv_file = normal_bot_dotenv()
+    if dotenv_file is not None:
+        load_dotenv(dotenv_file)
     token = os.getenv('DISCORD_TOKEN', '').strip()
     if token:
         return token
