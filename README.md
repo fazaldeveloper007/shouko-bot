@@ -255,6 +255,32 @@ She reports exactly what Discord shows: members set to Invisible appear
 offline, and when Discord supplies no start time there is no elapsed clock
 (she says "playing Genshin", never invents "for 2 hours").
 
+## Conversation continuation (on by default)
+
+When her reply to you ends with a question, your next message in that
+channel counts as the answer for a short window (default 4 minutes) - no
+need to repeat her name or use Discord's reply button. Fail-silent rules
+in `continuity.py` keep her out of cross-talk:
+
+- The window only opens when she actually asked something.
+- If you @mention someone or natively reply to someone else's message,
+  the message is theirs, not hers.
+- Any interleaved human chat in the channel, or anyone else triggering
+  her, closes the window immediately - in doubt she stays quiet.
+- An accepted answer consumes the window; the next one needs a fresh
+  question from her.
+
+Tune with `CONTINUITY_ENABLED=0` (off) and `CONTINUITY_MINUTES` (default 4).
+She never starts conversations this way; it only recognises answers in an
+exchange you started.
+
+## Reply timing logs
+
+Every AI reply logs one line (`reply timing: channel=... wait=... prep=...
+brain=... total=...`) so slow replies can be attributed: `wait` is queueing
+behind another reply in the same channel, `prep` is reference/image
+fetching, `brain` is the model call itself. No content is logged.
+
 ## Proactive unanswered-help (off by default)
 
 With `PROACTIVE_ENABLED=1` she watches the three Gaming Impact text channels
