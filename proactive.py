@@ -6,7 +6,9 @@ Kristy may - once - add her own input, as herself, never impersonating the
 person the question was addressed to.
 
 Hard rules baked in here, not in the prompt:
-- People get a grace window first; she never jumps in instantly.
+- No intentional wait before she answers a tracked question; the AI
+  verdict, per-channel daily cap and cooldown, quiet hours and the
+  answer-recheck still gate every post.
 - A pending question is cancelled when anyone reply-references it, when the
   asker posts a follow-up (they moved on), or when the AI verdict says the
   chat already answered it. Unrelated chatter from others cancels NOTHING.
@@ -37,7 +39,7 @@ def _flag(name, default):
 
 ENABLED = _flag("PROACTIVE_ENABLED", "0")
 MENTIONS = _flag("PROACTIVE_MENTIONS", "0")  # default: no tags on proactive posts
-GRACE_MINUTES = int(os.getenv("PROACTIVE_GRACE_MINUTES", "5"))  # Fazal-approved: 5 min
+GRACE_MINUTES = int(os.getenv("PROACTIVE_GRACE_MINUTES", "0"))  # no intentional wait; verdict + caps still gate
 OPENER_IDLE_HOURS = float(os.getenv("PROACTIVE_OPENER_IDLE_HOURS", "4"))
 COOLDOWN_MINUTES = int(os.getenv("PROACTIVE_COOLDOWN_MINUTES", "60"))
 DAILY_CAP = int(os.getenv("PROACTIVE_DAILY_CAP", "3"))
@@ -125,6 +127,17 @@ class Proactive:
             elif author_id == p["author_id"]:
                 del self.state["pending"][key]
                 log.info("proactive: pending %s cancelled (asker follow-up)", key)
+        self.save()
+
+    def cancel_addressed_by_reply(self, channel_id, author_id, message_id):
+        """Kristy directly replied to this member in this channel: any pending
+        help bid of theirs here is addressed - cancel it so she never
+        double-answers at the loop tick."""
+        for key, p in list(self.state["pending"].items()):
+            if p["channel_id"] != channel_id or p["author_id"] != author_id:
+                continue
+            del self.state["pending"][key]
+            log.info("proactive: pending %s addressed by her direct reply", key)
         self.save()
 
     # ---- gating ----
