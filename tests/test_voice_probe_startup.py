@@ -63,6 +63,17 @@ class StartupDiagnostics(unittest.IsolatedAsyncioTestCase):
         self.assertIn('PROBE_JOIN_NOT_REQUESTED', ' '.join(str(c) for c in output.call_args_list))
         fake.close.assert_awaited_once()
 
+    async def test_check_only_never_constructs_discord_client(self):
+        stack = self.common()
+        stack.enter_context(patch.dict(probe.os.environ, {'DISCORD_TOKEN': 'SYNTHETIC_PRIVATE_TOKEN'}))
+        client = stack.enter_context(patch.object(probe.discord, 'Client'))
+        output = stack.enter_context(patch('builtins.print'))
+        await probe.run(42, check_only=True)
+        client.assert_not_called()
+        printed = ' '.join(str(c) for c in output.call_args_list)
+        self.assertIn('PREFLIGHT_OK', printed)
+        self.assertNotIn('SYNTHETIC_PRIVATE_TOKEN', printed)
+
     def test_redaction_retains_type_not_third_party_message(self):
         with patch('builtins.print') as output:
             probe.report_error(RuntimeError('SYNTHETIC_SECRET'), 'STARTUP')
