@@ -17,6 +17,7 @@ from voice_live.group_policy import GroupPolicyError
 def scope_key(scope):
     value = dict(guild=scope.guild, bot=scope.bot,
         audience=sorted(scope.allowlist), revision=scope.notice_revision,
+        channel_gate=scope.channel_gate,
         purpose='adult-nonsensitive-native-live-no-diary-future-sessions',
         model='gemini-3.1-flash-live-preview', voice='Sulafat',
         handling='Google-Free-product-improvement-human-review',
