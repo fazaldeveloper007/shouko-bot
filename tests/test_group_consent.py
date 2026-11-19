@@ -52,6 +52,13 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(scope_key(other),scope_key(self.scope))
         self.assertIn(A,self.store.valid(other))
 
+    def test_channel_gate_change_invalidates_saved_grants(self):
+        self.grant(A);self.grant(B)
+        opened=GroupScope(G,CH,BOT,self.scope.allowlist,NOTICE_REVISION,'open')
+        self.assertNotEqual(scope_key(opened),scope_key(self.scope))
+        self.assertFalse(self.store.valid(opened))
+        self.assertFalse(self.store.valid(self.scope))
+
     def test_allowlist_change_invalidates_and_reverting_does_not_resurrect(self):
         self.grant(A);self.grant(B)
         changed=GroupScope(G,CH,BOT,frozenset((A,B,C)),NOTICE_REVISION)
