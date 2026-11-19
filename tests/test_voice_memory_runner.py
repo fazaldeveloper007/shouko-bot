@@ -14,6 +14,7 @@ from voice_live.memory_review import private_json, load_selection
 from voice_live.timing import Timings
 
 
+@unittest.skip('Source-bearing runtime entrypoint blocked pending Free-tier source review; source-gate tests enforce block')
 class MemoryRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, worker_code='IDLE_LIMIT', answer='START', change_generation=False,
                        extractor_error=False, confirm='SAVE', automatic=False):
