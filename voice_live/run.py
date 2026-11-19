@@ -170,8 +170,12 @@ async def exchange(bridge, key):
         await turn.close()
 
 
-def public_result(result):
-    return {k: result.get(k, 0) for k in ('code', 'packets', 'inputBytes', 'outputBytes', 'outputFramesRead')}
+def public_result(result, outcome=None):
+    summary = {k: result.get(k, 0) for k in ('code', 'packets', 'inputBytes', 'outputBytes', 'outputNonzeroSamples', 'outputFramesRead')}
+    if outcome:
+        summary['workerCode'] = summary['code']
+        summary['code'] = outcome
+    return summary
 
 
 async def run(requester, guild_id=None, confirmed_free_tier=False):
@@ -224,6 +228,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             return
         launched = True
         stop = task = safety = None
+        outcome = None
         try:
             channels = [ch for g in client.guilds if guild_id is None or g.id == guild_id
                         for ch in g.voice_channels if requester in ch.voice_states]
@@ -259,8 +264,10 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             elif bridge.result in done:
                 pass  # Worker completed or failed; result is projected after cleanup.
             else:
-                print('LIVE_STOP: ' + ('OVERALL_LIMIT' if not done else 'MANUAL_OR_SAFETY_STOP'), flush=True)
+                outcome = 'OVERALL_LIMIT' if not done else ('SAFETY_STOP' if safety in done else 'MANUAL_STOP')
+                print('LIVE_STOP: ' + outcome, flush=True)
         except Exception as error:
+            outcome = error_code(error)
             report_error(error)
         finally:
             abort.set()
@@ -277,7 +284,8 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             await asyncio.gather(*(p for p in (task, stop, safety) if p), return_exceptions=True)
             await cleanup()
             if bridge and bridge.result.done():
-                print('LIVE_RESULT ' + json.dumps(public_result(bridge.result.result())), flush=True)
+                result = public_result(bridge.result.result(), outcome)
+                print('LIVE_RESULT ' + json.dumps(result), flush=True)
             print('Native test ended. Check leave status before restarting your normal bot.', flush=True)
 
     @client.event
@@ -296,12 +304,16 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
         key = token = None
 
 
-def report_error(error):
+def error_code(error):
     # Every message from a third party stays private. No traces or raw API text.
     code = str(error) if type(error) is LiveError else {
         asyncio.TimeoutError: 'TIMEOUT', discord.LoginFailure: 'DISCORD_LOGIN_REJECTED',
         FileNotFoundError: 'DEPENDENCY_NOT_FOUND'}.get(type(error), 'STARTUP_OR_SESSION_FAILED')
-    print('LIVE_ERROR code=' + code, flush=True)
+    return code
+
+
+def report_error(error):
+    print('LIVE_ERROR code=' + error_code(error), flush=True)
 
 
 if __name__ == '__main__':
