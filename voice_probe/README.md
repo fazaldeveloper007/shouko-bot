@@ -52,6 +52,8 @@ No VC join is requested before terminal `START` and the `VC_JOIN_AFTER_START` ma
 Share only the `RECEIVE_RESULT` and leave-confirmation line, not `.env` or full gateway logs.
 
 - `TIME_LIMIT` or `STOPPED`, with `packets > 0`, `samples > 0`, and `nonzeroSamples > 0`, supports successful requester audio transport/DAVE decryption/Opus decoding in that run. It does not prove intelligible speech, STT, conversational latency or Gemini Live behavior.
+On DAVE startup failure, `daveProof` reports only fixed readiness booleans, protocol version and pending-transition count, captured before teardown. No privacy-code values, key bytes, session IDs, raw library debug or packets are exposed. `DAVE_TIMEOUT` distinguishes the bounded readiness timeout from `DAVE_CONNECTION_LOST`; neither proves audio receive success. Encryption checks are not bypassed.
+
 - All-zero counts: no decoded requester audio was demonstrated. This is not success.
 - `DAVE_WAIT_FAILED`, `DAVE_NOT_READY`, `RECEIVE_OR_DECRYPT_ERROR`, `DECODE_ERROR`, `OTHER_SPEAKER`, or another failure code: test stopped, do not infer receive success.
 
