@@ -59,7 +59,8 @@ conn.emit('stateChange',{}, {status:'ready'});
  const mono=Buffer.alloc(9600);
  for(let i=0;i<mono.length;i+=2)mono.writeInt16LE(Math.round(Math.sin(i/2*440*2*Math.PI/24000)*3000),i);
  if(mode==='dave_loss')encrypted=false;
- send({type:'output',data:mono.toString('base64')});
+ const response=mode==='tiny'?Buffer.alloc(2):mode==='silent'?Buffer.alloc(9600):mono;
+ send({type:'output',data:response.toString('base64')});
  if(mode==='other_speaker')conn.receiver.speaking.emit('start','500000000000000');
  if(mode==='stop')send({type:'stop'});
  if(mode==='overall')timers.find(t=>t.ms===30000).fn();
@@ -119,6 +120,16 @@ class RealStreaming(unittest.TestCase):
                           ('output_timeout','OUTPUT_LIMIT')]:
             with self.subTest(mode=mode):
                 self.assertEqual(self.scenario(mode)['result']['code'],code)
+
+    def test_tiny_and_digital_silence_never_report_spoken_success(self):
+        for mode,code in [('tiny','GOOGLE_AUDIO_TOO_SHORT'),('silent','GOOGLE_AUDIO_SILENT')]:
+            with self.subTest(mode=mode):
+                data=self.scenario(mode)
+                self.assertEqual(data['result']['code'],code)
+                self.assertEqual(data['result']['outputNonzeroSamples'],0)
+                if mode=='tiny':
+                    self.assertEqual(data['result']['outputFramesRead'],0)
+                    self.assertNotIn('playing',data['types'])
 
     def test_streaming_resampling_alignment_and_antialiasing(self):
         data=subprocess.run(['node','-e',FIR,str(ROOT)],text=True,capture_output=True,timeout=5,check=True)
