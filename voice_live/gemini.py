@@ -114,7 +114,10 @@ class NativeTurn:
             raise LiveError('INPUT_NOT_ENDED')
         while True:
             self.check()
-            payload = await self.receive(8)
+            try:
+                payload = await self.receive(8)
+            except asyncio.TimeoutError:
+                raise LiveError('GOOGLE_RESPONSE_IDLE_TIMEOUT') from None
             content = payload.get('serverContent', {})
             if not isinstance(content, dict):
                 raise LiveError('GOOGLE_EVENT_INVALID')
@@ -147,7 +150,9 @@ class NativeTurn:
                         return
                 finally:
                     data[:] = b'\0' * len(data)
-            if content.get('turnComplete'):
+            # Single-turn non-background-reasoning model: generationComplete
+            # finishes audio production; turnComplete may wait for playback.
+            if content.get('generationComplete') or content.get('turnComplete'):
                 await send({'type': 'output_end'})
                 return
 
