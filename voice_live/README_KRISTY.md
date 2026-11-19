@@ -1,4 +1,4 @@
-# Kristy natural Live voice with reviewed shared memory
+# Kristy natural Live voice with shared own-ID memory
 
 This is a manual voice entrypoint, not always-on listening or general server
 rollout. It uses natural `duplex.py`, not the older 8-second alternating runner.
@@ -21,8 +21,8 @@ foreign-speaker, membership and DAVE fail-closed controls remain unchanged.
 Membership changes can be delayed; stop is not proof that no joined person
 could hear a fragment. No owner guard removal, autojoin or background listening.
 
-1. A local private preview is required before old diary notes can enter voice.
-   Only explicitly selected exact facts from that requester's diary are used,
+1. For the explicitly approved current owner/guild, the dedicated Kristy entrypoint automatically reads that speaker's existing canonical diary. No per-note picker is required. An explicit --memory-selection retains a narrower legacy review route. Automatic read access is bound to a separate generation record and stops after forget/revoke.
+   Only facts from that requester's canonical diary are used in automatic mode,
    bound to their Discord ID, guild and forget generation. No other member
    diary, group history, recap or Kristy self-diary lessons are imported. Names
    or IDs spoken to the model cannot choose a diary file. Facts are possibly
@@ -192,3 +192,23 @@ process environment or the repository's default memory directory, before dotenv
 loading. Voice and the picker do not override this with a later .env-only value.
 Use the same launch environment as text bot. Missing canonical own-ID files stop
 with `MEMORY_EXISTING_DIARY_NOT_FOUND`, not a new empty diary.
+
+
+### Automatic own-ID diary mode
+
+The owner explicitly chose normal-text-like access to their own existing diary
+instead of selecting notes one by one. The dedicated entrypoint defaults to this
+approved owner/guild scope. It ignores the old one-note picker selection for this
+mode; it does not delete or edit it. It reads the same existing phone file, not
+other member files, channel recaps or old chats. Diary context goes to Google.
+All stored facts in this bounded own-ID diary are eligible at session start,
+including future text-saved notes. No automatic semantic privacy filter is
+claimed. Keep this diary/session non-sensitive; stored claims may be wrong or
+about someone mentioned and are not proof of who is speaking. Discord ID binds
+the speaker. The preferred-name metadata is not silently promoted into a fact.
+
+The private scope file stores owner/guild/generation/mode only, not note text.
+Forget/revoke invalidates it and never silently reauthorizes it. A previous
+revocation before first use also fails closed. New voice-note writes still need
+the separate private end-session SAVE confirmation. No per-note read approval
+is requested on ordinary runs. Other owners/guilds are not granted access.
