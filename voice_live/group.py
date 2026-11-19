@@ -16,7 +16,7 @@ from voice_probe.receive import existing_token, console_line
 from voice_live.gemini import require_free_tier, LiveError
 from voice_live.group_config import load_config, configured_scope
 from voice_live.group_policy import GroupSessionPolicy, GroupPolicyError
-from voice_live.group_runtime import (ConsentView, NOTICE_REVISION, draft_notice,
+from voice_live.group_runtime import (ConsentView, NOTICE_REVISION, DETAILS, draft_notice,
     discord_snapshot, run_approved_group)
 
 
@@ -50,23 +50,25 @@ class SharedConsentView(discord.ui.View):
         super().__init__(timeout=720)
         self.coordinator, self.agreed = coordinator, agreed
         self.audience = tuple(coordinator.policy._roster)
+        if set(self.audience) <= coordinator.policy._agreed:
+            self.remove_item(self.agree_button)
 
     async def interaction_check(self, interaction):
         return (str(interaction.user.id) in self.audience and
             str(interaction.guild_id) == self.coordinator.policy.scope.guild)
 
-    @discord.ui.button(label='I am 18+ and Agree', style=discord.ButtonStyle.success)
+    @discord.ui.button(label='18+ Agree, future sessions', style=discord.ButtonStyle.success)
     async def agree_button(self, interaction, button):
         voice = interaction.user.voice
         channel = voice.channel if voice else None
         try:
             self.coordinator.agree(actor=str(interaction.user.id),
                 guild=str(interaction.guild_id), channel=str(channel.id) if channel else '',
-                audience=self.audience, revision=NOTICE_REVISION, adult=True, processing=True)
+                audience=self.audience, revision=NOTICE_REVISION, adult=True, processing=True, future=True)
             if self.coordinator.policy._agreed == set(self.audience):
                 self.agreed.set()
             await interaction.response.send_message(
-                'Agreed for this session and listed audience. No microphone starts until everyone agrees. Decline / Stop remains available.', ephemeral=True)
+                'Agreement saved for future Live sessions with this allowed group. Revoke removes it. No microphone starts until everyone present has agreed.', ephemeral=True)
         except GroupPolicyError:
             await interaction.response.send_message('Agreement not accepted. Session or audience changed.', ephemeral=True)
 
@@ -74,6 +76,20 @@ class SharedConsentView(discord.ui.View):
     async def decline_button(self, interaction, button):
         self.coordinator.stop()
         await interaction.response.send_message('Session stopped. No further voice processing.', ephemeral=True)
+
+
+    @discord.ui.button(label='Details', style=discord.ButtonStyle.secondary)
+    async def details_button(self, interaction, button):
+        await interaction.response.send_message(DETAILS + '\nAllowed audience Discord IDs: ' +
+            ', '.join(sorted(self.coordinator.policy.scope.allowlist)), ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+    @discord.ui.button(label='Revoke', style=discord.ButtonStyle.secondary)
+    async def revoke_button(self, interaction, button):
+        if self.coordinator.grant_store is not None:
+            self.coordinator.grant_store.revoke(str(interaction.user.id))
+        self.coordinator.stop()
+        await interaction.response.send_message('Your saved Live agreement is removed. Active session stopped.', ephemeral=True)
 
     async def on_timeout(self):
         self.coordinator.stop()
@@ -83,6 +99,7 @@ async def run(config_path, *, confirmed_free_tier=False, notice_approved=False):
     require_free_tier(confirmed_free_tier)
     if notice_approved is not True:
         raise GroupPolicyError('GROUP_NOTICE_APPROVAL_REQUIRED')
+    raise GroupPolicyError('GROUP_USE_SLASH_WORKFLOW')
     data, ids = load_config(config_path)
     # Validate required actual channel before credentials or network.
     configured_scope(data, ids, '100000000000000000')
