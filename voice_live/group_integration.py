@@ -8,7 +8,7 @@ from voice_live.group import SharedConsentView
 from voice_live.group_bridge import end_line
 from voice_live.group_consent import ConsentStore
 from voice_live.gemini import LiveError, require_free_tier
-from voice_live.group_config import load_config, configured_scope
+from voice_live.group_config import load_config, config_guilds, configured_scope
 from voice_live.group_policy import GroupSessionPolicy, GroupPolicyError
 from voice_live.group_runtime import discord_snapshot, draft_notice, run_approved_group
 from music.player import MusicError
@@ -45,7 +45,7 @@ class LiveGroups:
     async def revoke(self, interaction):
         data, ids = load_config(self.config_path)
         actor = str(interaction.user.id)
-        if str(interaction.guild_id) != data['guild_id']:
+        if str(interaction.guild_id) not in config_guilds(data):
             raise GroupPolicyError('GROUP_CALLER_NOT_ALLOWED')
         self.consent_store.revoke(actor)
         session = self.sessions.get(interaction.guild_id)
@@ -61,13 +61,14 @@ class LiveGroups:
         vc = getattr(getattr(interaction.user, 'voice', None), 'channel', None)
         if not isinstance(vc, discord.VoiceChannel):
             raise GroupPolicyError('GROUP_JOIN_VOICE_FIRST')
-        if str(vc.guild.id) != data['guild_id'] or str(interaction.guild_id) != data['guild_id']:
+        guild = str(interaction.guild_id)
+        if guild not in config_guilds(data) or str(vc.guild.id) != guild:
             raise GroupPolicyError('GROUP_GUILD_NOT_ALLOWED')
         if str(interaction.user.id) not in ids:
             raise GroupPolicyError('GROUP_CALLER_NOT_ALLOWED')
         # Exact channel comes from authenticated caller NOW, not screenshot/config default.
         scoped = dict(data, voice_channel_id=str(vc.id))
-        scope = configured_scope(scoped, ids, self.client.user.id)
+        scope = configured_scope(scoped, ids, self.client.user.id, guild)
         discord_snapshot(vc, scope)
         me = vc.guild.me
         perms = vc.permissions_for(me)
@@ -109,11 +110,11 @@ class LiveGroups:
             await agreed.wait()
         def validate_scope():
             current, ids = load_config(self.config_path)
-            if (current['guild_id'] != policy.scope.guild or
+            if (policy.scope.guild not in config_guilds(current) or
                     frozenset(ids) != policy.scope.allowlist or
                     current.get('channel_gate', 'restricted') != policy.scope.channel_gate or
                     current['notice_revision'] != policy.scope.notice_revision):
-                changed = configured_scope(dict(current, voice_channel_id=policy.scope.channel), ids, policy.scope.bot)
+                changed = configured_scope(dict(current, voice_channel_id=policy.scope.channel), ids, policy.scope.bot, policy.scope.guild)
                 self.consent_store.valid(changed)  # Clear old scope before stopping.
                 raise GroupPolicyError('GROUP_PERMISSION_SCOPE_CHANGED')
         try:
