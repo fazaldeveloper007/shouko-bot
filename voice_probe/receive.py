@@ -128,6 +128,17 @@ class ProbeBridge(Bridge):
                 f.set_exception(VoiceFailure('WORKER_EXITED'))
 
 
+def public_result(result):
+    summary = {k: result.get(k, 0) for k in
+               ('code', 'packets', 'samples', 'nonzeroSamples', 'peak')}
+    data = result.get('daveProof')
+    if isinstance(data, dict):
+        summary['daveProof'] = {key: data.get(key) for key in (
+            'transportReady', 'protocol', 'sessionReady', 'privacyPresent',
+            'reinitializing', 'transitionExecuted', 'pendingTransitions')}
+    return summary
+
+
 async def console_line():
     # No executor input thread that could keep Python alive after timeout.
     loop = asyncio.get_running_loop()
@@ -299,8 +310,7 @@ async def run(requester, guild_id=None, check_only=False):
                     await bridge.write({'type': 'stop'})
                 result = await asyncio.wait_for(asyncio.shield(bridge.result), 3)
                 # Only allow a fixed diagnostic projection, never packets or text.
-                print('RECEIVE_RESULT ' + json.dumps({k: result.get(k, 0) for k in
-                      ('code', 'packets', 'samples', 'nonzeroSamples', 'peak')}))
+                print('RECEIVE_RESULT ' + json.dumps(public_result(result)))
                 print('Decoded nonzero PCM supports receive/decode only; intelligibility and Live conversation remain UNTESTED.')
             finally:
                 stop.cancel()
@@ -312,8 +322,7 @@ async def run(requester, guild_id=None, check_only=False):
             report_error(error, stage)
             if bridge is not None and bridge.result.done():
                 result = bridge.result.result()
-                print('RECEIVE_RESULT ' + json.dumps({k: result.get(k, 0) for k in
-                      ('code', 'packets', 'samples', 'nonzeroSamples', 'peak')}))
+                print('RECEIVE_RESULT ' + json.dumps(public_result(result)))
         finally:
             await cleanup()
             print('Test ended; decoder released, no audio files created. Restart your normal bot.')
