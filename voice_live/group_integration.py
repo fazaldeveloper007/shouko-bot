@@ -5,11 +5,12 @@ from types import SimpleNamespace
 import discord
 from discord import app_commands
 from voice_live.group import SharedConsentView
+from voice_live.group_bridge import end_line
 from voice_live.group_consent import ConsentStore
+from voice_live.gemini import LiveError, require_free_tier
 from voice_live.group_config import load_config, configured_scope
 from voice_live.group_policy import GroupSessionPolicy, GroupPolicyError
 from voice_live.group_runtime import discord_snapshot, draft_notice, run_approved_group
-from voice_live.gemini import require_free_tier
 from music.player import MusicError
 from music.ui import answer
 
@@ -126,6 +127,9 @@ class LiveGroups:
                 confirmed_free_tier=True, outcome=session, grant_store=self.consent_store, validate_scope=validate_scope)
         except asyncio.CancelledError:
             raise
+        except (GroupPolicyError, LiveError) as error:
+            # Fixed reason codes only; end_line drops anything that is not one.
+            print(end_line({'code': str(error)}), flush=True)
         except Exception:
             # No model/user/exception text in logs or Discord diagnostics.
             pass
