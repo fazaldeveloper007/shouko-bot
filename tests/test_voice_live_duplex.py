@@ -160,7 +160,8 @@ for(let i=0;i<3;i++){now+=20;quiet.accept(frame(300));quiet.tick();}assert.equal
 quiet.destroy();console.log('GATE_OK');
 '''
 PREFIX=HARNESS[:HARNESS.index('(async()=>{')].replace("root+'/voice_live/worker.cjs'","root+'/voice_live/worker_duplex.cjs'")
-PREFIX=PREFIX.replace("if(name==='./audio.cjs')return{Converter};", "if(name==='./audio.cjs')return{Converter};if(name==='./speech_gate.cjs')return require(root+'/voice_live/speech_gate.cjs');")
+PREFIX=PREFIX.replace('decrypt:p=>p','decrypt:(p,user)=>p')
+PREFIX=PREFIX.replace("if(name==='./audio.cjs')return{Converter};", "if(name==='./audio.cjs')return{Converter};if(name==='./speech_gate.cjs')return require(root+'/voice_live/speech_gate.cjs');if(name==='./receive_report.cjs')return require(root+'/voice_live/receive_report.cjs');")
 BODY=r'''
 (async()=>{
  await new Promise(setImmediate);send({type:'listen'});
