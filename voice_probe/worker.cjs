@@ -3,10 +3,12 @@
 const readline = require('node:readline');
 const v = require('@discordjs/voice');
 const OpusScript = require('opusscript');
+const receiveDiagnostics = require('./receive_diagnostics.cjs');
 const {proof, encrypted, waitEncrypted} = require('../music/dave_gate.cjs');
 const out = m => process.stdout.write(JSON.stringify(m)+'\n');
 let cfg, conn, adapter, stream, decoder, ending=false, ready=false, serial=0;
-let deadline, connectDeadline, initDeadline, encryptionWaiting=false;
+let deadline, connectDeadline, initDeadline, encryptionWaiting=false, diagnostics;
+let receiveErrorClass;
 const acks=new Map();
 const stats={packets:0, samples:0, nonzeroSamples:0, peak:0};
 function finish(code='STOPPED') {
@@ -17,9 +19,10 @@ function finish(code='STOPPED') {
  clearTimeout(deadline); clearTimeout(connectDeadline);
  for(const t of acks.values())clearTimeout(t); acks.clear();
  stream?.destroy(); stream=null;
+ diagnostics?.restore(); diagnostics=null;
  try{decoder?.delete();}catch{} decoder=null;
  try{conn?.destroy();}catch{}
- out({type:'result',code,...stats,daveProof});
+ out({type:'result',code,...stats,daveProof,...(receiveErrorClass?{errorClass:receiveErrorClass}:{})});
  // Decoder memory is released; JS/native allocators cannot promise forensic zeroization.
  process.exitCode=code==='STOPPED'||code==='TIME_LIMIT'?0:1;
  setImmediate(()=>process.exit(process.exitCode));
@@ -34,8 +37,12 @@ function startReceive() {
  decoder=new OpusScript(48000,2,OpusScript.Application.AUDIO);
  // Subscription happens for one verified requester only. Other SSRCs have no stream.
  conn.receiver.speaking.on('start', id=>{if(id!==cfg.target)finish('OTHER_SPEAKER');});
+ diagnostics=receiveDiagnostics.install(conn.receiver);
  stream=conn.receiver.subscribe(cfg.target,{end:{behavior:v.EndBehaviorType.Manual}});
- stream.on('error',()=>finish('RECEIVE_OR_DECRYPT_ERROR'));
+ stream.on('error',error=>{
+  const failure=diagnostics?.classify(error)||{code:'RECEIVE_UNCLASSIFIED_ERROR',errorClass:receiveDiagnostics.errorClass(error)};
+  receiveErrorClass=failure.errorClass;finish(failure.code);
+ });
  stream.on('data', packet=>{
   if(ending)return;
   if(!encrypted(conn))return finish('DAVE_NOT_READY');
