@@ -130,6 +130,8 @@ class LiveBridge(Bridge):
                 elif kind == 'playing':
                     self.timings.mark(event.get('epoch'), 'playing')
                     print('LIVE_PLAYING: speaking; requester can interrupt. STOP ends session.', flush=True)
+                elif kind == 'session_draining':
+                    print('LIVE_FINISHING_REPLY: session deadline reached; current reply may finish. Speaking or STOP ends it.', flush=True)
                 elif kind == 'reply_done':
                     print('LIVE_WAITING: waiting for requester speech, 60s idle limit excludes playback.', flush=True)
                 elif kind == 'result':
@@ -211,19 +213,23 @@ def public_result(result, outcome=None):
     return summary
 
 
-async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None):
+async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None, full_persona=False):
     require_free_tier(confirmed_free_tier)  # Before credentials, Discord or Google.
     selection = load_selection(memory_path) if memory_path else None
+    persona = None
+    if full_persona:
+        from voice_live.identity import local_persona
+        persona = local_persona()
     if selection and (selection.owner != requester or guild_id != selection.guild):
         raise LiveError('MEMORY_SCOPE_CHANGED')
+    if selection and not (Path(diary.MEMORY_DIR) / f'{requester}.json').is_file():
+        raise LiveError('MEMORY_EXISTING_DIARY_NOT_FOUND')
     if not sys.stdin.isatty():
         raise LiveError('TERMINAL_REQUIRED')
     token = existing_token()
     key = existing_gemini_key()
-    # Credential loader resolved nearest .env; now honor its existing memory
-    # directory setting too, without importing bot.py or reading other diaries.
-    if os.getenv('MEMORY_DIR'):
-        diary.MEMORY_DIR = Path(os.environ['MEMORY_DIR']).expanduser()
+    # Match text bot: diary resolves storage at import, before dotenv loading.
+    # Never re-point voice to a different .env-only directory.
     # Read-only dependency check, no API/network import side effects.
     check = await asyncio.create_subprocess_exec('node', '-e',
         "require('./voice_probe/node_modules/@discordjs/voice');require('./voice_probe/node_modules/opusscript');require('./voice_live/audio.cjs')",
@@ -287,13 +293,13 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
             if selection:
                 generation, snapshot = await asyncio.to_thread(store.snapshot, requester)
                 memory = SessionMemory(selection=selection, requester=requester,
-                    guild=channel.guild.id, generation=generation, facts=snapshot['facts'])
+                    guild=channel.guild.id, generation=generation, facts=snapshot['facts'], persona=persona)
                 snapshot = None
             print(f'Requester {requester}; guild {channel.guild.id}; channel {channel.id}.')
             print(f'Native model {MODEL}; voice {VOICE}. Existing key Free tier confirmed by owner; not a billing lookup.')
             print('Only your microphone goes to Google. Free API inputs/replies may improve products and be human-reviewed.')
             if memory:
-                print('Kristy short persona + your privately reviewed selected diary notes go to Google.')
+                print(('Your locally edited full text persona' if full_persona else 'Kristy short persona') + ' + your privately reviewed selected diary notes go to Google.')
                 print('Temporary input text is kept in bounded memory, no audio/full transcript files.')
                 print('One extra Google Gemini3.5FlashLite request after safe session end selects useful own-user notes.')
                 print('Conservative source checks skip ambiguous notes; remaining proposals require your private end-session SAVE confirmation.')
@@ -301,11 +307,11 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
             else:
                 print('Use a NON-SENSITIVE test phrase. No chat history/diaries/transcripts/recording.')
             print('Normal bot must be stopped. Keep the whole voice session non-sensitive.')
-            print('Speech ends on natural pause (~0.8s), 60s hard input cap; 10s reply cap; 600s total from START.')
+            print('Speech ends on natural pause (~0.8s), 60s hard input cap; no per-reply cutoff; at 600s finish the current reply only. Speaking or STOP ends it.')
             print('60s user-idle limit excludes Kristy playback. No guarantee of uninterrupted duration.')
             print('Local microphone monitoring continues during replies for barge-in; earphones needed against echo.')
             print('Only detected utterance audio plus up to 200ms onset buffer goes to Google, no idle stream.')
-            print('Local energy detection can mistake noise/quiet speech. Any hard input/output cap ends session.')
+            print('Local energy detection can mistake noise/quiet speech. Hard input, aggregate output and queue safety bounds can end the session.')
             print('No unselected history or session resumption. Connection/quota/error stops, no reconnect/fallback.')
             print('Empty restricted VC only. Any terminal input or Ctrl+C stops. Type START within 60s to agree and start.', flush=True)
             if await asyncio.wait_for(console_line(), 60) != 'START':
@@ -336,6 +342,11 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
                 memory_watch = asyncio.create_task(watch_memory())
             task = asyncio.create_task(session())
             done, _ = await asyncio.wait([task, stop, safety, bridge.result], timeout=600, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                # No new turn after deadline. Worker drains only an already pending
+                # reply, retaining barge-in/manual/safety stop and provider timeouts.
+                await bridge.write({'type': 'session_deadline'})
+                done, _ = await asyncio.wait([task, stop, safety, bridge.result], return_when=asyncio.FIRST_COMPLETED)
             if task in done:
                 await task
             elif bridge.result in done:
