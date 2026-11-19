@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 import discord
 from voice_probe.receive import existing_token, console_line
 from voice_live.gemini import require_free_tier, LiveError
-from voice_live.group_config import load_config, configured_scope
+from voice_live.group_config import load_config, config_guilds, configured_scope
 from voice_live.group_policy import GroupSessionPolicy, GroupPolicyError
 from voice_live.group_runtime import (ConsentView, NOTICE_REVISION, DETAILS, draft_notice,
     discord_snapshot, run_approved_group)
@@ -102,7 +102,7 @@ async def run(config_path, *, confirmed_free_tier=False, notice_approved=False):
     raise GroupPolicyError('GROUP_USE_SLASH_WORKFLOW')
     data, ids = load_config(config_path)
     # Validate required actual channel before credentials or network.
-    configured_scope(data, ids, '100000000000000000')
+    configured_scope(data, ids, '100000000000000000', sorted(config_guilds(data))[0])
     if not sys.stdin.isatty():
         raise GroupPolicyError('TERMINAL_REQUIRED')
     token = existing_token()
@@ -123,7 +123,7 @@ async def run(config_path, *, confirmed_free_tier=False, notice_approved=False):
         task = stop = None
         view = message = None
         try:
-            scope = configured_scope(data, ids, client.user.id)
+            scope = configured_scope(data, ids, client.user.id, sorted(config_guilds(data))[0])
             policy = GroupSessionPolicy(scope)
             channel = client.get_channel(int(scope.channel))
             if not isinstance(channel, discord.VoiceChannel):
