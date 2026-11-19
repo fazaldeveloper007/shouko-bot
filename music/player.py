@@ -293,6 +293,7 @@ class Manager:
         self.queue_limit = queue_limit
         self.players = {}
         self.guild_locks = {}
+        self.voice_reservations = {}
         self.panel_builder = None
         self.panel_interval = 1.0
 
@@ -307,6 +308,8 @@ class Manager:
         gid = vc.guild.id
         lock = self.guild_locks.setdefault(gid, asyncio.Lock())
         async with lock:
+            if gid in self.voice_reservations:
+                raise MusicError('Live voice is active or awaiting confirmed leave. Use /leavevckristy first')
             player = self.players.get(gid)
             if player and not player.closed:
                 if player.channel.id != vc.id: raise MusicError('Kristy is already active in another VC in this server')
