@@ -13,6 +13,7 @@ import tempfile
 import sys
 import unicodedata
 import re
+import diary  # Same import-time canonical directory as text bot, before dotenv.
 from voice_live.memory import Selection, MemoryErrorCode, digest, identity
 from voice_live.member_store import MemberStore
 
@@ -154,13 +155,9 @@ def main():
     parser.add_argument('--selection-file', type=Path)
     parser.add_argument('--confirmed-private-own-notes', action='store_true')
     args = parser.parse_args()
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
-    import diary
-    directory = Path(os.getenv('MEMORY_DIR') or diary.MEMORY_DIR).expanduser()
+    directory = Path(diary.MEMORY_DIR)
+    if args.action in ('pick', 'preview', 'approve') and not (directory / f'{args.user_id}.json').is_file():
+        raise MemoryErrorCode('MEMORY_EXISTING_DIARY_NOT_FOUND')
     store = MemberStore(directory)
     if args.action == 'pick':
         selection_path = args.selection_file or (directory / f'voice-selection-{args.user_id}-{args.guild_id}.json')
