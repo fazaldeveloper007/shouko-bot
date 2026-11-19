@@ -41,6 +41,14 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(GroupPolicyError):
                 self.load(data)
 
+    def test_channel_gate_config_optional_and_validated(self):
+        data, ids = self.load(self.config())
+        self.assertEqual(configured_scope(data, ids, BOT).channel_gate, 'restricted')
+        data, ids = self.load(dict(self.config(), channel_gate='open'))
+        self.assertEqual(configured_scope(data, ids, BOT).channel_gate, 'open')
+        with self.assertRaises(GroupPolicyError):
+            self.load(dict(self.config(), channel_gate='public'))
+
     async def test_cli_defaults_block_before_credentials_and_network(self):
         with patch.object(group,'existing_token') as token,patch.object(group.discord,'Client') as client:
             with self.assertRaises(Exception):
