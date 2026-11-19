@@ -47,10 +47,10 @@ class GroupScope:
 
 
 class GroupSessionPolicy:
-    """Per-session, per-audience permission gate. Never restores old grants.
+    """Current-session gate; verified persistent grants are supplied by coordinator.
 
     Ages are member assertions, not age verification. Every audience change is
-    terminal after start. A new policy/session and new agreements are required.
+    terminal after start. A new policy/session is required; bounded standing grants may be revalidated.
     This gate cannot establish the safety of spoken content under free terms.
     """
     def __init__(self, scope):
