@@ -16,7 +16,7 @@ from voice_live.timing import Timings
 
 class MemoryRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def exercise(self, worker_code='IDLE_LIMIT', answer='START', change_generation=False,
-                       extractor_error=False, confirm='SAVE'):
+                       extractor_error=False, confirm='SAVE', automatic=False):
         from test_voice_live import RunnerGates
         guild = RunnerGates().guild()
         callbacks = {}
@@ -79,8 +79,10 @@ class MemoryRunnerTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(runner.asyncio,'wait',wait), \
                  patch.object(runner.discord.VoiceChannel,'connect',connect), \
                  patch.object(runner,'memory_extract_once',sender), \
+                 patch('voice_live.automatic_diary.OWNER',42), \
+                 patch('voice_live.automatic_diary.GUILD',guild.id), \
                  patch('builtins.print') as output:
-                await runner.run(42, guild.id, True, selection_path)
+                await runner.run(42, guild.id, True, None if automatic else selection_path, automatic_diary=automatic)
             printed = str(output.call_args_list)
             # Only private post-session review can show candidate notes. No raw
             # transcript event or extraction errors are ever printed.
@@ -100,13 +102,24 @@ class MemoryRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sender.await_count, 1)
                 self.assertIn('MEMORY_SAVED', printed)
                 self.assertIn('Self-note: I like chess.', [x['t'] for x in store.snapshot(42)[1]['facts']])
-                self.assertIn(digest('Self-note: I like chess.'), load_selection(selection_path).digests)
+                if automatic:
+                    from voice_live.automatic_diary import authorize
+                    # Scope constants restored outside patches; validate own store result directly.
+                    self.assertTrue((Path(temp)/f'voice-automatic-42-{guild.id}.json').exists())
+                else:
+                    self.assertIn(digest('Self-note: I like chess.'), load_selection(selection_path).digests)
                 self.assertIn('LEAVE_CONFIRMED', printed)
                 self.assertIn('LIVE_TIMINGS', printed)
             client.close.assert_awaited_once()
 
     async def test_safe_idle_saves_once_after_cleanup_updates_selection(self):
         await self.exercise()
+
+    async def test_automatic_own_diary_safe_save_without_picker(self):
+        await self.exercise(automatic=True)
+
+    async def test_automatic_own_diary_revoke_stops_save(self):
+        await self.exercise(automatic=True,change_generation=True)
 
     async def test_receive_error_no_extraction(self):
         await self.exercise(worker_code='RECEIVE_ERROR')
