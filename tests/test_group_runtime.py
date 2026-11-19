@@ -136,6 +136,20 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 restricted_channel(ch, self.scope)
         restricted_channel(self.channel(), self.scope)
 
+    def test_open_gate_leaves_public_channel_untouched(self):
+        scope = GroupScope(G, CH, BOT, frozenset((A, B)), NOTICE_REVISION, 'open')
+        for ch in (self.channel(denied=False), self.channel(extra=True), self.channel()):
+            restricted_channel(ch, scope)
+        snapshot = discord_snapshot(self.channel(denied=False), scope)
+        self.assertEqual(set(snapshot['humans']), {A, B})
+
+    def test_open_gate_still_requires_exact_channel(self):
+        scope = GroupScope(G, CH, BOT, frozenset((A, B)), NOTICE_REVISION, 'open')
+        ch = self.channel()
+        ch.id = int(C)
+        with self.assertRaisesRegex(GroupPolicyError, 'MISMATCH'):
+            restricted_channel(ch, scope)
+
     def test_unresolved_members_fail_closed(self):
         ch = self.channel()
         ch.guild.get_member = lambda actor: None
