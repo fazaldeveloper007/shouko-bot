@@ -105,6 +105,13 @@ class GroupPolicyTests(unittest.TestCase):
                 with self.assertRaises(GroupPolicyError):
                     GroupScope(G, CH, BOT, values, 'draft1')
 
+    def test_channel_gate_value_validated(self):
+        with self.assertRaisesRegex(GroupPolicyError, 'GATE'):
+            GroupScope(G, CH, BOT, (A, B), 'draft1', 'public')
+        for gate in ('restricted', 'open'):
+            self.assertEqual(GroupScope(G, CH, BOT, (A, B), 'draft1', gate).channel_gate, gate)
+        self.assertEqual(GroupScope(G, CH, BOT, (A, B), 'draft1').channel_gate, 'restricted')
+
     def test_malformed_roster_stops(self):
         self.active()
         with self.assertRaises(GroupPolicyError):
