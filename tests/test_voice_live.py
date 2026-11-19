@@ -206,3 +206,47 @@ class RunnerGates(unittest.IsolatedAsyncioTestCase):
         with patch.object(runner.Bridge,'disconnect',parent):
             self.assertTrue(await bridge.disconnect(force=True))
         self.assertEqual(order,['stop','leave']);self.assertTrue(abort.is_set())
+
+class GenerationLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def test_generation_complete_finishes_without_waiting_for_turn_complete(self):
+        turn=NativeTurn('DUMMY',lambda:True);turn.input_ended=True
+        event=audio_event(bytes(960),complete=False)
+        turn.ws=Socket([event,{'serverContent':{'generationComplete':True}}])
+        send=AsyncMock();await turn.output(send)
+        self.assertEqual(send.call_args.args[0],{'type':'output_end'})
+        self.assertEqual(turn.ws.events,[])
+
+    async def test_tiny_audio_then_generation_complete_is_forwarded_not_invented(self):
+        turn=NativeTurn('DUMMY',lambda:True);turn.input_ended=True
+        event=audio_event(bytes(2),complete=False)
+        event['serverContent']['generationComplete']=True
+        turn.ws=Socket([event]);send=AsyncMock();await turn.output(send)
+        self.assertEqual(turn.output_bytes,2)
+        self.assertEqual(send.await_count,2)
+        self.assertEqual(base64.b64decode(send.call_args_list[0].args[0]['data']),bytes(2))
+
+    async def test_idle_receive_timeout_has_specific_fixed_code(self):
+        turn=NativeTurn('DUMMY',lambda:True);turn.input_ended=True
+        turn.receive=AsyncMock(side_effect=asyncio.TimeoutError())
+        with self.assertRaisesRegex(LiveError,'GOOGLE_RESPONSE_IDLE_TIMEOUT'):
+            await turn.output(AsyncMock())
+
+    async def test_generation_complete_with_multiple_parts_processes_all_audio_first(self):
+        turn=NativeTurn('DUMMY',lambda:True);turn.input_ended=True
+        event=audio_event(bytes(960),complete=False,parts=2)
+        event['serverContent']['generationComplete']=True
+        turn.ws=Socket([event]);send=AsyncMock();await turn.output(send)
+        self.assertEqual(turn.output_bytes,1920)
+        self.assertEqual([c.args[0]['type'] for c in send.call_args_list],['output','output','output_end'])
+
+
+class Outcomes(unittest.TestCase):
+    def test_cleanup_stop_does_not_hide_upstream_failure(self):
+        result=runner.public_result({'code':'STOPPED','outputBytes':2},'GOOGLE_RESPONSE_IDLE_TIMEOUT')
+        self.assertEqual(result['code'],'GOOGLE_RESPONSE_IDLE_TIMEOUT')
+        self.assertEqual(result['workerCode'],'STOPPED')
+        self.assertEqual(result['outputBytes'],2)
+
+    def test_overall_limit_distinct_from_idle_and_manual(self):
+        for outcome in ('OVERALL_LIMIT','GOOGLE_RESPONSE_IDLE_TIMEOUT','MANUAL_STOP','SAFETY_STOP'):
+            self.assertEqual(runner.public_result({'code':'STOPPED'},outcome)['code'],outcome)
