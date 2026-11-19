@@ -1,0 +1,63 @@
+# Finite requester-only native voice prototype
+
+This is a manually started developer prototype in a normal Discord VC, not a feature enabled in bot.py. Only the requester and Kristy may be present. It makes one native Gemini audio round trip, then leaves. It is not general server voice chat, continuous listening, or a replacement for the existing text/persona/music behavior.
+
+## Approval and billing gate
+
+Before starting, the owner must confirm that the **current existing Gemini key installed on the phone** uses AI Studio **Free tier**. Check the existing key's actual project and current tier in the Google account where that key was created, not an older account/project. Do not create, copy into chat, reset or replace keys; do not enable billing, buy credits or enable a paid fallback. If the current key's tier is uncertain, stop. A similar project name, a different account's dashboard or a successful request does not prove this key is free.
+
+The runner refuses before reading credentials or connecting unless `--confirmed-free-tier` is supplied. This parameter records the owner's confirmation about the CURRENT installed key. It is **not** an automatic billing lookup and must not be used to bypass uncertainty. No billing changes are made. Stop if the current project becomes paid, access is denied or quota is exhausted. There is no reconnect, alternate key, model/provider fallback or automatic retry. A free-project dashboard entry in another Google account does not prove this installed key has model access; a setup rejection stops without fallback.
+
+The model is pinned to `gemini-3.8-live`, built-in voice `Kore`, using Google's native audio Live WebSocket endpoint. The working text model is unchanged. The minimal test prompt asks for one short friendly Hinglish reply, identifies Kristy as an AI prototype and asks for no personal information. It imports no persona.py, member diaries, chat history or private creator details.
+
+## Data use and audience
+
+This test sends the requester's microphone PCM and the generic test prompt to Google. Generated audio is played into the same VC. Google unpaid-service inputs and responses may be used for product/model improvement and processed by human reviewers. Use only a short non-sensitive test sentence. Do not discuss private, sensitive or personal information. The local runner writes no audio files, transcript, conversation log or memory entry, but that does not mean Google retains nothing. Credentials stay in Python and are sent only to their intended services; the Node worker gets no credential environment.
+
+Google's current API terms require adult use and prohibit API clients directed toward or likely accessed by under-18s. They describe developer professional/business use, not consumer use. This narrow adult development prototype does not clear a general gaming-server rollout. The owner must resolve intended-use and audience eligibility before broader access. See [Google terms](https://ai.google.dev/gemini-api/terms).
+
+## Bounds and stop
+
+- Explicit terminal START, after showing requester/guild/channel, model, voice and data-use terms. No Google connection or VC join before START.
+- At most **8 seconds of requester capture**, independently capped at 256000 bytes of 16kHz mono PCM. Only the requester's Discord receive stream is subscribed.
+- One reply, at most **10 seconds of generated audio** by both PCM byte count and playback timer. There is no second listen/reply turn, barge-in loop or tool use. Stop interrupts the reply.
+- **30-second overall deadline from START**, including VC join and Google setup. Slow setup/generation can end the test before a full reply. Audio work stops at the deadline; bounded disconnect/cleanup can take longer to confirm leave.
+- STOP + Enter, any terminal input after START, Ctrl+C, requester leaving/moving, any other occupant, foreign-speaking metadata, DAVE loss, stream/IPC/API error or timeout stops the test and clears local queues. Other users never get an audio receive subscription.
+- Membership events are not instantaneous. Use an access-restricted, otherwise empty test VC. Do not promise that someone entering during output can hear absolutely nothing before the membership event stops playback.
+- DAVE stays required. Unlike the local receive-only probe, this separately approved output prototype intentionally joins **unmuted**, because it must speak. It does not change server mute settings or weaken encryption.
+
+PCM is filtered/resampled from Discord's 48kHz stereo to 16kHz mono for input. Google 24kHz mono PCM is filtered/resampled to 48kHz stereo and Opus-encoded for Discord. No ffmpeg, external TTS service or transcription cascade is used. Buffers, codecs and filters are cleared/released on exit; language/native allocators and immutable transport strings cannot promise forensic zeroization.
+
+## Run only after the current-key Free-tier confirmation is confirmed
+
+Stop the normal bot with its usual method. Join the otherwise empty restricted normal VC from the confirmed requester's own Discord account. Preserve local persona edits; if pulling conflicts, stop rather than resetting/stashing blindly.
+
+```sh
+cd ~/shouko-bot
+git pull --ff-only
+python voice_live/run.py --user-id YOUR_CONFIRMED_DISCORD_USER_ID --confirmed-free-tier
+```
+
+The already-installed pinned voice_probe dependencies are reused. No npm reinstall or new SDK/key is required. Python uses aiohttp, already required by discord.py. Existing normal bot env/nearest-ancestor .env credentials are used, with the same strictly literal documented Termux boot-file fallback; boot scripts are never executed/sourced. Missing or ambiguous existing credentials stop locally without printing or creating them.
+
+At the actual prompt, check IDs and type START. Speak **only after LIVE_LISTENING**, one non-sensitive line such as asking for a short greeting. After the 8-second input window, LIVE_REPLY_PENDING means requester capture is stopped. LIVE_PLAYING means the Discord player began handling generated audio, not proof the requester heard intelligible speech. Do not rerun automatically on failure.
+
+Share only `LIVE_ERROR`, `LIVE_RESULT` and leave-status lines, never .env, keys, raw API/crypto logs or audio. `LEAVE_UNCONFIRMED` means manually check/disconnect Kristy before restarting the normal bot using its usual command.
+
+`COMPLETE` means the bounded worker processed the one-turn output and reached player idle. `OUTPUT_LIMIT` means a configured output cap ended it, so the reply may be cut short. Numeric outputFramesRead counts frames read by the player pipeline, not a receipt proving they were heard. Only the requester's actual report establishes audibility/intelligibility. Neither success guarantees ongoing conversational latency or production reliability. `OVERALL_LIMIT` can simply mean this bounded trial ran out of time; do not silently extend it or repeat.
+
+## Offline verification
+
+```sh
+python -m pytest tests/test_voice_live*.py tests/test_voice_probe*.py -q
+```
+
+Tests use the actual pinned VoiceReceiver/AudioReceiveStream, synthetic encrypted RTP, real opusscript encode/decode and actual Discord AudioPlayer scheduling with a synthetic connection. They verify input conversion, anti-alias rejection, streaming chunk invariance, output encode/decode, single-requester subscription, manual/foreign-speaker/DAVE/deadline stops, cleanup ordering, fixed protocol/setup, malformed events, full-part processing, byte caps, no-key-before-Free-tier-confirmation gate, real discord.py channel selection and header auth without a key-bearing URL. Google sockets are fakes. DAVE session cryptography/network/phone compatibility, Google model access, microphone intelligibility and real Discord playback remain live-unverified until one authorized run. No cloud call is made by tests.
+
+## References checked for this prototype
+
+- [Live API reference](https://ai.google.dev/api/live), WSS setup, manual activity boundaries and realtime audio.
+- [Live guide](https://ai.google.dev/gemini-api/docs/live-guide), audio formats and 3.8 model-specific settings. 3.8 does not accept thinkingLevel or disabling proactive audio; neither flag is sent.
+- [Pricing](https://ai.google.dev/gemini-api/docs/pricing), Free-tier availability does not prove this installed key's tier.
+- [Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), project-scoped limits/capacity are not unlimited guarantees.
+- [Google terms](https://ai.google.dev/gemini-api/terms), unpaid data use and audience restrictions.
