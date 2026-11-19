@@ -44,9 +44,8 @@ def snowflake(value):
 
 
 def safe_members(channel, requester, bot_id):
-    # Use the guild voice-state map, not member-cache completeness.
-    ids = {uid for uid, state in channel.guild.voice_states.items()
-           if state.channel and state.channel.id == channel.id}
+    # Public discord.py channel API works even without member-cache completeness.
+    ids = set(channel.voice_states)
     return requester in ids and not (ids - {requester, bot_id})
 
 
@@ -263,9 +262,9 @@ async def run(requester, guild_id=None, check_only=False):
             for guild in client.guilds:
                 if guild_id is not None and guild.id != guild_id:
                     continue
-                state = guild.voice_states.get(requester)
-                if state and isinstance(state.channel, discord.VoiceChannel):
-                    candidates.append(state.channel)
+                for voice_channel in guild.voice_channels:
+                    if requester in voice_channel.voice_states:
+                        candidates.append(voice_channel)
             if len(candidates) != 1:
                 print('STOP: requester must be in exactly one normal VC visible to this bot; use --guild-id if ambiguous.')
                 return
@@ -273,7 +272,7 @@ async def run(requester, guild_id=None, check_only=False):
             if not safe_members(channel, requester, client.user.id):
                 print('STOP: use an otherwise empty VC. No other people/bots may be present.')
                 return
-            if client.user.id in channel.guild.voice_states:
+            if any(client.user.id in vc.voice_states for vc in channel.guild.voice_channels):
                 print('STOP: bot is already in a VC. Stop the normal bot first.')
                 return
             print(f'Requester {requester}; guild {channel.guild.id}; channel {channel.id}.')
