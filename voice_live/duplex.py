@@ -213,9 +213,12 @@ def public_result(result, outcome=None):
     return summary
 
 
-async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None, full_persona=False):
+async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None, full_persona=False, automatic_diary=False):
     require_free_tier(confirmed_free_tier)  # Before credentials, Discord or Google.
     selection = load_selection(memory_path) if memory_path else None
+    if automatic_diary:
+        from voice_live.automatic_diary import authorize
+        selection = authorize(MemberStore(diary.MEMORY_DIR), requester, guild_id)
     persona = None
     if full_persona:
         from voice_live.identity import local_persona
@@ -299,7 +302,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
             print(f'Native model {MODEL}; voice {VOICE}. Existing key Free tier confirmed by owner; not a billing lookup.')
             print('Only your microphone goes to Google. Free API inputs/replies may improve products and be human-reviewed.')
             if memory:
-                print(('Your locally edited full text persona' if full_persona else 'Kristy short persona') + ' + your privately reviewed selected diary notes go to Google.')
+                print(('Your locally edited full text persona' if full_persona else 'Kristy short persona') + (' + your own-ID existing diary context goes to Google automatically.' if automatic_diary else ' + your privately reviewed selected diary notes go to Google.'))
                 print('Temporary input text is kept in bounded memory, no audio/full transcript files.')
                 print('One extra Google Gemini3.5FlashLite request after safe session end selects useful own-user notes.')
                 print('Conservative source checks skip ambiguous notes; remaining proposals require your private end-session SAVE confirmation.')
@@ -331,9 +334,12 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
                     while True:
                         await asyncio.sleep(1)
                         try:
-                            current = load_selection(memory_path)
+                            if automatic_diary:
+                                from voice_live.automatic_diary import validate
+                                await asyncio.to_thread(validate, store, requester, channel.guild.id, generation)
+                            current = (None if automatic_diary else load_selection(memory_path))
                             current_generation = await asyncio.to_thread(store.generation, requester)
-                            if current != selection or current_generation != generation:
+                            if (not automatic_diary and current != selection) or current_generation != generation:
                                 raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
                         except Exception:
                             memory.invalidate()
@@ -384,8 +390,13 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
                 safe_end = bool(channel and safe_members(channel, requester, client.user.id)
                     and reason in ('MANUAL_STOP', 'SESSION_LIMIT', 'IDLE_LIMIT'))
                 try:
-                    current_selection = load_selection(memory_path)
                     current_generation, _ = await asyncio.to_thread(store.snapshot, requester)
+                    if automatic_diary:
+                        from voice_live.automatic_diary import validate
+                        await asyncio.to_thread(validate, store, requester, channel.guild.id, generation)
+                        current_selection = selection
+                    else:
+                        current_selection = load_selection(memory_path)
                     safe_end = safe_end and current_selection == selection and current_generation == generation
                     facts = await memory.finish_candidates(reason=('USER_IDLE' if reason == 'IDLE_LIMIT' else reason),
                         safe=safe_end, send_once=lambda request: memory_extract_once(key, request))
@@ -403,7 +414,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
                             facts = ()
                             memory.status = 'MEMORY_NOT_SAVED_REVIEW'
                     if facts:
-                        if load_selection(memory_path) != selection:
+                        if not automatic_diary and load_selection(memory_path) != selection:
                             raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
                         saved_snapshot = await asyncio.to_thread(store.merge_reviewed, requester,
                             expected_generation=generation, facts=facts, merge=diary.merge)
@@ -413,13 +424,14 @@ async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=N
                         # new text notes or changed legacy facts.
                         from voice_live.memory import digest
                         current_generation, _ = await asyncio.to_thread(store.snapshot, requester)
-                        if current_generation != generation or load_selection(memory_path) != selection:
+                        if current_generation != generation or (not automatic_diary and load_selection(memory_path) != selection):
                             raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
                         available = {digest(item['t']) for item in saved_snapshot['facts']}
                         chosen = tuple(d for d in selection.digests if d in available)
                         chosen += tuple(digest(t) for t in facts
                             if digest(t) in available and digest(t) not in chosen)
-                        await asyncio.to_thread(private_json, memory_path, {
+                        if not automatic_diary:
+                            await asyncio.to_thread(private_json, memory_path, {
                             'owner': requester, 'guild': channel.guild.id,
                             'generation': generation, 'digests': list(dict.fromkeys(chosen))})
                     print('LIVE_MEMORY ' + json.dumps({'code': memory.status,
