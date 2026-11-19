@@ -20,6 +20,14 @@ class Music:
         self.synced = False
         self.busy = set()
         self.register()
+        self.live = None
+        if os.getenv('KRISTY_LIVE_ENABLED') == '1':
+            from voice_live.group_integration import LiveGroups
+            self.live = LiveGroups(client, self.manager,
+                os.getenv('KRISTY_LIVE_PRIVATE_CONFIG', ''),
+                notice_approved=os.getenv('KRISTY_LIVE_NOTICE_APPROVED') == '1',
+                confirmed_free_tier=os.getenv('KRISTY_LIVE_CONFIRMED_FREE_TIER') == '1')
+            self.live.register(self.tree)
 
     def register(self):
         @self.tree.command(name='joinvckristy', description='Join your VC; use its built-in text chat')
@@ -27,7 +35,7 @@ class Music:
         async def join(interaction: discord.Interaction):
             await self.execute(interaction, 'join')
 
-        @self.tree.command(name='leavevckristy', description='Clear queue and leave this VC')
+        @self.tree.command(name='leavevckristy', description='Stop Live or music and leave this VC')
         @app_commands.guild_only()
         async def leave(interaction: discord.Interaction):
             await self.execute(interaction, 'leave')
@@ -61,6 +69,8 @@ class Music:
 
     async def execute(self, interaction, action, query=''):
         try:
+            if action == 'leave' and self.live and await self.live.leave(interaction):
+                return
             self.manager.caller_channel(interaction.user, interaction.channel)
             await interaction.response.defer()
             if action == 'search':
@@ -144,6 +154,8 @@ class Music:
             self.synced = True
 
     async def voice_changed(self, member, before, after):
+        if getattr(self, 'live', None):
+            await self.live.voice_changed(member, before, after)
         p = self.manager.players.get(member.guild.id)
         if not p: return
         if member.id == self.client.user.id:
@@ -152,7 +164,12 @@ class Music:
 
     async def gateway_disconnected(self):
         # Do not silently resume voice under a changed main-gateway session.
+        if getattr(self, 'live', None):
+            await self.live.close()
         await self.manager.close()
 
     def context(self, channel): return self.manager.context(channel)
-    async def close(self): await self.manager.close()
+    async def close(self):
+        if getattr(self, 'live', None):
+            await self.live.close()
+        await self.manager.close()
