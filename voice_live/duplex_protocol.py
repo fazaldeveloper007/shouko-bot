@@ -41,8 +41,9 @@ class DuplexTurn(SessionTurn):
 
 
 class DuplexFlow:
-    def __init__(self, turn, bridge):
+    def __init__(self, turn, bridge, timings=None):
         self.turn = turn
+        self.timings = timings
         self.bridge = bridge
         self.epoch = 0
         self.active = False
@@ -97,6 +98,8 @@ class DuplexFlow:
                 self.pending_ended = self.suppressed = False
                 self.barrier.clear()
                 self.deadline = asyncio.get_running_loop().time() + 8
+                if self.timings is not None:
+                    self.timings.mark(epoch, 'input_end')
                 await bounded(self.turn.ws.send_json({'realtimeInput': {'activityEnd': {}}}), 1)
             else:
                 raise LiveError('INPUT_EVENT_INVALID')
@@ -135,6 +138,8 @@ class DuplexFlow:
                         raise LiveError('GOOGLE_AUDIO_AFTER_GENERATION')
                     if not isinstance(inline, dict) or inline.get('mimeType', '').replace(' ', '') != 'audio/pcm;rate=24000':
                         raise LiveError('GOOGLE_OUTPUT_FORMAT')
+                    if self.timings is not None:
+                        self.timings.mark(self.pending, 'first_audio')
                     data = decode_audio(inline.get('data'))
                     try:
                         if self.pending_bytes + len(data) >= 480000:
