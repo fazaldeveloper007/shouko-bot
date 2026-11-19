@@ -62,36 +62,47 @@ fixed. Keep the normal bot stopped before any eventual voice session. Preserve
 local persona edits and stop on pull conflicts, never reset/stash blindly.
 
 The review utility uses the existing `MEMORY_DIR` after `.env` loading. No keys
-are needed for preview. Substitute the already verified Discord ID and guild,
-not a username. Put private files under the gitignored memory directory, never
-upload them or paste their contents to a shared channel.
+are needed. Substitute the already verified Discord ID and guild, not a
+username. In a private local terminal, run:
 
 ```sh
-python -m voice_live.memory_review preview --user-id YOUR_ID --guild-id YOUR_GUILD --preview-file memory/voice-review.json
+python -m voice_live.memory_review pick --user-id YOUR_ID --guild-id YOUR_GUILD
 ```
 
-Open `memory/voice-review.json` privately on the phone. It starts with an empty
-`approved_digests` list. Put only the displayed digests for chosen non-sensitive
-own-user notes in that list. Exclude private locations/contacts/health/financial
-information, secrets and facts about other people. No automatic categorizer
-selects the existing notes for you. Then:
+This is a numbered local picker, no JSON or digest editing needed. It displays
+only that member's existing diary notes. Enter chosen numbers such as `1 3 5`,
+or `NONE` for an explicitly empty selection. Nothing is selected by default.
+Then type `CONFIRM` only after checking the shown choice numbers. Empty input,
+`CANCEL`, another confirmation answer or EOF leaves prior selection unchanged.
+Bad/duplicate/out-of-range choices fail without writing. Choose only your
+non-sensitive self-facts; exclude secrets and other people's private facts.
 
-```sh
-python -m voice_live.memory_review approve --user-id YOUR_ID --guild-id YOUR_GUILD --preview-file memory/voice-review.json --selection-file memory/voice-selection.json --confirmed-private-own-notes
-```
+The picker requires an interactive terminal and warns not to screenshot/share
+its private screen. Its scrollback can contain note text. No telemetry, Google,
+VC, audio or canonical-diary write occurs. It stores only selected exact fact
+digests in a0600 file under the existing gitignored memory directory:
+`voice-selection-YOUR_ID-YOUR_GUILD.json`. An optional `--selection-file` can
+choose another private location, but never put it in a shared repository.
+No plaintext fact-preview file is created by `pick`.
 
-Delete the private preview after approval. The selection contains digests, not
-note text. It is still private account metadata. `preview` and `approve` send
-nothing to Google and print counts/status only. The future gated voice command
-is `python voice_live/kristy.py` with required `--user-id`, `--guild-id`,
-`--memory-selection` and `--confirmed-free-tier` flags. It does not run on
-import. The existing generic prototype runners remain unchanged defaults for
-legacy commands, never an automatic fallback from this entrypoint.
+`MEMORY_SELECTION_READY count=N` confirms local eligibility, not transmission or
+voice start. `MEMORY_NO_EXISTING_NOTES` leaves selection unchanged. If an empty
+diary is unexpected, check the configured memory directory instead of assuming
+notes were deleted. A note edited/deleted or a forget generation changed during
+review invalidates the selection rather than approving a replacement. Preferred
+name is not silently imported; it can be supplied as an ordinary reviewed fact.
+Legacy `preview`/`approve` JSON export remains available but is not needed for
+the normal numbered flow.
+
+The later gated voice command is `python voice_live/kristy.py` with required
+`--user-id`, `--guild-id`, `--memory-selection` and `--confirmed-free-tier` flags.
+It does not run on import. The existing generic developer runners remain
+available, never an automatic fallback from this entrypoint.
 
 To invalidate voice access without deleting member notes:
 
 ```sh
-python -m voice_live.memory_review revoke --user-id YOUR_ID --guild-id YOUR_GUILD --preview-file memory/voice-review.json
+python -m voice_live.memory_review revoke --user-id YOUR_ID --guild-id YOUR_GUILD
 ```
 
 Revoke increments a shared generation. A running memory-enabled voice session
