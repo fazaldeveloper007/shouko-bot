@@ -2,11 +2,24 @@
 import asyncio
 import json
 from pathlib import Path
+import re
 from music.transport import Bridge, VoiceFailure
 from voice_probe.receive import worker_env
 from voice_live.gemini import LiveError
 from voice_live.timing import Timings
 ROOT = Path(__file__).resolve().parents[1]
+
+_END_CODE = re.compile(r'[A-Z0-9_]{2,64}').fullmatch
+
+
+def end_line(event):
+    """Content-free end line: only this code's own fixed UPPER_SNAKE codes pass."""
+    parts = []
+    for key in ('code', 'receiveStage', 'errorClass'):
+        value = event.get(key)
+        if isinstance(value, str) and _END_CODE(value):
+            parts.append(value)
+    return 'LIVE_ENDED: ' + ('/'.join(parts) if parts else 'UNKNOWN')
 
 class GroupBridge(Bridge):
     def __init__(self, client, channel, coordinator, abort):
@@ -90,6 +103,7 @@ class GroupBridge(Bridge):
                 elif kind == 'reply_done':
                     print('LIVE_WAITING: waiting for participant speech, 60s idle limit excludes playback.', flush=True)
                 elif kind == 'result':
+                    print(end_line(event), flush=True)
                     if not self.result.done():
                         self.result.set_result(event)
                     future = self.waiters.get('voice_ready')
