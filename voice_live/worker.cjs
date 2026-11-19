@@ -9,7 +9,7 @@ const {Converter}=require('./audio.cjs');
 const out=m=>process.stdout.write(JSON.stringify(m)+'\n');
 let cfg,conn,adapter,stream,decoder,encoder,player,resource,inputFilter,outputFilter;
 let ending=false,ready=false,listening=false,inputEnded=false,outputEnded=false,startedOutput=false;
-let pending=Buffer.alloc(0),frames=[],audioStream,frameSent=0,issued=[],inputBytes=0,outputBytes=0,packets=0;
+let pending=Buffer.alloc(0),frames=[],audioStream,frameSent=0,issued=[],inputBytes=0,outputBytes=0,outputNonzeroSamples=0,packets=0;
 let inputTimer,outputTimer,overallTimer,connectTimer,securityTimer,serial=0,encryptionWaiting=false;
 const acks=new Map();
 function finish(code='STOPPED'){
@@ -22,7 +22,7 @@ function finish(code='STOPPED'){
  inputFilter?.destroy();outputFilter?.destroy();
  try{decoder?.delete();}catch{}try{encoder?.delete();}catch{}
  try{conn?.destroy();}catch{}
- out({type:'result',code,packets,inputBytes,outputBytes,outputFramesRead:frameSent,daveProof});
+ out({type:'result',code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,daveProof});
  process.exitCode=['COMPLETE','OUTPUT_LIMIT','STOPPED'].includes(code)?0:1;
  setImmediate(()=>process.exit(process.exitCode));
 }
@@ -77,10 +77,15 @@ function encodeOutput(pcm){
  }
  pending=Buffer.from(combined.subarray(offset));combined.fill(0);
  if(frames.length>500)return finish('OUTPUT_QUEUE_LIMIT');
- ensurePlayer();audioStream.wake();
+ // Do not start a player on an incomplete frame.
+ if(frames.length){ensurePlayer();audioStream.wake();}
 }
 function endOutput(){
  if(ending||outputEnded)return;
+ // Less than one 20ms source frame is not a playable response. Never
+ // pad a single sample into a claimed spoken reply.
+ if(outputBytes<960)return finish('GOOGLE_AUDIO_TOO_SHORT');
+ if(!outputNonzeroSamples)return finish('GOOGLE_AUDIO_SILENT');
  if(pending.length){const frame=Buffer.alloc(3840);pending.copy(frame);pending.fill(0);pending=Buffer.alloc(0);frames.push(encoder.encode(frame,960));frame.fill(0);}
  outputEnded=true;
  if(!outputBytes)return finish('NO_AUDIO_RESPONSE');
@@ -135,7 +140,7 @@ function message(m){
    if(pcm.length%2)throw Error();
    const remaining=480000-outputBytes;
    if(pcm.length>remaining){const cut=Buffer.from(pcm.subarray(0,remaining));pcm.fill(0);pcm=cut;}
-   if(pcm.length){outputBytes+=pcm.length;converted=outputFilter.convert(pcm);encodeOutput(converted);}
+   if(pcm.length){outputBytes+=pcm.length;for(let i=0;i<pcm.length;i+=2)if(pcm.readInt16LE(i)!==0)outputNonzeroSamples++;converted=outputFilter.convert(pcm);encodeOutput(converted);}
    if(outputBytes>=480000)endOutput();
   }finally{pcm.fill(0);converted?.fill(0);}
  }else if(m.type==='output_end')endOutput();
