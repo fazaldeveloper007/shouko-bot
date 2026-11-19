@@ -104,6 +104,48 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         obj.live.leave.assert_awaited_once()
         obj.manager.get.assert_not_awaited()
 
+    async def test_second_configured_guild_can_start_live(self):
+        G2='7'*18
+        vc2=FakeVC()
+        vc2.guild=types.SimpleNamespace(id=int(G2),voice_client=None,me=types.SimpleNamespace(voice=None))
+        i2=types.SimpleNamespace(user=types.SimpleNamespace(id=int(A),voice=types.SimpleNamespace(channel=vc2)),
+            guild_id=int(G2),channel=vc2)
+        data=dict(self.data,guild_id=[G,G2])
+        hold=asyncio.Event()
+        seen=[]
+        async def wait(session,policy):
+            seen.append(policy.scope.guild)
+            await hold.wait()
+        with patch('voice_live.group_integration.load_config',return_value=(data,(A,B))),patch('voice_live.group_integration.discord.VoiceChannel',FakeVC),patch('voice_live.group_integration.discord_snapshot'),patch('voice_live.group_integration.answer',new=AsyncMock()),patch.object(self.live,'_run',side_effect=wait):
+            await self.live.start(i2)
+            self.assertIn(int(G2),self.m.voice_reservations)
+            hold.set()
+            await self.live.sessions[int(G2)].task
+        self.assertEqual(seen,[G2])
+
+    async def test_unlisted_guild_rejected_with_list_config(self):
+        G2='7'*18
+        vc2=FakeVC()
+        vc2.guild=types.SimpleNamespace(id=int(G2),voice_client=None,me=types.SimpleNamespace(voice=None))
+        i2=types.SimpleNamespace(user=types.SimpleNamespace(id=int(A),voice=types.SimpleNamespace(channel=vc2)),
+            guild_id=int(G2),channel=vc2)
+        with patch('voice_live.group_integration.load_config',return_value=(dict(self.data,guild_id=[G]),(A,B))),patch('voice_live.group_integration.discord.VoiceChannel',FakeVC):
+            with self.assertRaisesRegex(GroupPolicyError,'GROUP_GUILD_NOT_ALLOWED'):
+                await self.live.start(i2)
+        self.assertFalse(self.live.sessions)
+        self.assertFalse(self.m.voice_reservations)
+
+    async def test_voice_channel_in_other_guild_than_command_rejected(self):
+        G2='7'*18
+        vc2=FakeVC()
+        vc2.guild=types.SimpleNamespace(id=int(G2),voice_client=None,me=types.SimpleNamespace(voice=None))
+        i2=types.SimpleNamespace(user=types.SimpleNamespace(id=int(A),voice=types.SimpleNamespace(channel=vc2)),
+            guild_id=int(G),channel=vc2)
+        with patch('voice_live.group_integration.load_config',return_value=(dict(self.data,guild_id=[G,G2]),(A,B))),patch('voice_live.group_integration.discord.VoiceChannel',FakeVC):
+            with self.assertRaisesRegex(GroupPolicyError,'GROUP_GUILD_NOT_ALLOWED'):
+                await self.live.start(i2)
+        self.assertFalse(self.live.sessions)
+
 
 class EndLineTests(unittest.TestCase):
     def test_fixed_codes_pass_and_anything_else_is_dropped(self):
