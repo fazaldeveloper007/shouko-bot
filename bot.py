@@ -48,6 +48,7 @@ import discord
 from persona import SYSTEM_PROMPT
 from gifs import GIFS, CHARACTER_GIFS
 import diary
+from voice_live.member_store import MemberStore
 import aliases
 import retrying
 import self_diary
@@ -591,6 +592,7 @@ FORGET_REPLY = "done 🥺 maine tumhari diary band karke hata di, ab mujhe tumha
 # actually saved to the diary file - never before the fact is on disk.
 SAVE_CONFIRM_REPLY = "likh liya 📔 tumhari diary mein save kar diya, ab yaad rahega 💗"
 
+_pending_generation = {}  # shared-store generation captured with source exchange
 _pending = {}        # user_id -> list of (speaker, text) since last extraction
 _since_extract = {}  # user_id -> addressed messages since last extraction
 _last_extract = {}   # user_id -> time of last extraction
@@ -2002,7 +2004,7 @@ def _requeue_exchanges(user_id, exchanges):
     _pending[user_id] = deduped[-12:]
     _last_extract.pop(user_id, None)  # the failure must not start the cooldown
 
-async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None):
+async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None, generation=None):
     """Background: extract durable facts from recent exchanges and merge them.
 
     An explicit "yaad rakhna / remember this" request is retried once after a
@@ -2018,7 +2020,11 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
             if attempt:
                 await asyncio.sleep(SAVE_RETRY_DELAY)
             try:
-                mem = diary.load(user_id)
+                store = MemberStore(diary.MEMORY_DIR)
+                current_generation, mem = await asyncio.to_thread(store.snapshot, user_id)
+                if generation is None or current_generation != generation:
+                    _save_pending.discard(user_id)
+                    return
                 async with retrying.request_scope():
                     raw = await call_extractor(diary.extraction_prompt(mem, display_name, exchanges))
                 name, facts, parsed = diary.parse_extraction(raw)
@@ -2028,12 +2034,13 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
                     _save_pending.discard(user_id)
                     return  # member asked to be forgotten while we were thinking
                 if facts or name:
-                    mem = diary.load(user_id)  # re-read: it may have changed meanwhile
-                    diary.merge(mem, facts, name=name)
-                    if not diary.save(user_id, mem):
-                        raise IOError("diary.save() returned False")
+                    mem = await asyncio.to_thread(store.merge_reviewed, user_id,
+                        expected_generation=generation, facts=tuple(facts), name=name,
+                        merge=diary.merge)
                     log.info("Diary updated for %s (+%d facts, %d total)", user_id, len(facts), len(mem["facts"]))
-                ok = True
+                # An empty result is not a saved explicit request. Never give
+                # the saved confirmation if no facts/name reached disk.
+                ok = bool(facts or name) or not confirming
                 break
             except Exception as e:
                 log.warning("Diary extraction attempt %d/%d failed for %s: %s",
@@ -2048,7 +2055,16 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
                         log.warning("Could not send save confirmation in channel %s",
                                     getattr(channel, "id", channel))
         else:
-            _requeue_exchanges(user_id, exchanges)
+            # Do not revive pre-forget exchange sources after another process
+            # changed the shared generation during extraction.
+            try:
+                current_generation = await asyncio.to_thread(MemberStore(diary.MEMORY_DIR).generation, user_id)
+            except Exception:
+                current_generation = None
+            if generation is not None and current_generation == generation:
+                _requeue_exchanges(user_id, exchanges)
+            else:
+                _save_pending.discard(user_id)
     finally:
         _extract_busy = False
 
@@ -2083,7 +2099,8 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
         _last_global_extract = now
         _extract_busy = True
         task = asyncio.create_task(
-            extract_and_save(user_id, display_name, exchanges, _forget_epoch.get(user_id, 0), channel)
+            extract_and_save(user_id, display_name, exchanges, _forget_epoch.get(user_id, 0),
+                             channel, _pending_generation.get(user_id))
         )
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
@@ -2481,6 +2498,10 @@ async def on_message(message):
 
     music_context = client.music.context(message.channel) if client.music else ""
     user_id = message.author.id
+    try:
+        source_generation, _ = await asyncio.to_thread(MemberStore(diary.MEMORY_DIR).snapshot, user_id)
+    except Exception:
+        source_generation = None  # reply still works, but no stale unversioned learning
     speaker = message.author.display_name
 
     has_image = message_has_image(message)
@@ -2522,7 +2543,14 @@ async def on_message(message):
         _pending.pop(user_id, None)
         _since_extract.pop(user_id, None)
         _save_pending.discard(user_id)
-        diary.forget(user_id)
+        _pending_generation.pop(user_id, None)
+        try:
+            await asyncio.to_thread(MemberStore(diary.MEMORY_DIR).forget, user_id)
+        except Exception:
+            log.warning("Member diary deletion failed; no deletion confirmation")
+            await message.reply("Diary delete nahi hui, isliye deleted confirm nahi karungi.",
+                                mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return
         try:
             await message.reply(
                 ping_reply_text(message.author.id, FORGET_REPLY),
@@ -2760,6 +2788,16 @@ async def on_message(message):
 
     # learn from this exchange in the background, after the reply is already out
     if content and reply not in FALLBACK_LINES and reply != EMPTY_REPLY_FALLBACK:
+        try:
+            generation, _ = await asyncio.to_thread(MemberStore(diary.MEMORY_DIR).snapshot, user_id)
+        except Exception:
+            log.warning("Diary snapshot unavailable; no extraction scheduled")
+            return
+        if source_generation is None or source_generation != generation:
+            return  # a forget during this exchange invalidated its source
+        if _pending_generation.get(user_id) != generation:
+            _pending[user_id] = []  # forget/revocation invalidated older pending sources
+        _pending_generation[user_id] = generation
         buf = _pending.setdefault(user_id, [])
         if music_context:
             from music.memory import durable_exchange
