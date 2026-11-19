@@ -28,7 +28,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.vc=FakeVC()
         self.i=types.SimpleNamespace(user=types.SimpleNamespace(id=int(A),voice=types.SimpleNamespace(channel=self.vc)),
             guild_id=int(G),channel=self.vc)
-        self.data=dict(guild_id=G, owner_id=A,notice_revision='group-free-draft1')
+        self.data=dict(guild_id=G, owner_id=A,notice_revision='group-free-future-v2')
 
     async def test_live_reservation_blocks_music_and_natural_get_before_connection(self):
         self.m.voice_reservations[int(G)]=object()
