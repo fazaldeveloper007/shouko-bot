@@ -11,15 +11,15 @@ const receiveReport=require('./receive_report.cjs');
 const out=m=>process.stdout.write(JSON.stringify(m)+'\n');
 let epoch=0,turnsCompleted=0,turnOutputBytes=0,turnNonzero=0,gate,droppedChunks=0;
 let cfg,conn,adapter,stream,decoder,encoder,player,resource,inputFilter,outputFilter;
-let diagnostics,receiveFailure;
+let diagnostics,receiveFailure,draining=false,awaitingReply=false;
 let ending=false,ready=false,listening=false,outputEnded=false,startedOutput=false;
 let pending=Buffer.alloc(0),frames=[],audioStream,frameSent=0,issued=[],inputBytes=0,outputBytes=0,outputNonzeroSamples=0,packets=0;
-let inputTimer,outputTimer,overallTimer,connectTimer,securityTimer,serial=0,encryptionWaiting=false;
+let inputTimer,overallTimer,connectTimer,securityTimer,serial=0,encryptionWaiting=false;
 const acks=new Map();
 function finish(code='STOPPED'){
  if(ending)return;ending=true;listening=false;
  const daveProof=conn?proof(conn):null;gate?.destroy();
- for(const t of [inputTimer,outputTimer,overallTimer,connectTimer,securityTimer])clearTimeout(t);
+ for(const t of [inputTimer,overallTimer,connectTimer,securityTimer])clearTimeout(t);
  for(const t of acks.values())clearTimeout(t);acks.clear();
  diagnostics?.restore();diagnostics=null;
  stream?.destroy();stream=null;player?.stop(true);audioStream?.destroy();
@@ -28,7 +28,7 @@ function finish(code='STOPPED'){
  try{decoder?.delete();}catch{}try{encoder?.delete();}catch{}
  try{conn?.destroy();}catch{}
  out({type:'result',...(receiveFailure||{}),code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,turnsCompleted,droppedChunks,daveProof});
- process.exitCode=['COMPLETE','OUTPUT_LIMIT','STOPPED'].includes(code)?0:1;
+ process.exitCode=['COMPLETE','STOPPED'].includes(code)?0:1;
  setImmediate(()=>process.exit(process.exitCode));
 }
 function checkSecurity(){
@@ -43,7 +43,7 @@ function sendPayload(payload){
  out({type:'gateway_send',id,payload});return true;
 }
 function cancelOutput(){
- clearTimeout(outputTimer);gate?.setPlaying(false);
+ gate?.setPlaying(false);
  const old=player;player=null;
  old?.removeAllListeners();old?.stop(true);audioStream?.destroy();audioStream=null;resource=null;
  for(const frame of frames.concat(issued))frame.fill(0);frames=[];issued=[];pending.fill(0);pending=Buffer.alloc(0);
@@ -53,18 +53,20 @@ function cancelOutput(){
 function gateEvent(m){
  if(ending)return;
  if(m.type==='speech_start'){
+  if(draining)return finish('SESSION_LIMIT');
   cancelOutput();epoch=m.epoch;
   out({type:'speech_start',epoch});
  }else if(m.type==='audio'){
   inputBytes+=Buffer.byteLength(m.data,'base64');
   if(inputBytes>19200000)return finish('SESSION_INPUT_LIMIT');
   if(!out(m))finish('IPC_BACKPRESSURE');
- }else if(m.type==='speech_end')out(m);
+ }else if(m.type==='speech_end'){awaitingReply=true;out(m);}
 }
 function completeIfDone(){
  if(ending)return;
  if(outputEnded&&frames.length===0&&player?.state.status===v.AudioPlayerStatus.Idle){
-  turnsCompleted++;cancelOutput();out({type:'reply_done',epoch});
+  turnsCompleted++;awaitingReply=false;cancelOutput();out({type:'reply_done',epoch});
+  if(draining)finish('SESSION_LIMIT');
  }
 }
 class OpusFrames extends Readable {
@@ -86,7 +88,7 @@ function ensurePlayer(){
  player=v.createAudioPlayer({behaviors:{noSubscriber:v.NoSubscriberBehavior.Stop}});
  player.on('error',()=>finish('PLAYER_ERROR'));
  player.on('stateChange',(_,s)=>{
-  if(s.status===v.AudioPlayerStatus.Playing&&!startedOutput){startedOutput=true;outputTimer=setTimeout(()=>finish('OUTPUT_LIMIT'),10000);gate?.setPlaying(true);out({type:'playing',epoch});}
+  if(s.status===v.AudioPlayerStatus.Playing&&!startedOutput){startedOutput=true;gate?.setPlaying(true);out({type:'playing',epoch});}
   if(s.status===v.AudioPlayerStatus.Idle){gate?.setPlaying(false);completeIfDone();}
  });
  conn.subscribe(player);player.play(resource);
@@ -99,7 +101,7 @@ function encodeOutput(pcm){
   frames.push(encoder.encode(frame,960));offset+=3840;
  }
  pending=Buffer.from(combined.subarray(offset));combined.fill(0);
- if(frames.length>500)return finish('OUTPUT_QUEUE_LIMIT');
+ if(frames.length>30000)return finish('OUTPUT_QUEUE_LIMIT');
  // Do not start a player on an incomplete frame.
  if(frames.length){ensurePlayer();audioStream.wake();}
 }
@@ -114,11 +116,16 @@ function endOutput(){
  if(!turnOutputBytes)return finish('NO_AUDIO_RESPONSE');
  ensurePlayer();audioStream.wake();completeIfDone();
 }
+function sessionDeadline(){
+ if(ending||draining)return;
+ if(!awaitingReply||gate?.active)return finish('SESSION_LIMIT');
+ draining=true;out({type:'session_draining'});
+}
 function message(m){
  if(ending)return;
  if(m.type==='init'){
   if(cfg||![m.guild,m.channel,m.user,m.target].every(x=>typeof x==='string'&&/^\d{15,22}$/.test(x)))throw Error();
-  cfg=m;overallTimer=setTimeout(()=>finish('SESSION_LIMIT'),600000);connectTimer=setTimeout(()=>finish('CONNECT_TIMEOUT'),12000);
+  cfg=m;overallTimer=setTimeout(sessionDeadline,600000);connectTimer=setTimeout(()=>finish('CONNECT_TIMEOUT'),12000);
   conn=v.joinVoiceChannel({guildId:m.guild,channelId:m.channel,selfDeaf:false,selfMute:false,daveEncryption:true,debug:false,group:'kristy-native-duplex-test',adapterCreator:api=>{adapter=api;return{sendPayload,destroy:()=>{}};}});
   conn.on('error',()=>finish('VOICE_ERROR'));
   conn.receiver.speaking.on('start',id=>{if(id!==cfg.target)finish('OTHER_SPEAKER');});
@@ -160,14 +167,11 @@ function message(m){
   let pcm=Buffer.from(m.data,'base64'),converted;
   try{
    if(pcm.length%2)throw Error();
-   const remaining=480000-turnOutputBytes;
-   if(pcm.length>remaining){const cut=Buffer.from(pcm.subarray(0,remaining));pcm.fill(0);pcm=cut;}
-   if(outputBytes+pcm.length>28800000)return finish('SESSION_OUTPUT_LIMIT');
    if(pcm.length){outputBytes+=pcm.length;turnOutputBytes+=pcm.length;for(let i=0;i<pcm.length;i+=2)if(pcm.readInt16LE(i)!==0){outputNonzeroSamples++;turnNonzero++;}converted=outputFilter.convert(pcm);encodeOutput(converted);}
-   if(turnOutputBytes>=480000)return finish('OUTPUT_LIMIT');
   }finally{pcm.fill(0);converted?.fill(0);}
  }else if(m.type==='output_end'){if(Number.isInteger(m.epoch)&&m.epoch<epoch){droppedChunks++;return;}if(m.epoch!==epoch||!epoch||gate.active)throw Error();endOutput();}
  else if(m.type==='cancel_output'){if(m.epoch===epoch)cancelOutput();else if(!Number.isInteger(m.epoch)||m.epoch>epoch)throw Error();}
+ else if(m.type==='session_deadline')sessionDeadline();
  else if(m.type==='stop')finish();
  else throw Error();
 }
