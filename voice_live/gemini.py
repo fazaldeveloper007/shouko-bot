@@ -30,12 +30,15 @@ def require_model(model):
     return model
 
 
-def setup_for(model):
+def setup_for(model, voice=VOICE):
     require_model(model)
+    if voice not in (VOICE, 'Sulafat'):
+        raise LiveError('VOICE_NOT_APPROVED')
     # Fresh per-turn config, never mutate the default or select a fallback.
     import copy
     setup = copy.deepcopy(SETUP)
     setup['setup']['model'] = 'models/' + model
+    setup['setup']['generationConfig']['speechConfig']['voiceConfig']['prebuiltVoiceConfig']['voiceName'] = voice
     return setup
 
 
@@ -60,7 +63,9 @@ def decode_audio(value):
 
 
 class NativeTurn:
-    def __init__(self, key, safe, model=MODEL):
+    def __init__(self, key, safe, model=MODEL, voice=VOICE):
+        setup_for(model, voice)  # Validate before holding a key or opening a socket.
+        self.voice = voice
         self.model = require_model(model)
         self.key = key
         self.safe = safe
@@ -72,6 +77,9 @@ class NativeTurn:
         if not self.safe():
             raise LiveError('MEMBERSHIP_CHANGED')
 
+    def setup(self):
+        return setup_for(self.model, self.voice)
+
     async def open(self):
         self.check()
         self.session = aiohttp.ClientSession(trust_env=False,
@@ -82,7 +90,7 @@ class NativeTurn:
                 headers={'x-goog-api-key': self.key}, max_msg_size=1500000,
                 autoclose=True, autoping=True), 6)
             self.check()
-            await self.ws.send_json(setup_for(self.model))
+            await self.ws.send_json(self.setup())
             response = await self.receive(6)
             if not isinstance(response.get('setupComplete'), dict):
                 raise LiveError('GOOGLE_SETUP_REJECTED')
