@@ -68,29 +68,61 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         flow.bridge.audio.put_nowait({'type':'audio','epoch':1,'data':base64.b64encode(bytes(640)).decode()})
         with self.assertRaisesRegex(LiveError,'INPUT_BYTE_LIMIT'):await flow.send_input()
 
-    async def test_interruption_drops_old_chunks_until_terminal_barrier(self):
+    async def test_interruption_activity_end_first_stale_close_credited(self):
+        # Real-server order: the interrupted turn's turnComplete can lag until
+        # after the user's activityEnd. Gating activityEnd on it deadlocked.
         flow=self.flow();flow.pending=1;flow.epoch=1;flow.barrier.clear()
         send=asyncio.create_task(flow.send_input())
         flow.bridge.audio.put_nowait({'type':'speech_start','epoch':2})
         flow.bridge.audio.put_nowait({'type':'audio','epoch':2,'data':base64.b64encode(bytes(640)).decode()})
         flow.bridge.audio.put_nowait({'type':'speech_end','epoch':2})
-        await self.spin(lambda:flow.active and flow.suppressed)
-        await asyncio.sleep(0)
-        self.assertFalse(any('activityEnd' in m['realtimeInput'] for m in flow.turn.ws.sent))
+        await self.spin(lambda:any('activityEnd' in m['realtimeInput'] for m in flow.turn.ws.sent))
+        self.assertEqual(flow.pending,2)
+        self.assertEqual(flow.stale_turn_completes,1)
+        self.assertTrue(flow.drain_interrupt_pending)
         events=asyncio.Queue()
         async def receive(t):return await events.get()
         flow.turn.receive=receive
         reader=asyncio.create_task(flow.receive_output())
         await events.put(audio_event(bytes(960),complete=False))
         await events.put({'serverContent':{'interrupted':True}})
+        await self.spin(lambda:not flow.drain_interrupt_pending)
+        self.assertEqual(flow.bridge.write.call_count,0)
+        await events.put(audio_event(bytes(1920),complete=False))
+        await self.spin(lambda:flow.bridge.write.call_count==1)
         await events.put({'serverContent':{'turnComplete':True}})
+        await self.spin(lambda:flow.stale_turn_completes==0)
+        self.assertEqual(flow.pending,2)
+        await events.put({'serverContent':{'generationComplete':True,'turnComplete':True}})
+        await self.spin(lambda:flow.pending is None)
+        calls=[c.args[0] for c in flow.bridge.write.call_args_list]
+        self.assertEqual([m['type'] for m in calls],['output','output_end'])
+        self.assertTrue(all(m['epoch']==2 for m in calls))
+        self.assertTrue(flow.barrier.is_set())
+        await self.stop(send);await self.stop(reader)
+
+    async def test_interruption_closed_while_speaking_needs_no_credit(self):
+        flow=self.flow();flow.pending=1;flow.epoch=1;flow.barrier.clear()
+        send=asyncio.create_task(flow.send_input())
+        flow.bridge.audio.put_nowait({'type':'speech_start','epoch':2})
+        await self.spin(lambda:flow.active and flow.suppressed)
+        events=asyncio.Queue()
+        async def receive(t):return await events.get()
+        flow.turn.receive=receive
+        reader=asyncio.create_task(flow.receive_output())
+        await events.put({'serverContent':{'interrupted':True}})
+        await events.put({'serverContent':{'turnComplete':True}})
+        await self.spin(lambda:flow.pending is None)
+        self.assertFalse(flow.suppressed)
+        flow.bridge.audio.put_nowait({'type':'audio','epoch':2,'data':base64.b64encode(bytes(640)).decode()})
+        flow.bridge.audio.put_nowait({'type':'speech_end','epoch':2})
         await self.spin(lambda:flow.pending==2)
-        output_calls=[c.args[0] for c in flow.bridge.write.call_args_list]
-        self.assertEqual(output_calls,[{'type':'cancel_output','epoch':1}])
+        self.assertEqual(flow.stale_turn_completes,0)
         await events.put(audio_event(bytes(1920)))
         await self.spin(lambda:flow.pending is None)
         calls=[c.args[0] for c in flow.bridge.write.call_args_list]
         self.assertEqual([m['type'] for m in calls],['cancel_output','output','output_end'])
+        self.assertEqual(calls[0]['epoch'],1)
         self.assertTrue(all(m['epoch']==2 for m in calls[1:]))
         await self.stop(send);await self.stop(reader)
 
@@ -116,7 +148,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(LiveError,'GOOGLE_UNEXPECTED_ACTION'):await flow.receive_output()
 
     async def test_watch_suppressed_and_response_timeouts_not_idle_timer(self):
-        for suppressed,code in [(True,'GOOGLE_INTERRUPTION_TIMEOUT'),(False,'GOOGLE_RESPONSE_IDLE_TIMEOUT')]:
+        for suppressed,code in [(True,'GOOGLE_RESPONSE_IDLE_TIMEOUT'),(False,'GOOGLE_RESPONSE_IDLE_TIMEOUT')]:
             flow=self.flow();flow.deadline=0;flow.suppressed=suppressed
             with self.assertRaisesRegex(LiveError,code):await flow.watch()
 
