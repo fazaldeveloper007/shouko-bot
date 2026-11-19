@@ -7,9 +7,11 @@ const Opus=require('../voice_probe/node_modules/opusscript');
 const {encrypted,waitEncrypted,proof}=require('../music/dave_gate.cjs');
 const {Converter}=require('./audio.cjs');
 const {SpeechGate}=require('./speech_gate.cjs');
+const receiveReport=require('./receive_report.cjs');
 const out=m=>process.stdout.write(JSON.stringify(m)+'\n');
 let epoch=0,turnsCompleted=0,turnOutputBytes=0,turnNonzero=0,gate,droppedChunks=0;
 let cfg,conn,adapter,stream,decoder,encoder,player,resource,inputFilter,outputFilter;
+let diagnostics,receiveFailure;
 let ending=false,ready=false,listening=false,outputEnded=false,startedOutput=false;
 let pending=Buffer.alloc(0),frames=[],audioStream,frameSent=0,issued=[],inputBytes=0,outputBytes=0,outputNonzeroSamples=0,packets=0;
 let inputTimer,outputTimer,overallTimer,connectTimer,securityTimer,serial=0,encryptionWaiting=false;
@@ -19,12 +21,13 @@ function finish(code='STOPPED'){
  const daveProof=conn?proof(conn):null;gate?.destroy();
  for(const t of [inputTimer,outputTimer,overallTimer,connectTimer,securityTimer])clearTimeout(t);
  for(const t of acks.values())clearTimeout(t);acks.clear();
+ diagnostics?.restore();diagnostics=null;
  stream?.destroy();stream=null;player?.stop(true);audioStream?.destroy();
  for(const frame of frames.concat(issued))frame.fill(0);frames=[];issued=[];pending.fill(0);pending=Buffer.alloc(0);
  inputFilter?.destroy();outputFilter?.destroy();
  try{decoder?.delete();}catch{}try{encoder?.delete();}catch{}
  try{conn?.destroy();}catch{}
- out({type:'result',code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,turnsCompleted,droppedChunks,daveProof});
+ out({type:'result',...(receiveFailure||{}),code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,turnsCompleted,droppedChunks,daveProof});
  process.exitCode=['COMPLETE','OUTPUT_LIMIT','STOPPED'].includes(code)?0:1;
  setImmediate(()=>process.exit(process.exitCode));
 }
@@ -135,8 +138,10 @@ function message(m){
   if(!ready||listening)throw Error();
   inputFilter=new Converter('input');decoder=new Opus(48000,2,Opus.Application.AUDIO);
   gate=new SpeechGate(gateEvent,finish);listening=true;
+  diagnostics=receiveReport.install(conn.receiver);
+  if(!diagnostics)return finish('DIAGNOSTIC_CONTRACT_MISMATCH');
   stream=conn.receiver.subscribe(cfg.target,{end:{behavior:v.EndBehaviorType.Manual}});
-  stream.on('error',()=>finish('RECEIVE_ERROR'));
+  stream.on('error',error=>{receiveFailure=diagnostics?.classify(error)||{receiveStage:'STREAM_OTHER',errorClass:'OTHER'};finish(receiveFailure.receiveStage==='CONTRACT_MISMATCH'?'DIAGNOSTIC_CONTRACT_MISMATCH':'RECEIVE_ERROR');});
   stream.on('data',packet=>{
    let pcm,mono;
    try{
