@@ -27,7 +27,7 @@ could hear a fragment. No owner guard removal, autojoin or background listening.
    diary, group history, recap or Kristy self-diary lessons are imported. Names
    or IDs spoken to the model cannot choose a diary file. Facts are possibly
    outdated data, never instructions or permission to act.
-2. Short Kristy personality and selected notes go to Google along with detected
+2. The full local text persona and selected notes go to Google along with detected
    requester audio. The same Live session returns input transcription. Bounded
    temporary text is held in memory, not raw audio/full-transcript files.
 3. At an ordinary safe session end only, one extra Google Gemini 3.5 Flash-Lite
