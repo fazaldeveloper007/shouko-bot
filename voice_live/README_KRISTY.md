@@ -3,13 +3,15 @@
 This is a manual voice entrypoint, not always-on listening or general server
 rollout. It uses natural `duplex.py`, not the older 8-second alternating runner.
 Voice remains Gemini 3.1 Flash Live Preview / Sulafat, 60-second utterance cap,
-10-second reply cap, 60-second idle excluding actual playback, and 600 seconds
+no per-reply cutoff, 60-second idle excluding actual playback, and 600 seconds (then finish the already pending reply only)
 from START. The normal text model and local `persona.py` are unchanged.
 
-**Known blocker:** natural voice previously ended in `RECEIVE_ERROR` before
-Google audio upload. This memory update does not diagnose or repair that error.
-Offline tests are not phone proof. Do not rerun it expecting a verified repair.
-There is no added receiver instrumentation or automatic retry/fallback.
+The owner reported a successful natural-voice conversation and speaking
+interruption after the receive-reporting update. The earlier intermittent
+receive-error cause is not established, and the reporting change is not claimed
+as its root-cause fix. Fixed receive-stage diagnostics remain available. No
+automatic retry/fallback is added. These new persona, diary and reply-duration
+changes are offline-tested, not a new successful phone run.
 
 ## Privacy and review gates
 
@@ -95,7 +97,10 @@ Legacy `preview`/`approve` JSON export remains available but is not needed for
 the normal numbered flow.
 
 The later gated voice command is `python voice_live/kristy.py` with required
-`--user-id`, `--guild-id`, `--memory-selection` and `--confirmed-free-tier` flags.
+`--user-id`, `--guild-id` and `--confirmed-free-tier` flags. The reviewed selection
+file defaults to the same canonical diary directory; `--memory-selection` may
+explicitly select its private path. A missing own-user diary fails clearly rather
+than creating a blank replacement.
 It does not run on import. The existing generic developer runners remain
 available, never an automatic fallback from this entrypoint.
 
@@ -173,3 +178,17 @@ failure tolerance are unchanged. Instance methods are restored on exit; the
 current DAVE decrypt method is wrapped only during its synchronous parse call
 and restored in `finally`. Offline synthetic tests are not a successful phone
 or provider test. No new live retry is implied by this change.
+
+
+The Kristy entrypoint now reads the full local `persona.py` SYSTEM_PROMPT as a
+string without executing it or importing bot.py. Local persona edits stay local,
+and the startup START gate discloses that the persona goes to Google. The voice
+overlay limits claims to actual available voice capabilities and supplied
+context. Reviewed own-member diary selection remains required. This does not
+automatically import channel recaps, server history or other members' diaries.
+
+Storage matches text bot's import-time `diary.MEMORY_DIR`, from the hosting
+process environment or the repository's default memory directory, before dotenv
+loading. Voice and the picker do not override this with a later .env-only value.
+Use the same launch environment as text bot. Missing canonical own-ID files stop
+with `MEMORY_EXISTING_DIARY_NOT_FOUND`, not a new empty diary.
