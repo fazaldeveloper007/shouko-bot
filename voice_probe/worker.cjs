@@ -3,20 +3,23 @@
 const readline = require('node:readline');
 const v = require('@discordjs/voice');
 const OpusScript = require('opusscript');
-const {encrypted, waitEncrypted} = require('../music/dave_gate.cjs');
+const {proof, encrypted, waitEncrypted} = require('../music/dave_gate.cjs');
 const out = m => process.stdout.write(JSON.stringify(m)+'\n');
 let cfg, conn, adapter, stream, decoder, ending=false, ready=false, serial=0;
-let deadline, connectDeadline, initDeadline;
+let deadline, connectDeadline, initDeadline, encryptionWaiting=false;
 const acks=new Map();
 const stats={packets:0, samples:0, nonzeroSamples:0, peak:0};
 function finish(code='STOPPED') {
  if(ending)return; ending=true;
+ // Fixed proof projection only, before connection.destroy discards the state.
+ // Never expose raw networking objects, keys, session IDs or privacy codes.
+ const daveProof=conn?proof(conn):null;
  clearTimeout(deadline); clearTimeout(connectDeadline);
  for(const t of acks.values())clearTimeout(t); acks.clear();
  stream?.destroy(); stream=null;
  try{decoder?.delete();}catch{} decoder=null;
  try{conn?.destroy();}catch{}
- out({type:'result',code,...stats});
+ out({type:'result',code,...stats,daveProof});
  // Decoder memory is released; JS/native allocators cannot promise forensic zeroization.
  process.exitCode=code==='STOPPED'||code==='TIME_LIMIT'?0:1;
  setImmediate(()=>process.exit(process.exitCode));
@@ -56,8 +59,14 @@ function message(m) {
   conn.on('error',()=>finish('VOICE_ERROR'));
   conn.on('stateChange',(_,s)=>{
    if(ending)return;
-   if(s.status===v.VoiceConnectionStatus.Ready&&!ready){
-    waitEncrypted(conn,{timeoutMs:10000}).then(()=>{clearTimeout(connectDeadline);startReceive();}).catch(()=>finish('DAVE_WAIT_FAILED'));
+   if(s.status===v.VoiceConnectionStatus.Ready&&!ready&&!encryptionWaiting){
+    encryptionWaiting=true;
+    waitEncrypted(conn,{timeoutMs:10000}).then(()=>{clearTimeout(connectDeadline);startReceive();}).catch(error=>{
+     const code=error?.message==='DAVE_WAIT_TIMEOUT'?'DAVE_TIMEOUT':
+                error?.message==='DAVE_CONNECTION_LOST'?'DAVE_CONNECTION_LOST':
+                error?.message==='DAVE_WAIT_CANCELLED'?'DAVE_CANCELLED':'DAVE_WAIT_FAILED';
+     finish(code);
+    });
    }else if(ready&&s.status!==v.VoiceConnectionStatus.Ready)finish('VOICE_DISCONNECTED');
   });
  }else if(m.type==='ack') {
