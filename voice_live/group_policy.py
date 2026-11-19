@@ -34,6 +34,9 @@ class GroupScope:
     bot: str
     allowlist: frozenset
     notice_revision: str
+    # 'restricted' also demands locked channel overwrites; 'open' leaves an
+    # existing public VC untouched and relies on runtime roster gating only.
+    channel_gate: str = 'restricted'
 
     def __post_init__(self):
         for value in (self.guild, self.channel, self.bot):
@@ -44,6 +47,8 @@ class GroupScope:
         if (not isinstance(self.notice_revision, str) or
                 not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}', self.notice_revision)):
             raise GroupPolicyError('GROUP_NOTICE_INVALID')
+        if self.channel_gate not in ('restricted', 'open'):
+            raise GroupPolicyError('GROUP_CHANNEL_GATE_INVALID')
 
 
 class GroupSessionPolicy:
