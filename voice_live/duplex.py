@@ -215,6 +215,11 @@ def public_result(result, outcome=None):
 
 async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None, full_persona=False, automatic_diary=False):
     require_free_tier(confirmed_free_tier)  # Before credentials, Discord or Google.
+    # Free-tier terms prohibit personal/confidential/sensitive input, including
+    # system instructions. Existing local persona/diary content is unverified.
+    # Neither owner consent nor keyword filtering certifies arbitrary sources.
+    if full_persona or automatic_diary or memory_path is not None:
+        raise LiveError('FREE_SOURCE_REVIEW_REQUIRED')
     selection = load_selection(memory_path) if memory_path else None
     if automatic_diary:
         from voice_live.automatic_diary import authorize
