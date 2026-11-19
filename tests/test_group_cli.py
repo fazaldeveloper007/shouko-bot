@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import AsyncMock, patch
 from test_group_policy import A, B, BOT, G, CH
-from voice_live.group_config import load_config, configured_scope
+from voice_live.group_config import load_config, config_guilds, configured_scope
 from voice_live.group_policy import GroupPolicyError
 from voice_live import group
 
@@ -25,7 +25,7 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
 
     def test_private_config_owner_plus_members_no_consent(self):
         data, ids=self.load(self.config())
-        scope=configured_scope(data,ids,BOT)
+        scope=configured_scope(data,ids,BOT,G)
         self.assertEqual(scope.allowlist,frozenset((A,B)))
         self.assertEqual(data['consents'],[])
 
@@ -33,7 +33,7 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
         data=self.config();data['voice_channel_id']=None
         data, ids=self.load(data)
         with self.assertRaises(GroupPolicyError):
-            configured_scope(data,ids,BOT)
+            configured_scope(data,ids,BOT,G)
 
     def test_config_cannot_store_reusable_consent_or_notice_approval(self):
         for name,value in [('consents',[A]),('notice_approved',True),('maximum_concurrent_humans',12)]:
@@ -43,9 +43,9 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
 
     def test_channel_gate_config_optional_and_validated(self):
         data, ids = self.load(self.config())
-        self.assertEqual(configured_scope(data, ids, BOT).channel_gate, 'restricted')
+        self.assertEqual(configured_scope(data, ids, BOT, G).channel_gate, 'restricted')
         data, ids = self.load(dict(self.config(), channel_gate='open'))
-        self.assertEqual(configured_scope(data, ids, BOT).channel_gate, 'open')
+        self.assertEqual(configured_scope(data, ids, BOT, G).channel_gate, 'open')
         with self.assertRaises(GroupPolicyError):
             self.load(dict(self.config(), channel_gate='public'))
 
@@ -75,3 +75,14 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await view.interaction_check(NS(user=NS(id=int(A)),guild_id=int(G))))
         self.assertFalse(await view.interaction_check(NS(user=NS(id=int(BOT)),guild_id=int(G))))
         view.stop()
+
+
+    def test_guild_id_single_string_or_unique_short_list(self):
+        data, ids = self.load(self.config())
+        self.assertEqual(config_guilds(data), frozenset((G,)))
+        G2 = '7'*18
+        data, ids = self.load(dict(self.config(), guild_id=[G, G2]))
+        self.assertEqual(config_guilds(data), frozenset((G, G2)))
+        for bad in ([], [G, G], [G, 'not-a-snowflake'], [G]*9, 12345, None):
+            with self.assertRaises(GroupPolicyError):
+                config_guilds(dict(self.config(), guild_id=bad))
