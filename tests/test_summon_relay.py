@@ -199,6 +199,47 @@ class SummonRelay(unittest.IsolatedAsyncioTestCase):
         self.assertIn('save nahi hua', m.reply.await_args.args[0])
         self.assertIsNone(self.bot.aliases.resolve(555, 'Miku'))
 
+    async def test_shared_diary_generation_blocks_late_text_extraction(self):
+        from voice_live.member_store import MemberStore
+        self.bot.diary.MEMORY_DIR = pathlib.Path(self._tmp.name)/'member-memory'
+        store = MemberStore(self.bot.diary.MEMORY_DIR)
+        generation, _ = store.snapshot(1)
+        self.bot._save_pending.add(1)
+        channel = types.SimpleNamespace(send=AsyncMock())
+        async def extractor(prompt):
+            store.forget(1)
+            return '{"name":"", "facts":["Likes puzzles"]}'
+        with patch.object(self.bot, 'call_extractor', extractor):
+            await self.bot.extract_and_save(1, 'Synthetic member', [('Synthetic member','I like puzzles')],
+                                            0, channel, generation)
+        self.assertEqual(store.snapshot(1)[1]['facts'], [])
+        self.assertNotIn(1, self.bot._pending)
+        channel.send.assert_not_awaited()
+
+    async def test_shared_diary_text_confirmation_only_after_actual_save(self):
+        from voice_live.member_store import MemberStore
+        self.bot.diary.MEMORY_DIR = pathlib.Path(self._tmp.name)/'member-memory'
+        store = MemberStore(self.bot.diary.MEMORY_DIR)
+        generation, _ = store.snapshot(1)
+        self.bot._save_pending.add(1)
+        channel = types.SimpleNamespace(send=AsyncMock())
+        with patch.object(self.bot, 'call_extractor', AsyncMock(return_value='{"facts":["Likes puzzles"]}')):
+            await self.bot.extract_and_save(1, 'Synthetic member', [('Synthetic member','I like puzzles')],
+                                            0, channel, generation)
+        self.assertEqual(store.snapshot(1)[1]['facts'][0]['t'], 'Likes puzzles')
+        channel.send.assert_awaited_once()
+
+    async def test_shared_diary_text_empty_result_no_false_saved(self):
+        from voice_live.member_store import MemberStore
+        self.bot.diary.MEMORY_DIR = pathlib.Path(self._tmp.name)/'member-memory'
+        generation, _ = MemberStore(self.bot.diary.MEMORY_DIR).snapshot(1)
+        self.bot._save_pending.add(1)
+        channel = types.SimpleNamespace(send=AsyncMock())
+        with patch.object(self.bot, 'call_extractor', AsyncMock(return_value='{"facts":[]}')):
+            await self.bot.extract_and_save(1, 'Synthetic member', [('Synthetic member','I like puzzles')],
+                                            0, channel, generation)
+        channel.send.assert_not_awaited()
+
     async def test_requester_no_send_permission_rejected(self):
         dest = self.dest()
         dest.permissions_for = lambda who: types.SimpleNamespace(
