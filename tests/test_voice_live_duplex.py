@@ -44,6 +44,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             config=socket.sent[0]['setup']
             self.assertEqual(config['realtimeInputConfig'],{'automaticActivityDetection':{'disabled':True},'activityHandling':'START_OF_ACTIVITY_INTERRUPTS'})
             self.assertEqual(config['model'],'models/gemini-3.1-flash-live-preview')
+            self.assertNotIn('maxOutputTokens',config['generationConfig'])
+            self.assertNotIn('briefly',config['systemInstruction']['parts'][0]['text'])
             self.assertEqual(config['generationConfig']['speechConfig']['voiceConfig']['prebuiltVoiceConfig']['voiceName'],'Sulafat')
             await turn.close()
         flow=self.flow();task=asyncio.create_task(flow.send_input())
@@ -118,14 +120,26 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             flow=self.flow();flow.deadline=0;flow.suppressed=suppressed
             with self.assertRaisesRegex(LiveError,code):await flow.watch()
 
-    async def test_output_cap_and_input_epoch_errors_fail_closed(self):
-        flow=self.flow();flow.pending=1;flow.turn.ws=Socket([audio_event(bytes(480000))])
-        with self.assertRaisesRegex(LiveError,'OUTPUT_LIMIT'):await flow.receive_output()
-        flow.bridge.write.assert_not_awaited()
+    async def test_input_epoch_errors_fail_closed(self):
         for event in ({'type':'speech_start','epoch':2},{'type':'speech_end','epoch':1},
                       {'type':'audio','epoch':1,'data':'AAAA'}):
             flow=self.flow();flow.bridge.audio.put_nowait(event)
             with self.assertRaisesRegex(LiveError,'INPUT_EPOCH_INVALID'):await flow.send_input()
+
+    async def test_reply_longer_than_old_ten_seconds_reaches_generation_end(self):
+        flow=self.flow();flow.pending=1
+        events=[audio_event(bytes(24000),complete=False) for _ in range(24)]
+        events.append({'serverContent':{'generationComplete':True,'turnComplete':True}})
+        queue=asyncio.Queue()
+        for event in events:queue.put_nowait(event)
+        async def receive(timeout):return await queue.get()
+        flow.turn.receive=receive
+        task=asyncio.create_task(flow.receive_output())
+        await self.spin(lambda:flow.barrier.is_set() and flow.pending is None)
+        await self.stop(task)
+        calls=[c.args[0] for c in flow.bridge.write.call_args_list]
+        self.assertEqual(sum(len(base64.b64decode(m['data'])) for m in calls if m['type']=='output'),576000)
+        self.assertEqual(calls[-1],{'type':'output_end','epoch':1})
 
     async def test_exchange_always_closes_and_no_credentials_before_free_gate(self):
         turn=types.SimpleNamespace(open=AsyncMock(),close=AsyncMock())
@@ -182,18 +196,25 @@ BODY=r'''
  await new Promise(r=>setTimeout(r,850));timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();
  assert.equal(messages.filter(m=>m.type==='speech_end').length,1);
  const response=mode==='tiny'?Buffer.alloc(2):mode==='silent'?Buffer.alloc(24000):mono;
- send({type:'output',epoch:1,data:response.toString('base64')});
+ if(mode==='long'){for(let i=0;i<24;i++)send({type:'output',epoch:1,data:mono.toString('base64')});send({type:'output_end',epoch:1});}
+ else send({type:'output',epoch:1,data:response.toString('base64')});
  if(['tiny','silent'].includes(mode)){send({type:'output_end',epoch:1});}
  else if(mode==='buffering'){
   for(let i=0;i<8;i++)await inputPacket();
  }else{
   await new Promise(r=>setTimeout(r,90));assert.ok(messages.some(m=>m.type==='playing'));
-  if(mode==='barge')for(let i=0;i<8;i++)await inputPacket();
+  if(mode==='long'){assert.ok(!messages.some(m=>m.type==='result'));assert.equal(timers.filter(t=>t.ms===10000&&!t.cancelled).length,1);send({type:'stop'});}
+  else if(mode==='barge')for(let i=0;i<8;i++)await inputPacket();
   else if(mode==='stop')send({type:'stop'});
   else if(mode==='dave'){encrypted=false;timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();}
   else if(mode==='member')conn.receiver.speaking.emit('start','500000000000000');
-  else if(mode==='deadline')timers.find(t=>t.ms===600000).fn();
-  else if(mode==='outputlimit')timers.filter(t=>t.ms===10000&&!t.cancelled).at(-1).fn();
+  else if(['deadline','drainbarge','drainstop','drainmember'].includes(mode)){
+   timers.find(t=>t.ms===600000).fn();assert.ok(messages.some(m=>m.type==='session_draining'));assert.ok(!messages.some(m=>m.type==='result'));
+   if(mode==='drainbarge')for(let i=0;i<8;i++)await inputPacket();
+   else if(mode==='drainstop')send({type:'stop'});
+   else if(mode==='drainmember')conn.receiver.speaking.emit('start','500000000000000');
+   else {send({type:'output_end',epoch:1});await new Promise(r=>setTimeout(r,650));}
+  }
  }
  if(['barge','buffering'].includes(mode)){
   assert.equal(messages.filter(m=>m.type==='speech_start').length,2);
@@ -218,13 +239,18 @@ class RealDuplex(unittest.TestCase):
         p=subprocess.run(['node','-e',GATE,str(ROOT)],capture_output=True,text=True,timeout=5)
         self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(p.stdout.strip(),'GATE_OK')
     def test_real_simultaneous_receive_playback_interrupt_and_safety(self):
-        for mode,code in [('barge','STOPPED'),('buffering','STOPPED'),('stop','STOPPED'),('dave','DAVE_NOT_READY'),
-                          ('member','OTHER_SPEAKER'),('deadline','SESSION_LIMIT'),('outputlimit','OUTPUT_LIMIT'),
+        for mode,code in [('long','STOPPED'),('barge','STOPPED'),('buffering','STOPPED'),('stop','STOPPED'),('dave','DAVE_NOT_READY'),
+                          ('member','OTHER_SPEAKER'),('deadline','SESSION_LIMIT'),('drainbarge','SESSION_LIMIT'),('drainstop','STOPPED'),('drainmember','OTHER_SPEAKER'),
                           ('tiny','GOOGLE_AUDIO_TOO_SHORT'),('silent','GOOGLE_AUDIO_SILENT')]:
             with self.subTest(mode=mode):
                 p=subprocess.run(['node','-e',PREFIX+BODY,str(ROOT),mode],capture_output=True,text=True,timeout=6)
                 self.assertEqual(p.returncode,0,p.stderr)
                 data=json.loads(p.stdout);self.assertEqual(data['result']['code'],code)
+                if mode=='deadline':self.assertEqual(data['result']['turnsCompleted'],1)
+                if mode=='drainbarge':self.assertEqual(data['types'].count('speech_start'),1)
+                if mode=='long':
+                    self.assertEqual(data['result']['outputBytes'],576000)
+                    self.assertGreater(data['dispatched'],0)
                 if mode in ('barge','buffering'):
                     self.assertEqual(data['result']['turnsCompleted'],1)
                     self.assertEqual(data['result']['droppedChunks'],2)
