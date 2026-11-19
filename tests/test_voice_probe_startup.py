@@ -66,6 +66,14 @@ class StartupDiagnostics(unittest.IsolatedAsyncioTestCase):
         self.assertIn('PROBE_JOIN_NOT_REQUESTED', ' '.join(str(c) for c in output.call_args_list))
         fake.close.assert_awaited_once()
 
+    def test_result_projection_never_forwards_keys_or_privacy_values(self):
+        result = probe.public_result({'code': 'DAVE_TIMEOUT', 'token': 'SYNTHETIC_SECRET',
+                                      'daveProof': {'sessionReady': False, 'secretKey': 'SYNTHETIC_SECRET',
+                                                    'voicePrivacyCode': 'SYNTHETIC_SECRET'}})
+        self.assertNotIn('SYNTHETIC_SECRET', str(result))
+        self.assertFalse(result['daveProof']['sessionReady'])
+        self.assertNotIn('secretKey', result['daveProof'])
+
     async def test_check_only_never_constructs_discord_client(self):
         stack = self.common()
         stack.enter_context(patch.dict(probe.os.environ, {'DISCORD_TOKEN': 'SYNTHETIC_PRIVATE_TOKEN'}))
