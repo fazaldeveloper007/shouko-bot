@@ -80,6 +80,9 @@ class NativeTurn:
     def setup(self):
         return setup_for(self.model, self.voice)
 
+    async def start_initial_activity(self):
+        await self.ws.send_json({'realtimeInput': {'activityStart': {}}})
+
     async def open(self):
         self.check()
         self.session = aiohttp.ClientSession(trust_env=False,
@@ -94,7 +97,7 @@ class NativeTurn:
             response = await self.receive(6)
             if not isinstance(response.get('setupComplete'), dict):
                 raise LiveError('GOOGLE_SETUP_REJECTED')
-            await self.ws.send_json({'realtimeInput': {'activityStart': {}}})
+            await self.start_initial_activity()
         except BaseException:
             await self.close()
             raise
