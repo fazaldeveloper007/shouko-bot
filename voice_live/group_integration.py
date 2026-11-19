@@ -110,6 +110,7 @@ class LiveGroups:
             current, ids = load_config(self.config_path)
             if (current['guild_id'] != policy.scope.guild or
                     frozenset(ids) != policy.scope.allowlist or
+                    current.get('channel_gate', 'restricted') != policy.scope.channel_gate or
                     current['notice_revision'] != policy.scope.notice_revision):
                 changed = configured_scope(dict(current, voice_channel_id=policy.scope.channel), ids, policy.scope.bot)
                 self.consent_store.valid(changed)  # Clear old scope before stopping.
