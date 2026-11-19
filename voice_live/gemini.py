@@ -5,6 +5,8 @@ import json
 import aiohttp
 
 MODEL = 'gemini-3.8-live'
+COMPARISON_MODEL = 'gemini-3.1-flash-live-preview'
+ALLOWED_MODELS = (MODEL, COMPARISON_MODEL)
 VOICE = 'Kore'
 ENDPOINT = ('wss://generativelanguage.googleapis.com/ws/'
             'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent')
@@ -20,6 +22,21 @@ SETUP = {'setup': {'model': 'models/' + MODEL,
 
 class LiveError(RuntimeError):
     """Fixed public reason code only."""
+
+
+def require_model(model):
+    if model not in ALLOWED_MODELS:
+        raise LiveError('MODEL_NOT_APPROVED')
+    return model
+
+
+def setup_for(model):
+    require_model(model)
+    # Fresh per-turn config, never mutate the default or select a fallback.
+    import copy
+    setup = copy.deepcopy(SETUP)
+    setup['setup']['model'] = 'models/' + model
+    return setup
 
 
 def require_free_tier(confirmed):
@@ -43,7 +60,8 @@ def decode_audio(value):
 
 
 class NativeTurn:
-    def __init__(self, key, safe):
+    def __init__(self, key, safe, model=MODEL):
+        self.model = require_model(model)
         self.key = key
         self.safe = safe
         self.session = self.ws = None
@@ -64,7 +82,7 @@ class NativeTurn:
                 headers={'x-goog-api-key': self.key}, max_msg_size=1500000,
                 autoclose=True, autoping=True), 6)
             self.check()
-            await self.ws.send_json(SETUP)
+            await self.ws.send_json(setup_for(self.model))
             response = await self.receive(6)
             if not isinstance(response.get('setupComplete'), dict):
                 raise LiveError('GOOGLE_SETUP_REJECTED')
