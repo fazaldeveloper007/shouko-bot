@@ -93,7 +93,7 @@ const sandbox={Buffer,require:name=>{
  if(name==='node:readline')return{createInterface:()=>input};
  if(name==='@discordjs/voice')return voice;
  if(name==='opusscript')return O;
- if(name==='../music/dave_gate.cjs')return{encrypted:()=>encrypted,waitEncrypted:async()=>{}};
+ if(name==='../music/dave_gate.cjs')return{proof:()=>({transportReady:true,protocol:1,sessionReady:encrypted,privacyPresent:encrypted,reinitializing:false,transitionExecuted:true,pendingTransitions:0}),encrypted:()=>encrypted,waitEncrypted:async()=>{if(scenario==='dave_timeout')throw Error('DAVE_WAIT_TIMEOUT');}};
  throw Error('Unexpected dependency: '+name);
 },setTimeout:(fn,ms)=>{const t={fn,ms,unref(){}};timers.push(t);return t;},clearTimeout:()=>{},setImmediate:fn=>fn(),
 process:{stdout:{write:s=>messages.push(JSON.parse(s))},stdin:{},on:()=>{},exit:()=>{},exitCode:0}};
@@ -101,7 +101,7 @@ vm.runInNewContext(fs.readFileSync(root+'/voice_probe/worker.cjs','utf8'),sandbo
 function send(m){input.emit('line',JSON.stringify(m));}
 send({type:'init',guild:'100000000000000',channel:'200000000000000',user:'300000000000000',target:'400000000000000'});
 connection.emit('stateChange',{}, {status:'ready'});
-Promise.resolve().then(()=>{
+Promise.resolve().then(()=>Promise.resolve()).then(()=>{
  if(scenario==='other')speaking.emit('start','500000000000000');
  if(scenario==='dave_lost')encrypted=false;
  if(scenario==='decode'||scenario==='dave_lost'){
@@ -133,7 +133,7 @@ class Worker(unittest.TestCase):
         self.assertGreater(summary['nonzeroSamples'], 0)
         self.assertTrue(result['wiped'])
         self.assertTrue(result['destroyed'])
-        self.assertEqual(set(summary), {'type', 'code', 'packets', 'samples', 'nonzeroSamples', 'peak'})
+        self.assertEqual(set(summary), {'type', 'code', 'packets', 'samples', 'nonzeroSamples', 'peak', 'daveProof'})
 
     def test_no_other_user_subscription_and_stop_on_other_speaker(self):
         result = self.run_scenario('other')
@@ -145,6 +145,12 @@ class Worker(unittest.TestCase):
         result = self.run_scenario('dave_lost')
         self.assertEqual(result['messages'][-1]['code'], 'DAVE_NOT_READY')
         self.assertEqual(result['messages'][-1]['packets'], 0)
+
+    def test_dave_wait_timeout_reports_fixed_proof_without_audio(self):
+        result = self.run_scenario('dave_timeout')
+        self.assertEqual(result['messages'][-1]['code'], 'DAVE_TIMEOUT')
+        self.assertEqual(result['messages'][-1]['packets'], 0)
+        self.assertTrue(result['messages'][-1]['daveProof']['transportReady'])
 
     def test_manual_stop_cleans_stream(self):
         result = self.run_scenario('stop')
