@@ -113,6 +113,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('maxOutputTokens', setup['generationConfig'])
         self.assertIn('Do not claim to recognize', setup['systemInstruction']['parts'][0]['text'])
 
+    def test_group_persona_curated_no_private_facts(self):
+        text = GroupTurn('FAKE', lambda: True).setup()['setup']['systemInstruction']['parts'][0]['text']
+        for kept in ('Kristy', 'Genshin', 'rishta', 'Hinglish', 'Do not claim to recognize'):
+            self.assertIn(kept, text)
+        for removed in ('Fazal', 'Fazallette', 'Bhau', '[[react:', 'diary so you remember', 'recap'):
+            self.assertNotIn(removed, text)
+
     async def test_lifecycle_default_denies_before_any_connect(self):
         client = NS(user=NS(id=int(BOT)))
         channel = NS(connect=AsyncMock())
