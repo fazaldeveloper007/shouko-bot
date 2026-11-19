@@ -14,6 +14,12 @@ from music.transport import Bridge, VoiceFailure
 from voice_probe.receive import existing_token, worker_env, safe_members, snowflake, console_line
 from voice_live.gemini import LiveError, require_free_tier
 from voice_live.duplex_protocol import DuplexTurn, DuplexFlow
+from voice_live.memory import MemoryErrorCode
+from voice_live.member_store import MemberStore
+from voice_live.memory_review import load_selection, private_json
+from voice_live.memory_session import SessionMemory, MemoryDuplexTurn
+from voice_live.timing import Timings
+import diary
 MODEL = 'gemini-3.1-flash-live-preview'
 VOICE = 'Sulafat'
 
@@ -59,6 +65,7 @@ class LiveBridge(Bridge):
         super().__init__(client, channel, ROOT, 1, self.failure)
         self.requester = requester
         self.abort = abort
+        self.timings = Timings()
         self.audio = asyncio.Queue(maxsize=96)
         self.result = asyncio.get_running_loop().create_future()
 
@@ -121,6 +128,7 @@ class LiveBridge(Bridge):
                     elif kind == 'speech_end':
                         print('LIVE_REPLY_PENDING: local speech pause detected.', flush=True)
                 elif kind == 'playing':
+                    self.timings.mark(event.get('epoch'), 'playing')
                     print('LIVE_PLAYING: speaking; requester can interrupt. STOP ends session.', flush=True)
                 elif kind == 'reply_done':
                     print('LIVE_WAITING: waiting for requester speech, 60s idle limit excludes playback.', flush=True)
@@ -154,17 +162,41 @@ class LiveBridge(Bridge):
         return await super().disconnect(force=force)
 
 
-async def exchange(bridge, key):
-    turn = DuplexTurn(key, bridge.safe)
+async def exchange(bridge, key, memory=None):
+    turn = MemoryDuplexTurn(key, bridge.safe, memory) if memory else DuplexTurn(key, bridge.safe)
     try:
         await turn.open()
         bridge.future('listening')
         await bridge.write({'type': 'listen'})
         await bridge.wait('listening', 1)
         print('LIVE_LISTENING: local requester monitoring active, earphones recommended. Speak naturally.', flush=True)
-        await DuplexFlow(turn, bridge).run()
+        await DuplexFlow(turn, bridge, bridge.timings if memory else None).run()
     finally:
         await turn.close()
+
+
+async def memory_extract_once(key, request):
+    import aiohttp
+    if request.get('model') != 'gemini-3.5-flash-lite':
+        raise LiveError('MEMORY_EXTRACTOR_NOT_APPROVED')
+    endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent'
+    payload = {'systemInstruction': {'parts': [{'text': request['system_instruction']}]},
+        'contents': [{'role': 'user', 'parts': [{'text': json.dumps(request['source_turns'], ensure_ascii=False)}]}],
+        'generationConfig': {'maxOutputTokens': 600, 'temperature': .2, 'responseMimeType': 'application/json'}}
+    async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=18)) as session:
+        async with session.post(endpoint, headers={'x-goog-api-key': key}, json=payload, allow_redirects=False) as response:
+            if response.status != 200:
+                raise LiveError('MEMORY_EXTRACTION_FAILED')
+            # Bound bytes before decoding provider output, not after response.json.
+            data = await response.content.read(32769)
+            if len(data) > 32768:
+                raise LiveError('MEMORY_EXTRACTION_FAILED')
+            result = json.loads(data)
+            parts = result['candidates'][0]['content']['parts']
+            text = ''.join(p.get('text', '') for p in parts if not p.get('thought'))
+            if len(text) > 8192:
+                raise LiveError('MEMORY_EXTRACTION_FAILED')
+            return text
 
 
 def public_result(result, outcome=None):
@@ -175,12 +207,19 @@ def public_result(result, outcome=None):
     return summary
 
 
-async def run(requester, guild_id=None, confirmed_free_tier=False):
+async def run(requester, guild_id=None, confirmed_free_tier=False, memory_path=None):
     require_free_tier(confirmed_free_tier)  # Before credentials, Discord or Google.
+    selection = load_selection(memory_path) if memory_path else None
+    if selection and (selection.owner != requester or guild_id != selection.guild):
+        raise LiveError('MEMORY_SCOPE_CHANGED')
     if not sys.stdin.isatty():
         raise LiveError('TERMINAL_REQUIRED')
     token = existing_token()
     key = existing_gemini_key()
+    # Credential loader resolved nearest .env; now honor its existing memory
+    # directory setting too, without importing bot.py or reading other diaries.
+    if os.getenv('MEMORY_DIR'):
+        diary.MEMORY_DIR = Path(os.environ['MEMORY_DIR']).expanduser()
     # Read-only dependency check, no API/network import side effects.
     check = await asyncio.create_subprocess_exec('node', '-e',
         "require('./voice_probe/node_modules/@discordjs/voice');require('./voice_probe/node_modules/opusscript');require('./voice_live/audio.cjs')",
@@ -226,6 +265,11 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
         launched = True
         stop = task = safety = None
         outcome = None
+        memory = None
+        store = MemberStore(diary.MEMORY_DIR) if selection else None
+        generation = None
+        channel = None
+        memory_watch = None
         try:
             channels = [ch for g in client.guilds if guild_id is None or g.id == guild_id
                         for ch in g.voice_channels if requester in ch.voice_states]
@@ -236,16 +280,29 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
                 raise LiveError('VC_NOT_EMPTY')
             if any(client.user.id in ch.voice_states for ch in channel.guild.voice_channels):
                 raise LiveError('BOT_ALREADY_IN_VC')
+            if selection:
+                generation, snapshot = await asyncio.to_thread(store.snapshot, requester)
+                memory = SessionMemory(selection=selection, requester=requester,
+                    guild=channel.guild.id, generation=generation, facts=snapshot['facts'])
+                snapshot = None
             print(f'Requester {requester}; guild {channel.guild.id}; channel {channel.id}.')
             print(f'Native model {MODEL}; voice {VOICE}. Existing key Free tier confirmed by owner; not a billing lookup.')
             print('Only your microphone goes to Google. Free API inputs/replies may improve products and be human-reviewed.')
-            print('Use a NON-SENSITIVE test phrase. No chat history/diaries/transcripts/recording. Normal bot must be stopped.')
+            if memory:
+                print('Kristy short persona + your privately reviewed selected diary notes go to Google.')
+                print('Temporary input text is kept in bounded memory, no audio/full transcript files.')
+                print('One extra Google Gemini3.5FlashLite request after safe session end selects useful own-user notes.')
+                print('Conservative source checks skip ambiguous notes; remaining proposals require your private end-session SAVE confirmation.')
+                print('No per-reply extraction, paid/Groq fallback, source transcript logs or promises of crash-proof saving.')
+            else:
+                print('Use a NON-SENSITIVE test phrase. No chat history/diaries/transcripts/recording.')
+            print('Normal bot must be stopped. Keep the whole voice session non-sensitive.')
             print('Speech ends on natural pause (~0.8s), 60s hard input cap; 10s reply cap; 600s total from START.')
             print('60s user-idle limit excludes Kristy playback. No guarantee of uninterrupted duration.')
             print('Local microphone monitoring continues during replies for barge-in; earphones needed against echo.')
             print('Only detected utterance audio plus up to 200ms onset buffer goes to Google, no idle stream.')
             print('Local energy detection can mistake noise/quiet speech. Any hard input/output cap ends session.')
-            print('Session-only context at Google, no history/resume. Early connection/quota/error stops; no reconnect/fallback.')
+            print('No unselected history or session resumption. Connection/quota/error stops, no reconnect/fallback.')
             print('Empty restricted VC only. Any terminal input or Ctrl+C stops. Type START within 60s to agree and start.', flush=True)
             if await asyncio.wait_for(console_line(), 60) != 'START':
                 return
@@ -257,8 +314,22 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             async def session():
                 await channel.connect(cls=lambda c, ch: bridge, timeout=12, reconnect=False,
                                       self_deaf=False, self_mute=False)
-                await exchange(bridge, key)
+                await exchange(bridge, key, memory)
                 await asyncio.shield(bridge.result)
+            if memory:
+                async def watch_memory():
+                    while True:
+                        await asyncio.sleep(1)
+                        try:
+                            current = load_selection(memory_path)
+                            current_generation = await asyncio.to_thread(store.generation, requester)
+                            if current != selection or current_generation != generation:
+                                raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
+                        except Exception:
+                            memory.invalidate()
+                            abort.set()
+                            return
+                memory_watch = asyncio.create_task(watch_memory())
             task = asyncio.create_task(session())
             done, _ = await asyncio.wait([task, stop, safety, bridge.result], timeout=600, return_when=asyncio.FIRST_COMPLETED)
             if task in done:
@@ -280,14 +351,69 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
                     await asyncio.wait_for(bridge.write({'type': 'stop'}), .5)
                 except Exception:
                     bridge.p.kill()
-            for pending in (task, stop, safety):
+            for pending in (task, stop, safety, memory_watch):
                 if pending and not pending.done():
                     pending.cancel()
-            await asyncio.gather(*(p for p in (task, stop, safety) if p), return_exceptions=True)
+            await asyncio.gather(*(p for p in (task, stop, safety, memory_watch) if p), return_exceptions=True)
             await cleanup()
             if bridge and bridge.result.done():
                 result = public_result(bridge.result.result(), outcome)
                 print('LIVE_RESULT ' + json.dumps(result), flush=True)
+                if memory:
+                    print('LIVE_TIMINGS ' + json.dumps(bridge.timings.summary()), flush=True)
+            if memory:
+                # Discord stream/output/socket are closed before extraction. Do
+                # not reuse bridge.safe(): cleanup deliberately set abort.
+                worker_code = bridge.result.result().get('code') if bridge and bridge.result.done() else None
+                reason = outcome or worker_code
+                safe_end = bool(channel and safe_members(channel, requester, client.user.id)
+                    and reason in ('MANUAL_STOP', 'SESSION_LIMIT', 'IDLE_LIMIT'))
+                try:
+                    current_selection = load_selection(memory_path)
+                    current_generation, _ = await asyncio.to_thread(store.snapshot, requester)
+                    safe_end = safe_end and current_selection == selection and current_generation == generation
+                    facts = await memory.finish_candidates(reason=('USER_IDLE' if reason == 'IDLE_LIMIT' else reason),
+                        safe=safe_end, send_once=lambda request: memory_extract_once(key, request))
+                    if facts:
+                        print('PRIVATE_MEMORY_REVIEW: voice has ended. Review these proposed self-notes locally only.')
+                        print('They are not saved yet. Do not share this private review as diagnostics.')
+                        for number, fact in enumerate(facts, 1):
+                            print(str(number) + '. ' + fact)
+                        print('Type SAVE to save this whole selection, or anything else to discard. Timeout120s discards.', flush=True)
+                        try:
+                            confirmed = await asyncio.wait_for(console_line(), 120) == 'SAVE'
+                        except asyncio.TimeoutError:
+                            confirmed = False
+                        if not confirmed:
+                            facts = ()
+                            memory.status = 'MEMORY_NOT_SAVED_REVIEW'
+                    if facts:
+                        if load_selection(memory_path) != selection:
+                            raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
+                        saved_snapshot = await asyncio.to_thread(store.merge_reviewed, requester,
+                            expected_generation=generation, facts=facts, merge=diary.merge)
+                        memory.status = 'MEMORY_SAVED'
+                        # New voice notes passed the agreed source policy. Retain
+                        # their voice eligibility, but never auto-select unrelated
+                        # new text notes or changed legacy facts.
+                        from voice_live.memory import digest
+                        current_generation, _ = await asyncio.to_thread(store.snapshot, requester)
+                        if current_generation != generation or load_selection(memory_path) != selection:
+                            raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
+                        available = {digest(item['t']) for item in saved_snapshot['facts']}
+                        chosen = tuple(d for d in selection.digests if d in available)
+                        chosen += tuple(digest(t) for t in facts
+                            if digest(t) in available and digest(t) not in chosen)
+                        await asyncio.to_thread(private_json, memory_path, {
+                            'owner': requester, 'guild': channel.guild.id,
+                            'generation': generation, 'digests': list(dict.fromkeys(chosen))})
+                    print('LIVE_MEMORY ' + json.dumps({'code': memory.status,
+                        'saved': len(facts) if memory.status == 'MEMORY_SAVED' else 0,
+                        'skipped': memory.skipped}), flush=True)
+                except Exception:
+                    had_saved = memory.status == 'MEMORY_SAVED'
+                    memory.invalidate()
+                    print('LIVE_MEMORY ' + json.dumps({'code': 'MEMORY_SAVED_ACCESS_UPDATE_FAILED' if had_saved else 'MEMORY_SAVE_FAILED', 'saved': len(facts) if had_saved else 0}), flush=True)
             print('Native session ended. Check leave status before restarting your normal bot.', flush=True)
 
     @client.event
@@ -300,7 +426,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
                 pass
 
     try:
-        await asyncio.wait_for(client.start(token, reconnect=False), 680)
+        await asyncio.wait_for(client.start(token, reconnect=False), 860 if selection else 680)
     finally:
         await cleanup()
         key = token = None
