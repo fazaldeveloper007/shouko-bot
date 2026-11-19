@@ -12,7 +12,11 @@ from voice_live.duplex_protocol import DuplexTurn
 
 
 class SessionMemory:
-    def __init__(self, *, selection, requester, guild, generation, facts):
+    def __init__(self, *, selection, requester, guild, generation, facts, persona=None):
+        self.persona = persona or SHORT_PERSONA
+        self.speaker_context = ('Verified Discord speaker user ID: ' + str(requester) + '. '
+            'Only this speaker is connected. Selected diary notes belong only to this ID. '
+            'Do not guess identity from voice, nickname, another person mentioned, or notes about them.')
         self.owner = requester
         self.context = selected_context(selection, requester=requester, guild=guild,
                                         generation=generation, facts=facts)
@@ -24,7 +28,7 @@ class SessionMemory:
 
     def setup(self, config):
         config = copy.deepcopy(config)
-        config['setup']['systemInstruction'] = {'parts': [{'text': SHORT_PERSONA}]}
+        config['setup']['systemInstruction'] = {'parts': [{'text': self.persona}, {'text': self.speaker_context}]}
         if self.context:
             config['setup']['systemInstruction']['parts'].append({'text': self.context})
         config['setup']['inputAudioTranscription'] = {}
