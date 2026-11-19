@@ -131,6 +131,8 @@ class ProbeBridge(Bridge):
 def public_result(result):
     summary = {k: result.get(k, 0) for k in
                ('code', 'packets', 'samples', 'nonzeroSamples', 'peak')}
+    if result.get('errorClass') in ('ERROR', 'TYPE_ERROR', 'RANGE_ERROR', 'SYNTAX_ERROR', 'OTHER'):
+        summary['errorClass'] = result['errorClass']
     data = result.get('daveProof')
     if isinstance(data, dict):
         summary['daveProof'] = {key: data.get(key) for key in (
