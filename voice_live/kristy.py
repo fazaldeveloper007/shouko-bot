@@ -1,4 +1,4 @@
-"""Manual natural Live Kristy entrypoint. Review gate is mandatory, no autojoin."""
+"""Manual natural Live Kristy entrypoint. Approved own-ID diary context, no autojoin."""
 import argparse
 import asyncio
 from pathlib import Path
@@ -15,11 +15,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--user-id', type=snowflake, required=True)
     parser.add_argument('--guild-id', type=snowflake, required=True)
-    parser.add_argument('--memory-selection', type=Path, help='Optional reviewed selection path; defaults to canonical diary directory')
+    parser.add_argument('--memory-selection', type=Path, help='Optional narrower per-note selection; default is approved automatic own-ID diary')
     parser.add_argument('--confirmed-free-tier', action='store_true')
     args = parser.parse_args()
-    selection = args.memory_selection or Path(diary.MEMORY_DIR) / f'voice-selection-{args.user_id}-{args.guild_id}.json'
-    asyncio.run(run(args.user_id, args.guild_id, args.confirmed_free_tier, selection, full_persona=True))
+    # Automatic own-diary scope is approved only for the bound owner/guild.
+    # Explicit selection remains an optional narrower legacy route.
+    asyncio.run(run(args.user_id, args.guild_id, args.confirmed_free_tier, args.memory_selection,
+                    full_persona=True, automatic_diary=args.memory_selection is None))
 
 
 if __name__ == '__main__':
