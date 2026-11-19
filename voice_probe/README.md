@@ -55,14 +55,25 @@ Share only the `RECEIVE_RESULT` and leave-confirmation line, not `.env` or full 
 On DAVE startup failure, `daveProof` reports only fixed readiness booleans, protocol version and pending-transition count, captured before teardown. No privacy-code values, key bytes, session IDs, raw library debug or packets are exposed. `DAVE_TIMEOUT` distinguishes the bounded readiness timeout from `DAVE_CONNECTION_LOST`; neither proves audio receive success. Encryption checks are not bypassed.
 
 - All-zero counts: no decoded requester audio was demonstrated. This is not success.
-- `DAVE_WAIT_FAILED`, `DAVE_NOT_READY`, `RECEIVE_OR_DECRYPT_ERROR`, `DECODE_ERROR`, `OTHER_SPEAKER`, or another failure code: test stopped, do not infer receive success.
+- `DAVE_WAIT_FAILED`, `DAVE_NOT_READY`, `RECEIVE_TRANSPORT_ERROR`, `RECEIVE_PACKET_PARSE_OR_DAVE_ERROR`, `RECEIVE_STREAM_ERROR`, `RECEIVE_UNCLASSIFIED_ERROR`, `DECODE_ERROR`, `OTHER_SPEAKER`, or another failure code: test stopped, do not infer receive success.
+
+Receive-stream diagnostics are classification, not a repair:
+- `RECEIVE_TRANSPORT_ERROR`: the pinned receiver's transport decrypt method threw. This can include authentication, input shape or crypto runtime errors; it does not prove a network fault.
+- `RECEIVE_PACKET_PARSE_OR_DAVE_ERROR`: packet parsing or DAVE decrypt threw outside the transport decrypt method. This label intentionally does not separate those two causes.
+- `RECEIVE_STREAM_ERROR`: a stream error did not match the captured parse exception.
+- `RECEIVE_UNCLASSIFIED_ERROR`: the pinned method/version check did not match, so instrumentation was not installed. No broader method patching is attempted.
+- `errorClass`, when present, is only `ERROR`, `TYPE_ERROR`, `RANGE_ERROR`, `SYNTAX_ERROR` or `OTHER`. No raw messages/stacks/error codes are printed.
+
+The diagnostic wraps only this probe receiver instance's exact pinned decrypt/parse methods, preserves arguments, return values and thrown exception identity, and restores them on stop. It does not skip failed packets, retry, increase tolerance, or change DAVE/security/mute behavior. After a failed controlled attempt, stop and review the result rather than repeating phone tests.
 
 No automatic move to Gemini Live follows. Sending microphone audio to an AI service is a separate step requiring agreement, including its data-use and free-quota caveats.
 
 ## Offline tests
 
 ```sh
-python -m pytest tests/test_voice_probe.py -q
+python -m pytest tests/test_voice_probe*.py -q
 ```
 
 Worker tests use a fake Discord connection and real opusscript encode/decode on synthetic audio. They cover requester subscription, unknown-speaker stop, DAVE-loss stop, timer/manual cleanup, numeric identity validation, membership isolation and background-launch refusal. They do not exercise a real Discord server or Termux microphone stream.
+
+Additional streaming tests use the actual pinned VoiceReceiver and AudioReceiveStream with synthetic AES-GCM RTP and real opusscript for 100 packets. A corrupted transport tag and a synthetic DAVE-session exception verify distinct fixed labels and immediate stop after five decoded packets. Wrapper tests check the pinned method contract, original exception identity, idempotent installation/restoration and fixed output allowlist. DAVE session cryptography is stubbed in these tests; they are not a live Discord, DAVE interoperability or Termux proof.
