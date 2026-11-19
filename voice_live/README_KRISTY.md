@@ -156,3 +156,20 @@ Sources:
 - https://ai.google.dev/gemini-api/docs/live-guide
 - https://ai.google.dev/gemini-api/docs/pricing
 - https://ai.google.dev/gemini-api/terms
+
+
+### Receive failure reporting
+
+Natural duplex still stops and leaves on a receive error. It now adds only
+`receiveStage` and `errorClass` fixed labels to `LIVE_RESULT`, never exception
+text, stack, packet bytes, audio, tokens or keys. `TRANSPORT_DECRYPT`,
+`RTP_PARSE`, `DAVE_DECRYPT`, and `STREAM_OTHER` identify where the original
+exception escaped, not why it happened. `CONTRACT_MISMATCH` or
+`DIAGNOSTIC_CONTRACT_MISMATCH` means the pinned-library wrapper could not
+be safely installed or used, and the session stops.
+
+This is reporting, not a receive fix. Original parsing/decryption and DAVE
+failure tolerance are unchanged. Instance methods are restored on exit; the
+current DAVE decrypt method is wrapped only during its synchronous parse call
+and restored in `finally`. Offline synthetic tests are not a successful phone
+or provider test. No new live retry is implied by this change.
