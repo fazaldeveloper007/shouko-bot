@@ -10,12 +10,25 @@ is opt-in and disabled by default. No running phone deployment is implied.
 - The owner must approve the member-visible notice/details and routine status
   text. Permission to build the feature is not a member's actual agreement.
 - Keep the real allowlist/usernames and consent store private, OUTSIDE git.
-- Use a genuinely adult-restricted client and VC, not an open mixed-age lobby.
-  Default role must explicitly deny Connect AND View Channel. Explicit allows
-  must be individual allowed members and this bot, not broad roles. Unresolved
-  members/other bots are rejected. Administrators can bypass channel permissions,
-  and membership events arrive late, so zero frames heard by an unexpected
-  listener cannot be guaranteed.
+- Channel gate mode comes from the private config `channel_gate`:
+  `restricted` (default when the key is absent) keeps the original locked-VC
+  requirement: default role must explicitly deny Connect AND View Channel, and
+  explicit allows must be individual allowed members and this bot, not broad
+  roles. `open` leaves an existing public VC's permissions completely
+  untouched; enforcement is then the fixed allowlist at runtime. In BOTH modes
+  every roster refresh, agreement, input and output re-checks that every human
+  present is allowed and agreed, a non-allowlisted speaker's audio is zeroed
+  and stops the session, and any join/leave during an active session stops it.
+  Unresolved members/other bots are rejected. Administrators can bypass
+  channel permissions and membership events arrive late, so zero frames heard
+  by an unexpected listener cannot be guaranteed in either mode; in `open`
+  mode that stop latency is the only barrier for walk-in listeners.
+- The Gemini API Free age clause (https://ai.google.dev/gemini-api/terms)
+  forbids API Clients directed towards or likely to be accessed by under-18s.
+  The fixed adult-only allowlist, per-member 18+ assertion and
+  stop-on-any-unapproved-presence are our mitigation of that clause in `open`
+  mode, not a verified safe harbor; Google has published no guidance either
+  way for an adult-gated feature inside a general-audience app.
 - Each member independently asserts 18+ and permits Google processing and
   future sessions with the fixed allowed audience. IDs from the owner are NOT
   consent. These assertions are not independent age verification.
@@ -89,7 +102,11 @@ Private config schema 1: `guild_id`, `owner_id`, `voice_channel_id` (may be null
 for slash, which uses the caller's actual VC),
 `notice_revision: group-free-future-v2`, `notice_approved: false`,
 `maximum_concurrent_humans: 8`, `members: [{user_id, label}]`,
-`source_message_id`, `consents: []`. Labels are inert references, not identity
+`source_message_id`, `consents: []`. Optional `channel_gate` is `restricted`
+(locked VC, the default) or `open` (existing public VC untouched, runtime
+allowlist gating only). Switching `channel_gate` changes the hashed permission
+scope, so saved member agreements are invalidated and re-asked. Labels are
+inert references, not identity
 matching. Never prepopulate consents. The separate local consent store is derived
 from this private config path plus `.consent.json` and only real clicks write it.
 
