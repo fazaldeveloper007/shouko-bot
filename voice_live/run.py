@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 import discord
 from music.transport import Bridge, VoiceFailure
 from voice_probe.receive import existing_token, worker_env, safe_members, snowflake, console_line
-from voice_live.gemini import NativeTurn, LiveError, MODEL, VOICE, require_free_tier
+from voice_live.gemini import NativeTurn, LiveError, MODEL, VOICE, ALLOWED_MODELS, require_model, require_free_tier
 
 
 def existing_gemini_key():
@@ -145,8 +145,8 @@ class LiveBridge(Bridge):
         return await super().disconnect(force=force)
 
 
-async def exchange(bridge, key):
-    turn = NativeTurn(key, bridge.safe)
+async def exchange(bridge, key, model=MODEL):
+    turn = NativeTurn(key, bridge.safe, model=model)
     try:
         await turn.open()
         if not bridge.safe():
@@ -178,8 +178,9 @@ def public_result(result, outcome=None):
     return summary
 
 
-async def run(requester, guild_id=None, confirmed_free_tier=False):
+async def run(requester, guild_id=None, confirmed_free_tier=False, model=MODEL):
     require_free_tier(confirmed_free_tier)  # Before credentials, Discord or Google.
+    require_model(model)
     if not sys.stdin.isatty():
         raise LiveError('TERMINAL_REQUIRED')
     token = existing_token()
@@ -240,7 +241,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             if any(client.user.id in ch.voice_states for ch in channel.guild.voice_channels):
                 raise LiveError('BOT_ALREADY_IN_VC')
             print(f'Requester {requester}; guild {channel.guild.id}; channel {channel.id}.')
-            print(f'Native model {MODEL}; voice {VOICE}. Existing key Free tier confirmed by owner; not a billing lookup.')
+            print(f'Native model {model}; voice {VOICE}. Existing key Free tier confirmed by owner; not a billing lookup.')
             print('Only your microphone goes to Google. Free API inputs/replies may improve products and be human-reviewed.')
             print('Use a NON-SENSITIVE test phrase. No chat history/diaries/transcripts/recording. Normal bot must be stopped.')
             print('8s maximum input, 10s maximum spoken output in THIS VC, 30s overall from START; cleanup may take longer.')
@@ -255,7 +256,7 @@ async def run(requester, guild_id=None, confirmed_free_tier=False):
             async def session():
                 await channel.connect(cls=lambda c, ch: bridge, timeout=12, reconnect=False,
                                       self_deaf=False, self_mute=False)
-                await exchange(bridge, key)
+                await exchange(bridge, key, model=model)
                 await asyncio.shield(bridge.result)
             task = asyncio.create_task(session())
             done, _ = await asyncio.wait([task, stop, safety, bridge.result], timeout=30, return_when=asyncio.FIRST_COMPLETED)
@@ -321,9 +322,10 @@ if __name__ == '__main__':
     parser.add_argument('--user-id', type=snowflake, required=True)
     parser.add_argument('--guild-id', type=snowflake)
     parser.add_argument('--confirmed-free-tier', action='store_true', help='Owner confirms the CURRENT existing Gemini key uses Free tier; not an automatic lookup')
+    parser.add_argument('--model', choices=ALLOWED_MODELS, default=MODEL, help='Explicit one-run model selection, no automatic fallback; 3.1 is legacy preview')
     args = parser.parse_args()
     try:
-        asyncio.run(run(args.user_id, args.guild_id, args.confirmed_free_tier))
+        asyncio.run(run(args.user_id, args.guild_id, args.confirmed_free_tier, model=args.model))
     except KeyboardInterrupt:
         print('Stopped manually. Check bot left VC before restart.')
     except Exception as error:
