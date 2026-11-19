@@ -206,9 +206,16 @@ class ConsentView(discord.ui.View):
 
 
 def restricted_channel(channel, scope):
-    """Conservative explicit per-member connect gate. Admins can bypass it."""
+    """Exact channel match in every mode. The 'restricted' gate additionally
+    demands conservative explicit per-member connect overwrites; admins can
+    bypass those. The 'open' gate leaves an existing public VC's permissions
+    untouched: enforcement is the fixed allowlist at runtime, where any
+    non-allowlisted presence stops the session. Membership event latency means
+    an unexpected listener can hear audio before that stop in either mode."""
     if str(channel.id) != scope.channel or str(channel.guild.id) != scope.guild:
         raise GroupPolicyError('GROUP_CHANNEL_MISMATCH')
+    if scope.channel_gate == 'open':
+        return
     base = channel.overwrites_for(channel.guild.default_role)
     if base.connect is not False or base.view_channel is not False:
         raise GroupPolicyError('GROUP_CHANNEL_NOT_RESTRICTED')
