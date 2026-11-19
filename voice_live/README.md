@@ -61,3 +61,11 @@ Tests use the actual pinned VoiceReceiver/AudioReceiveStream, synthetic encrypte
 - [Pricing](https://ai.google.dev/gemini-api/docs/pricing), Free-tier availability does not prove this installed key's tier.
 - [Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), project-scoped limits/capacity are not unlimited guarantees.
 - [Google terms](https://ai.google.dev/gemini-api/terms), unpaid data use and audience restrictions.
+
+## Response lifecycle and failure outcomes
+
+The client ends this fixed non-background-reasoning single turn on either `generationComplete` or `turnComplete`, after processing all audio parts in that event. It does not wait for a delayed turnComplete after generation has already finished. This repairs a client lifecycle bug, not a claim that Gemini will produce audible speech.
+
+`GOOGLE_RESPONSE_IDLE_TIMEOUT` means no Google event arrived within the existing 8-second per-event receive limit. It is distinct from the unchanged 30-second `OVERALL_LIMIT`. `GOOGLE_AUDIO_TOO_SHORT` means less than one 20ms source frame arrived; no synthetic padding is used to turn a single sample into a claimed voice response. `GOOGLE_AUDIO_SILENT` means all returned PCM samples were zero. Neither is success. `outputNonzeroSamples` is an aggregate metric, not proof of intelligibility. When an upstream error or outer stop caused cleanup, LIVE_RESULT preserves it in `code`; `workerCode` records a worker cleanup STOPPED separately.
+
+The d77b15c phone run reached setup/listen and sent requester input but received only two PCM bytes and no playable Opus output. The exact provider-side reason remains unknown. Community reports describe similar tiny silent outputs for 3.8 Live, but do not establish this run's root cause or a verified workaround. These client fixes do not justify repeated diagnostic phone runs, model substitution or longer bounds. Hold until a grounded next step is chosen.
