@@ -201,6 +201,10 @@ async def memory_extract_once(key, request):
 
 def public_result(result, outcome=None):
     summary = {k: result.get(k, 0) for k in ('code', 'packets', 'inputBytes', 'outputBytes', 'outputNonzeroSamples', 'outputFramesRead', 'turnsCompleted', 'droppedChunks')}
+    if result.get('receiveStage') in {'TRANSPORT_DECRYPT', 'RTP_PARSE', 'DAVE_DECRYPT', 'STREAM_OTHER', 'CONTRACT_MISMATCH'}:
+        summary['receiveStage'] = result['receiveStage']
+    if result.get('errorClass') in {'ERROR', 'TYPE_ERROR', 'RANGE_ERROR', 'SYNTAX_ERROR', 'OTHER'}:
+        summary['errorClass'] = result['errorClass']
     if outcome:
         summary['workerCode'] = summary['code']
         summary['code'] = outcome
