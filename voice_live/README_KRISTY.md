@@ -1,5 +1,24 @@
 # Kristy natural Live voice with shared own-ID memory
 
+## Current source-data gate
+
+The full local persona/diary entrypoints currently stop with
+`FREE_SOURCE_REVIEW_REQUIRED` before credentials, disk source loading, Discord or
+Google calls. Their arbitrary local source contents have not been verified
+against the current Google unpaid-services restriction on personal,
+confidential or sensitive input, which also covers system instructions. Owner
+permission and keyword filters do not prove source eligibility. No automatic
+full-diary command should be treated as ready for a live run.
+
+This gate does not delete or edit the canonical diary, persona, previous picker
+selection, or access/revocation records. The implementation below is retained
+for a future verified source path or explicitly chosen provider/terms change;
+it is not an override instruction. Generic non-sensitive natural-voice testing
+remains a separate limited entrypoint without diary continuity. No provider,
+model, billing setting or receiver identity guard is changed by this gate.
+
+
+
 This is a manual voice entrypoint, not always-on listening or general server
 rollout. It uses natural `duplex.py`, not the older 8-second alternating runner.
 Voice remains Gemini 3.1 Flash Live Preview / Sulafat, 60-second utterance cap,
