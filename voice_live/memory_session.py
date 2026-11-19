@@ -1,6 +1,6 @@
-"""Inactive adapters for natural Live. No live entrypoint imports this module.
+"""Opt-in adapters for natural Live's reviewed-memory entrypoint.
 
-One explicit end-of-session call is supplied by the future runtime; this file
+The runtime supplies one explicit end-of-session request; this module
 has no network sender, credentials, file reads, saves or automatic retries.
 """
 import asyncio
@@ -127,7 +127,7 @@ class SessionMemory:
 
 
 class MemoryDuplexTurn(DuplexTurn):
-    """Opt-in class only; not constructed by the published natural runner."""
+    """Opt-in class constructed only by the reviewed-memory runner path."""
     def __init__(self, key, safe, memory):
         super().__init__(key, safe)
         self.memory = memory
