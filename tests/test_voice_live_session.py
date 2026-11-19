@@ -220,6 +220,9 @@ class RunnerSessionGates(unittest.IsolatedAsyncioTestCase):
             if n==1:return answer
             await asyncio.Event().wait()
         async def wait_for_session(tasks, **kw):
+            if 'timeout' not in kw:
+                bridge.result.set_result({'code':'SESSION_LIMIT'})
+                return ({tasks[3]},set())
             self.assertEqual(kw['timeout'],600)
             self.assertEqual(kw['return_when'],asyncio.FIRST_COMPLETED)
             if safety:
