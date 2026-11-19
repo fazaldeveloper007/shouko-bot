@@ -27,6 +27,13 @@ class DuplexTurn(SessionTurn):
     def setup(self):
         config = super().setup()
         config['setup']['realtimeInputConfig']['activityHandling'] = 'START_OF_ACTIVITY_INTERRUPTS'
+        # No application token cap or forced-short style for natural conversation.
+        config['setup']['generationConfig'].pop('maxOutputTokens', None)
+        config['setup']['systemInstruction'] = {'parts': [{'text':
+            'You are Kristy, an AI voice prototype. Have a friendly Hinglish conversation. '
+            'Give complete spoken answers using only this session as context. '
+            'Do not claim to be human. Do not request personal information. '
+            'No tools or external actions.'}]}
         return config
 
     async def receive(self, timeout):
@@ -142,8 +149,6 @@ class DuplexFlow:
                         self.timings.mark(self.pending, 'first_audio')
                     data = decode_audio(inline.get('data'))
                     try:
-                        if self.pending_bytes + len(data) >= 480000:
-                            raise LiveError('OUTPUT_LIMIT')
                         for i in range(0, len(data), 12000):
                             block = data[i:i+12000]
                             try:
