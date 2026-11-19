@@ -93,6 +93,7 @@ const sandbox={Buffer,require:name=>{
  if(name==='node:readline')return{createInterface:()=>input};
  if(name==='@discordjs/voice')return voice;
  if(name==='opusscript')return O;
+ if(name==='./receive_diagnostics.cjs')return require(root+'/voice_probe/receive_diagnostics.cjs');
  if(name==='../music/dave_gate.cjs')return{proof:()=>({transportReady:true,protocol:1,sessionReady:encrypted,privacyPresent:encrypted,reinitializing:false,transitionExecuted:true,pendingTransitions:0}),encrypted:()=>encrypted,waitEncrypted:async()=>{if(scenario==='dave_timeout')throw Error('DAVE_WAIT_TIMEOUT');}};
  throw Error('Unexpected dependency: '+name);
 },setTimeout:(fn,ms)=>{const t={fn,ms,unref(){}};timers.push(t);return t;},clearTimeout:()=>{},setImmediate:fn=>fn(),
