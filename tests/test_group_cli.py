@@ -13,7 +13,7 @@ from voice_live import group
 class GroupCliTests(unittest.IsolatedAsyncioTestCase):
     def config(self):
         return dict(schema=1, guild_id=G, owner_id=A, voice_channel_id=CH,
-            notice_revision='group-free-draft1', notice_approved=False,
+            notice_revision='group-free-future-v2', notice_approved=False,
             maximum_concurrent_humans=8, members=[dict(user_id=B, label='inert-label')],
             source_message_id='synthetic', consents=[])
 
@@ -61,9 +61,9 @@ class GroupCliTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_view_authenticated_actor_and_buttons(self):
         from types import SimpleNamespace as NS
-        c=NS(policy=NS(_roster=frozenset((A,B)),scope=NS(guild=G)))
+        c=NS(policy=NS(_roster=frozenset((A,B)),scope=NS(guild=G),_agreed=set()))
         view=group.SharedConsentView(c,asyncio.Event())
-        self.assertEqual([b.label for b in view.children],['I am 18+ and Agree','Decline / Stop'])
+        self.assertEqual([b.label for b in view.children],['18+ Agree, future sessions','Decline / Stop','Details','Revoke'])
         self.assertTrue(await view.interaction_check(NS(user=NS(id=int(A)),guild_id=int(G))))
         self.assertFalse(await view.interaction_check(NS(user=NS(id=int(BOT)),guild_id=int(G))))
         view.stop()
