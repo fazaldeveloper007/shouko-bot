@@ -18,7 +18,8 @@ spec.loader.exec_module(probe)
 class Guards(unittest.TestCase):
     def channel(self, ids):
         ch = types.SimpleNamespace(id=10)
-        ch.guild = types.SimpleNamespace(voice_states={i: types.SimpleNamespace(channel=ch) for i in ids})
+        ch.voice_states = {i: types.SimpleNamespace(channel=ch) for i in ids}
+        ch.guild = types.SimpleNamespace(voice_channels=[ch])
         return ch
 
     def test_target_alone_or_with_bot_only(self):
@@ -67,11 +68,11 @@ class GatewayGuards(unittest.IsolatedAsyncioTestCase):
         channel.guild.change_voice_state.assert_awaited_once_with(channel=channel, self_deaf=False, self_mute=True)
         self.assertTrue(bridge.write.await_args.args[0]['ok'])
         channel.guild.change_voice_state.reset_mock()
-        channel.guild.voice_states[77] = types.SimpleNamespace(channel=channel)
+        channel.voice_states[77] = types.SimpleNamespace(channel=channel)
         await bridge.dispatch({'type': 'gateway_send', 'id': 2, 'payload': payload})
         channel.guild.change_voice_state.assert_not_awaited()
         self.assertFalse(bridge.write.await_args.args[0]['ok'])
-        channel.guild.voice_states.pop(77)
+        channel.voice_states.pop(77)
         payload['d']['channel_id'] = '999'
         await bridge.dispatch({'type': 'gateway_send', 'id': 3, 'payload': payload})
         channel.guild.change_voice_state.assert_not_awaited()
