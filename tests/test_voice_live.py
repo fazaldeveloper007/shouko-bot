@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from voice_live.gemini import (NativeTurn, LiveError, MODEL, ENDPOINT,
-                               SETUP, require_free_tier, decode_audio)
+                               SETUP, COMPARISON_MODEL, ALLOWED_MODELS, setup_for, require_free_tier, decode_audio)
 from voice_live import run as runner
 
 
@@ -37,6 +37,57 @@ def audio_event(data, complete=True, parts=1):
         {'inlineData': {'mimeType': 'audio/pcm;rate=24000',
                         'data': base64.b64encode(data).decode()}} for _ in range(parts)]},
         'turnComplete': complete}}
+
+
+class ExplicitModelComparison(unittest.IsolatedAsyncioTestCase):
+    def test_default_unchanged_and_setup_isolated(self):
+        self.assertEqual(MODEL, 'gemini-3.8-live')
+        self.assertEqual(ALLOWED_MODELS, (MODEL, 'gemini-3.1-flash-live-preview'))
+        expected = copy.deepcopy(SETUP)
+        expected['setup']['model'] = 'models/' + COMPARISON_MODEL
+        actual = setup_for(COMPARISON_MODEL)
+        self.assertEqual(actual, expected)
+        actual['setup']['generationConfig']['maxOutputTokens'] = 999
+        self.assertEqual(setup_for(COMPARISON_MODEL), expected)
+        self.assertEqual(SETUP['setup']['model'], 'models/' + MODEL)
+
+    async def test_unapproved_model_blocked_before_credentials(self):
+        with patch.object(runner, 'existing_token', side_effect=AssertionError('credential read')):
+            with self.assertRaisesRegex(LiveError, 'MODEL_NOT_APPROVED'):
+                await runner.run(42, confirmed_free_tier=True, model='unapproved')
+
+    async def test_comparison_still_needs_free_tier_confirmation(self):
+        with patch.object(runner, 'existing_token', side_effect=AssertionError('credential read')):
+            with self.assertRaisesRegex(LiveError, 'EXISTING_KEY_FREE_TIER_NOT_CONFIRMED'):
+                await runner.run(42, model=COMPARISON_MODEL)
+
+    async def test_each_model_uses_exact_setup_no_fallback_on_rejection(self):
+        for model in ALLOWED_MODELS:
+            for accepted in (True, False):
+                with self.subTest(model=model, accepted=accepted):
+                    socket = Socket([{'setupComplete': {}} if accepted else {'error': {'code': 403}}])
+                    session = types.SimpleNamespace(ws_connect=AsyncMock(return_value=socket), close=AsyncMock())
+                    with patch('voice_live.gemini.aiohttp.ClientSession', return_value=session):
+                        turn = NativeTurn('DUMMY', lambda: True, model=model)
+                        if accepted:
+                            await turn.open()
+                        else:
+                            with self.assertRaisesRegex(LiveError, 'GOOGLE_API_REJECTED'):
+                                await turn.open()
+                        self.assertEqual(socket.sent[0], setup_for(model))
+                        self.assertEqual(session.ws_connect.await_count, 1)
+                        self.assertEqual(len([x for x in socket.sent if 'setup' in x]), 1)
+                        await turn.close()
+
+    async def test_exchange_passes_explicit_model_without_substitution(self):
+        for model in ALLOWED_MODELS:
+            turn = types.SimpleNamespace(open=AsyncMock(side_effect=LiveError('GOOGLE_SETUP_REJECTED')), close=AsyncMock())
+            bridge = types.SimpleNamespace(safe=lambda: True)
+            with patch.object(runner, 'NativeTurn', return_value=turn) as factory:
+                with self.assertRaisesRegex(LiveError, 'GOOGLE_SETUP_REJECTED'):
+                    await runner.exchange(bridge, 'DUMMY', model=model)
+                factory.assert_called_once_with('DUMMY', bridge.safe, model=model)
+                turn.close.assert_awaited_once()
 
 
 class Guards(unittest.TestCase):
