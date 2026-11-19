@@ -1,8 +1,8 @@
-"""Shared member-store transactions, not yet wired into text or voice runners.
+"""Shared member-store transactions for text and opt-in voice runners.
 
 POSIX locks support Termux without a new dependency. Every writer/forget path
-must adopt this boundary before two-way writes are enabled. Legacy save() users
-can still race these transactions until integration is complete.
+must use this boundary. External legacy scripts that call diary.save directly
+are not covered by this lock.
 """
 import contextlib
 import fcntl
