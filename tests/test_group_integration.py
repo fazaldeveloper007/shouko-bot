@@ -103,3 +103,13 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await obj.execute(self.i,'leave')
         obj.live.leave.assert_awaited_once()
         obj.manager.get.assert_not_awaited()
+
+
+class EndLineTests(unittest.TestCase):
+    def test_fixed_codes_pass_and_anything_else_is_dropped(self):
+        from voice_live.group_bridge import end_line
+        self.assertEqual(end_line({'code': 'IDLE_LIMIT'}), 'LIVE_ENDED: IDLE_LIMIT')
+        self.assertEqual(end_line({'code': 'RECEIVE_ERROR', 'receiveStage': 'STREAM_OTHER',
+            'errorClass': 'OTHER'}), 'LIVE_ENDED: RECEIVE_ERROR/STREAM_OTHER/OTHER')
+        for bad in ('secret message', 'lowercase', '', 'IDLE_LIMIT; rm -rf ~', None, 123):
+            self.assertEqual(end_line({'code': bad}), 'LIVE_ENDED: UNKNOWN')
