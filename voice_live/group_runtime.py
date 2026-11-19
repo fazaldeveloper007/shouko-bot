@@ -9,20 +9,39 @@ from voice_live.group_policy import GroupPolicyError
 from voice_live.duplex_protocol import DuplexFlow, DuplexTurn
 from voice_live.gemini import LiveError, require_free_tier
 
-NOTICE_REVISION = 'group-free-draft1'
+NOTICE_REVISION = 'group-free-future-v2'
 NOTICE = (
-    'Restricted 18+ non-sensitive Gemini voice test. Your microphone audio goes '
-    'to Google. Free-tier inputs and replies may improve Google products and be '
-    'human-reviewed. Replies are heard by everyone in this VC. No diary/history '
-    'is loaded or saved. Do not share personal, confidential or sensitive information. '
-    'Agree confirms you are 18+ and permits this processing for this session and '
-    'the listed audience. Decline or Stop ends the session. Audience changes stop it.'
+    '18+ Kristy Live: mic goes to Google; free inputs/replies may improve its '
+    'products and be human-reviewed. Everyone in this allowed group can hear '
+    'replies. Agree saves permission for future sessions with this same group. '
+    'No diary/history; no personal, confidential or sensitive talk. '
+    'Details lists the group. Revoke anytime.'
 )
+
+DETAILS = (
+    'Agreement permits processing of your microphone audio by Google Gemini '
+    'Live (3.1 / Sulafat), for non-sensitive group voice conversations now and '
+    'in future sessions in this same guild with this fixed allowed audience. '
+    'Not everyone in the allowed audience has to be present. Their replies and '
+    'your voice are audible in the VC. No diary, full local persona, chat history, '
+    'memory extraction or voice recording/transcript files are used. Google Free '
+    'data may improve products and be human-reviewed. No personal, confidential '
+    'or sensitive information. Your Discord ID and this permission scope are '
+    'saved locally, not sent to Google as an identity. Agree confirms you are '
+    '18+ and allow this processing and future reuse. Revoke clears your grant; '
+    'any active session stops. New allowed people, processing changes or notice '
+    'changes need fresh agreement. Anyone new joining/leaving during an active '
+    'session stops it. Decline / Stop stops this session; Revoke also removes '
+    'future permission. Discord admin bypass and membership event latency mean '
+    'we cannot guarantee an unexpected listener hears zero audio before stop.'
+)
+
 
 
 class GroupCoordinator:
     """Trusted adapter must refresh roster before every grant/audio/output."""
-    def __init__(self, policy, snapshot, stop_worker):
+    def __init__(self, policy, snapshot, stop_worker, grant_store=None):
+        self.grant_store = grant_store
         self.policy = policy
         self.snapshot = snapshot
         self.stop_worker = stop_worker
@@ -33,6 +52,11 @@ class GroupCoordinator:
     def refresh(self):
         try:
             self.policy.observe_roster(**self.snapshot())
+            if self.grant_store is not None:
+                valid = self.grant_store.valid(self.policy.scope)
+                if self.policy._active and not self.policy._roster <= valid:
+                    raise GroupPolicyError('GROUP_CONSENT_REVOKED')
+                self.policy._agreed = set(self.policy._roster & valid)
         except BaseException:
             self.stop()
             raise
@@ -44,10 +68,18 @@ class GroupCoordinator:
         self.policy.stop()
         self.stop_worker()  # synchronous cancellation signal, not a network wait
 
-    def agree(self, *, actor, guild, channel, audience, revision, adult, processing):
+    def agree(self, *, actor, guild, channel, audience, revision, adult, processing, future=False):
         self.refresh()
         self.policy.agree(actor=actor, guild=guild, channel=channel,
             audience=audience, notice_revision=revision, adult=adult, processing=processing)
+        if self.grant_store is not None:
+            try:
+                self.grant_store.agree(self.policy.scope, actor, adult=adult,
+                    processing=processing, future=future)
+                self.refresh()
+            except BaseException:
+                self.stop()
+                raise
 
     def start(self):
         self.refresh()
@@ -157,7 +189,7 @@ class ConsentView(discord.ui.View):
             channel = interaction.user.voice.channel if interaction.user.voice else None
             self.coordinator.agree(actor=str(interaction.user.id),
                 guild=str(interaction.guild_id), channel=str(channel.id) if channel else '',
-                audience=self.audience, revision=NOTICE_REVISION, adult=True, processing=True)
+                audience=self.audience, revision=NOTICE_REVISION, adult=True, processing=True, future=True)
             button.disabled = True
             await interaction.response.edit_message(content='Agreed for this session and audience. No microphone starts until everyone agrees. Decline / Stop remains available.', view=self)
         except GroupPolicyError:
@@ -204,7 +236,7 @@ def discord_snapshot(channel, scope):
 
 
 async def run_approved_group(client, channel, policy, key, *, consent_ready,
-                             stopped, notice_approved=False, confirmed_free_tier=False, outcome=None):
+                             stopped, notice_approved=False, confirmed_free_tier=False, outcome=None, grant_store=None, validate_scope=None):
     """Draft lifecycle. Owner-reviewed adapter must collect actual member grants.
 
     consent_ready receives the coordinator, binds the agreed audience to each
@@ -225,8 +257,11 @@ async def run_approved_group(client, channel, policy, key, *, consent_ready,
     def cancel():
         abort.set()
         stopped.set()
-    coordinator = GroupCoordinator(policy,
-        lambda: discord_snapshot(channel, policy.scope), cancel)
+    def snapshot():
+        if validate_scope is not None:
+            validate_scope()
+        return discord_snapshot(channel, policy.scope)
+    coordinator = GroupCoordinator(policy, snapshot, cancel, grant_store)
     flow = watcher = consent = None
     async def watch():
         while not abort.is_set():
@@ -287,7 +322,7 @@ async def run_approved_group(client, channel, policy, key, *, consent_ready,
 def draft_notice(coordinator):
     """Only observed Discord IDs, no names/diaries or model-defined audience."""
     coordinator.refresh()
-    return NOTICE + '\nAudience Discord IDs: ' + ', '.join(sorted(coordinator.policy._roster))
+    return NOTICE + '\nCurrent audience Discord IDs: ' + ', '.join(sorted(coordinator.policy._roster))
 
 
 async def show_approved_consent(interaction, coordinator, *, notice_approved=False):
