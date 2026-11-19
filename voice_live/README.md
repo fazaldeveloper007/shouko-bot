@@ -8,7 +8,7 @@ Before starting, the owner must confirm that the **current existing Gemini key i
 
 The runner refuses before reading credentials or connecting unless `--confirmed-free-tier` is supplied. This parameter records the owner's confirmation about the CURRENT installed key. It is **not** an automatic billing lookup and must not be used to bypass uncertainty. No billing changes are made. Stop if the current project becomes paid, access is denied or quota is exhausted. There is no reconnect, alternate key, model/provider fallback or automatic retry. A free-project dashboard entry in another Google account does not prove this installed key has model access; a setup rejection stops without fallback.
 
-The model is pinned to `gemini-3.8-live`, built-in voice `Kore`, using Google's native audio Live WebSocket endpoint. The working text model is unchanged. The minimal test prompt asks for one short friendly Hinglish reply, identifies Kristy as an AI prototype and asks for no personal information. It imports no persona.py, member diaries, chat history or private creator details.
+The default model stays `gemini-3.8-live`. The separately approved bounded comparison can explicitly select `--model gemini-3.1-flash-live-preview` for one run. No other model is allowed, and no failure changes models automatically. Both use built-in voice `Kore` and Google's native audio Live WebSocket endpoint. 3.1 is a legacy preview, not a proven fix or reliability guarantee; its access on the current key is unverified. The working text model is unchanged. The minimal test prompt asks for one short friendly Hinglish reply, identifies Kristy as an AI prototype and asks for no personal information. It imports no persona.py, member diaries, chat history or private creator details.
 
 ## Data use and audience
 
@@ -38,6 +38,14 @@ git pull --ff-only
 python voice_live/run.py --user-id YOUR_CONFIRMED_DISCORD_USER_ID --confirmed-free-tier
 ```
 
+The explicitly approved 3.1 comparison uses the same steps, replacing the final command with:
+
+```sh
+python voice_live/run.py --user-id YOUR_CONFIRMED_DISCORD_USER_ID --confirmed-free-tier --model gemini-3.1-flash-live-preview
+```
+
+Check the printed model is `gemini-3.1-flash-live-preview` before START. This does not change any saved model, key, billing setting or the normal bot. If setup/access/quota fails, stop without a retry, key change or fallback. Free-tier listing is not proof of this key's tier or access. The same data-use terms, requester restriction and 8s/10s/30s limits apply.
+
 The already-installed pinned voice_probe dependencies are reused. No npm reinstall or new SDK/key is required. Python uses aiohttp, already required by discord.py. Existing normal bot env/nearest-ancestor .env credentials are used, with the same strictly literal documented Termux boot-file fallback; boot scripts are never executed/sourced. Missing or ambiguous existing credentials stop locally without printing or creating them.
 
 At the actual prompt, check IDs and type START. Speak **only after LIVE_LISTENING**, one non-sensitive line such as asking for a short greeting. After the 8-second input window, LIVE_REPLY_PENDING means requester capture is stopped. LIVE_PLAYING means the Discord player began handling generated audio, not proof the requester heard intelligible speech. Do not rerun automatically on failure.
@@ -58,6 +66,7 @@ Tests use the actual pinned VoiceReceiver/AudioReceiveStream, synthetic encrypte
 
 - [Live API reference](https://ai.google.dev/api/live), WSS setup, manual activity boundaries and realtime audio.
 - [Live guide](https://ai.google.dev/gemini-api/docs/live-guide), audio formats and 3.8 model-specific settings. 3.8 does not accept thinkingLevel or disabling proactive audio; neither flag is sent.
+- [3.1 model page](https://aistudio.google.com/docs/models/gemini-3.1-flash-live-preview), legacy native audio preview selected only by an explicit comparison flag.
 - [Pricing](https://ai.google.dev/gemini-api/docs/pricing), Free-tier availability does not prove this installed key's tier.
 - [Rate limits](https://ai.google.dev/gemini-api/docs/rate-limits), project-scoped limits/capacity are not unlimited guarantees.
 - [Google terms](https://ai.google.dev/gemini-api/terms), unpaid data use and audience restrictions.
@@ -68,4 +77,4 @@ The client ends this fixed non-background-reasoning single turn on either `gener
 
 `GOOGLE_RESPONSE_IDLE_TIMEOUT` means no Google event arrived within the existing 8-second per-event receive limit. It is distinct from the unchanged 30-second `OVERALL_LIMIT`. `GOOGLE_AUDIO_TOO_SHORT` means less than one 20ms source frame arrived; no synthetic padding is used to turn a single sample into a claimed voice response. `GOOGLE_AUDIO_SILENT` means all returned PCM samples were zero. Neither is success. `outputNonzeroSamples` is an aggregate metric, not proof of intelligibility. When an upstream error or outer stop caused cleanup, LIVE_RESULT preserves it in `code`; `workerCode` records a worker cleanup STOPPED separately.
 
-The d77b15c phone run reached setup/listen and sent requester input but received only two PCM bytes and no playable Opus output. The exact provider-side reason remains unknown. Community reports describe similar tiny silent outputs for 3.8 Live, but do not establish this run's root cause or a verified workaround. These client fixes do not justify repeated diagnostic phone runs, model substitution or longer bounds. Hold until a grounded next step is chosen.
+The d77b15c phone run reached setup/listen and sent requester input but received only two PCM bytes and no playable Opus output. The exact provider-side reason remains unknown. Community reports describe similar tiny silent outputs for 3.8 Live, but do not establish this run's root cause or a verified workaround. These client fixes alone do not justify repeated diagnostic phone runs, model substitution or longer bounds. The owner separately approved one explicit 3.1 comparison under the same limits; the CLI option above enables only that choice, never automatic fallback. Real speech and current-key access remain unproven until that authorized run.
