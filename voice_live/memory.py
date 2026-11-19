@@ -1,6 +1,6 @@
-"""Inactive voice-memory primitives. No IO or network at import time.
+"""Opt-in voice-memory primitives. No IO or network at import time.
 
-No live runner imports this module. Data enters only through an explicit caller.
+Data enters only through an explicit memory-enabled caller.
 Review digests bind exact note content, not semantic safety: the caller must run
 and privately review selection policy before granting them.
 """
