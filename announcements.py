@@ -61,7 +61,7 @@ _TZ_FALLBACK_OFFSETS = {
 }
 
 from gifs import GIFS
-from birthdays import BIRTHDAYS
+from birthdays import BIRTHDAYS, BIRTHDAY_EMOJI, BIRTHDAY_LINES, BIRTHDAY_LOCAL_ART
 import random
 
 log = logging.getLogger("kristy.announce")
@@ -554,31 +554,19 @@ async def morning_loop():
 # any time inside the owner-approved midnight-to-noon window.
 # --------------------------------------------------------------------------
 
-_birthday_writer = None   # optional async (name) -> str|None, wired by bot.py
+# Per-character content lives in birthdays.py (BIRTHDAY_EMOJI / BIRTHDAY_LINES /
+# BIRTHDAY_LOCAL_ART). Format approved by the owner on 2026-11-20:
+#   # HAPPY BIRTHDAY NAME <emoji>
+#
+#   "<one short iconic character line>"
+# plus the character's art. No generated wishes, no generic templates.
 
-# Used when the AI writer is unavailable or its output is rejected. Deterministic
-# pick per character+date so a retry never reshuffles the line.
-BIRTHDAY_FALLBACK_WISHES = (
-    "Aaj {name} ka din hai! Cake first, commissions later \U0001f382",
-    "Happiest birthday {name}! Teyvat is celebrating today \u2728",
-    "{name} ka janamdin hai! Party kahan hai? \U0001f389",
-    "Happy birthday {name}! May your pulls be 50/50-winning today \U0001f31f",
-    "{name}! Janamdin mubarak! Aaj sirf masti, kaam baad mein \U0001f388",
-    "Wishing {name} the happiest birthday! Treats on me today~ \U0001f370",
-    "It's {name}'s birthday! Best day to them, best artifacts to us \U0001f381",
-    "Aaj {name} celebrate karte hain! Cake kat-ta hai ya main khud kha jaaun? \U0001f382",
-)
-
-def _fallback_wish(name, today):
-    pool = BIRTHDAY_FALLBACK_WISHES
-    pick = (sum(map(ord, name)) + int(today.strftime("%j"))) % len(pool)
-    return pool[pick].format(name=name)
-
-def _birthday_text(name, wish):
-    head = f"\U0001f382 Happy Birthday, {name}!"
+def _birthday_text(name, emoji, line):
+    head = f"# HAPPY BIRTHDAY {name.upper()}" + (f" {emoji}" if emoji else "")
+    text = head + "\n\n" + f'"{line}"'
     if BIRTHDAY_PING:
-        head = "@everyone " + head
-    return head + ("\n" + wish if wish else "")
+        text = "@everyone\n" + text
+    return text
 
 async def _birthday_check(now):
     """Post any not-yet-posted wishes for today's characters. Loop calls this."""
@@ -601,31 +589,44 @@ async def _birthday_check(now):
     today = now.strftime("%Y-%m-%d")
     done = _state["birthday_done"].setdefault(today, [])
     fails = _state["birthday_img_fail"].setdefault(today, {})
+    repo_root = os.path.dirname(os.path.abspath(__file__))
     for name, url in todays:
         if name in done:
             continue
-        # The photo is the point of the wish: never post text-only. A failed
-        # art fetch retries on the next tick inside the window; if the window
+        line = BIRTHDAY_LINES.get(name)
+        if not line:
+            # Owner-approved format needs the character's line; without one,
+            # skip (logged) rather than post a bare heading. Not retried:
+            # waiting will not conjure a line, so mark done for today.
+            log.warning("announcements: no curated birthday line for %s; skipping", name)
+            done.append(name)
+            save_state()
+            continue
+        # The photo is the point of the wish: never post without it. A failed
+        # art load retries on the next tick inside the window; if the window
         # ends first, today's wish is skipped (logged), like the morning post.
-        data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
+        local = BIRTHDAY_LOCAL_ART.get(name)
+        data, ctype = (None, None)
+        if local:
+            try:
+                with open(os.path.join(repo_root, local), 'rb') as fh:
+                    data = fh.read()
+                if not data:
+                    raise OSError("empty file")
+                ctype = 'image/jpeg' if local.lower().endswith(('.jpg', '.jpeg')) else 'image/png'
+            except OSError:
+                log.warning("announcements: birthday art file unreadable for %s (%s)", name, local)
+        else:
+            data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
         if not data:
             fails[name] = fails.get(name, 0) + 1
             save_state()
-            log.warning("announcements: birthday image fetch failed for %s (try %d), will retry",
+            log.warning("announcements: birthday image load failed for %s (try %d), will retry",
                         name, fails[name])
             continue
         image = (data, "png" if "png" in (ctype or "") else "jpg")
-        wish = None
-        if _birthday_writer is not None:
-            try:
-                wish = await _birthday_writer(name)
-            except Exception:
-                log.exception("announcements: birthday writer failed for %s", name)
-                wish = None
-        if not wish:
-            wish = _fallback_wish(name, now)
-        if await _post(BIRTHDAY_CHANNEL_ID, _birthday_text(name, wish),
-                       f"birthday {name}", image=image):
+        text = _birthday_text(name, BIRTHDAY_EMOJI.get(name, ''), line)
+        if await _post(BIRTHDAY_CHANNEL_ID, text, f"birthday {name}", image=image):
             if not DRY_RUN:
                 done.append(name)
                 if len(_state["birthday_done"]) > 10:
@@ -931,13 +932,12 @@ _tasks = []
 
 _started = False
 
-def start(client, birthday_writer=None):
-    global client_ref, _started, _birthday_writer
+def start(client):
+    global client_ref, _started
     if _started:
         return  # on_ready can fire again after reconnects; never double-start
     _started = True
     client_ref = client
-    _birthday_writer = birthday_writer
     load_state()
     if not ANNOUNCE_ENABLED:
         log.info("announcements: disabled via ANNOUNCE_ENABLED=0")
