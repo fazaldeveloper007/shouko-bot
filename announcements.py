@@ -12,6 +12,14 @@ Everything here is config-by-env with safe defaults for Fazal's server:
   CODES_CHANNEL_ID        default 1438772091116847247 (clips & highlights)
   EVENTS_CHANNEL_ID       default = CODES_CHANNEL_ID
   ANNOUNCE_CHECK_MINUTES  codes/events poll cadence, default 60
+  BIRTHDAY_ENABLED        character birthday wishes, default 1
+  BIRTHDAY_CHANNEL_ID     default 1438772091116847247 (clips & highlights)
+  BIRTHDAY_TIME           first post time, default 09:05 (after good-morning)
+  BIRTHDAY_TZ             IANA zone, default = MORNING_TZ
+  BIRTHDAY_PING           1 = prepend @everyone (default 0, quiet wish)
+                          Window: owner approved any time midnight-to-noon;
+                          posts stop at 12:00 local and are skipped if the bot
+                          was offline through the whole window (no late catch-up).
   OFFICIAL_UIDS           comma HoYoLAB uids treated as official, default 1015537
   ANNOUNCE_CODES_MODE     off (default) | strict | community
                             off:       codes feature disabled
@@ -52,6 +60,7 @@ _TZ_FALLBACK_OFFSETS = {
 }
 
 from gifs import GIFS
+from birthdays import BIRTHDAYS
 import random
 
 log = logging.getLogger("kristy.announce")
@@ -73,6 +82,14 @@ MORNING_TZ = os.getenv("MORNING_TZ", "Asia/Kolkata").strip()
 CODES_MODE = os.getenv("ANNOUNCE_CODES_MODE", "community").strip().lower()
 WELCOME_ENABLED = _flag("WELCOME_ENABLED", "1")
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "1438772091116847246").strip()
+BIRTHDAY_ENABLED = _flag("BIRTHDAY_ENABLED", "1")
+BIRTHDAY_CHANNEL_ID = os.getenv("BIRTHDAY_CHANNEL_ID", "1438772091116847247").strip()
+BIRTHDAY_TIME = os.getenv("BIRTHDAY_TIME", "09:05").strip()
+BIRTHDAY_TZ = os.getenv("BIRTHDAY_TZ", MORNING_TZ).strip()
+BIRTHDAY_PING = _flag("BIRTHDAY_PING", "0")
+BIRTHDAY_LAST_MINUTE = 12 * 60        # approved window ends at noon local
+BIRTHDAY_IMAGE_CAP = 9 * 1024 * 1024  # splash arts run ~2 MB
+BIRTHDAY_MAX_IMAGE_TRIES = 3          # then post text-only rather than skip
 try:
     CHECK_MINUTES = max(15, int(os.getenv("ANNOUNCE_CHECK_MINUTES", "60")))
 except ValueError:
@@ -132,6 +149,8 @@ def _default_state():
         "seen_events": [],     # type-2 post_ids already evaluated
         "held_codes": {},      # code -> {"first_seen": iso, "date_added": str|None}
         "morning_last": "",    # YYYY-MM-DD of last posted morning message
+        "birthday_done": {},     # date -> [character names already posted]
+        "birthday_img_fail": {}, # date -> {name: failed image fetches}
         "feeds_seeded": False,  # True once events/posts baseline is recorded
     }
 
@@ -472,32 +491,32 @@ async def _post(channel_id, text, label, image=None):
 # Morning loop
 # --------------------------------------------------------------------------
 
-_tzinfo = None
-_tz_resolved = False
 
-def _resolve_tz():
-    global _tzinfo, _tz_resolved
-    if _tz_resolved:
-        return _tzinfo
-    _tz_resolved = True
+_tz_cache = {}
+
+def _resolve_tz(name=None):
+    name = name or MORNING_TZ
+    if name in _tz_cache:
+        return _tz_cache[name]
+    tz = None
     if ZoneInfo is not None:
         try:
-            _tzinfo = ZoneInfo(MORNING_TZ)
-            return _tzinfo
+            tz = ZoneInfo(name)
         except Exception:
-            pass
-    fallback = _TZ_FALLBACK_OFFSETS.get(MORNING_TZ.strip().lower())
-    if fallback is not None:
-        log.warning("announcements: no tzdata for %r, using fixed UTC offset %s",
-                    MORNING_TZ, fallback)
-        _tzinfo = fallback
-    else:
-        log.warning("announcements: bad MORNING_TZ %r, using system local time", MORNING_TZ)
-        _tzinfo = None
-    return _tzinfo
+            tz = None
+    if tz is None:
+        fallback = _TZ_FALLBACK_OFFSETS.get(name.strip().lower())
+        if fallback is not None:
+            log.warning("announcements: no tzdata for %r, using fixed UTC offset %s",
+                        name, fallback)
+            tz = fallback
+        else:
+            log.warning("announcements: bad tz %r, using system local time", name)
+    _tz_cache[name] = tz
+    return tz
 
-def _now_local():
-    tz = _resolve_tz()
+def _now_local(tz_name=None):
+    tz = _resolve_tz(tz_name)
     if tz is None:
         return datetime.datetime.now()
     return datetime.datetime.now(tz)
@@ -526,6 +545,105 @@ async def morning_loop():
                         save_state()
         except Exception:
             log.exception("announcements: morning loop error")
+        await asyncio.sleep(30)
+
+
+# --------------------------------------------------------------------------
+# Character birthday wishes (owner request 2026-11-20): Kristy wishes each
+# Genshin character happy birthday with their official art, once per day,
+# any time inside the owner-approved midnight-to-noon window.
+# --------------------------------------------------------------------------
+
+_birthday_writer = None   # optional async (name) -> str|None, wired by bot.py
+
+# Used when the AI writer is unavailable or its output is rejected. Deterministic
+# pick per character+date so a retry never reshuffles the line.
+BIRTHDAY_FALLBACK_WISHES = (
+    "Aaj {name} ka din hai! Cake first, commissions later \U0001f382",
+    "Happiest birthday {name}! Teyvat is celebrating today \u2728",
+    "{name} ka janamdin hai! Party kahan hai? \U0001f389",
+    "Happy birthday {name}! May your pulls be 50/50-winning today \U0001f31f",
+    "{name}! Janamdin mubarak! Aaj sirf masti, kaam baad mein \U0001f388",
+    "Wishing {name} the happiest birthday! Treats on me today~ \U0001f370",
+    "It's {name}'s birthday! Best day to them, best artifacts to us \U0001f381",
+    "Aaj {name} celebrate karte hain! Cake kat-ta hai ya main khud kha jaaun? \U0001f382",
+)
+
+def _fallback_wish(name, today):
+    pool = BIRTHDAY_FALLBACK_WISHES
+    pick = (sum(map(ord, name)) + int(today.strftime("%j"))) % len(pool)
+    return pool[pick].format(name=name)
+
+def _birthday_text(name, wish):
+    head = f"\U0001f382 Happy Birthday, {name}!"
+    if BIRTHDAY_PING:
+        head = "@everyone " + head
+    return head + ("\n" + wish if wish else "")
+
+async def _birthday_check(now):
+    """Post any not-yet-posted wishes for today's characters. Loop calls this."""
+    minutes = now.hour * 60 + now.minute
+    try:
+        hh, mm = (int(x) for x in BIRTHDAY_TIME.split(":")[:2])
+    except Exception:
+        hh, mm = 9, 5
+    if not (hh * 60 + mm <= minutes < BIRTHDAY_LAST_MINUTE):
+        return
+    todays = list(BIRTHDAYS.get((now.month, now.day), ()))
+    if (now.month, now.day) == (2, 28):
+        try:
+            datetime.date(now.year, 2, 29)
+        except ValueError:
+            # Non-leap year: Feb 29 birthdays arrive on Feb 28, as in-game.
+            todays += BIRTHDAYS.get((2, 29), ())
+    if not todays:
+        return
+    today = now.strftime("%Y-%m-%d")
+    done = _state["birthday_done"].setdefault(today, [])
+    fails = _state["birthday_img_fail"].setdefault(today, {})
+    for name, url in todays:
+        if name in done:
+            continue
+        image = None
+        data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
+        if data:
+            image = (data, "png" if "png" in (ctype or "") else "jpg")
+        else:
+            fails[name] = fails.get(name, 0) + 1
+            save_state()
+            if fails[name] < BIRTHDAY_MAX_IMAGE_TRIES:
+                log.warning("announcements: birthday image fetch failed for %s (try %d)",
+                            name, fails[name])
+                continue
+            log.warning("announcements: birthday post for %s going text-only after %d image failures",
+                        name, fails[name])
+        wish = None
+        if _birthday_writer is not None:
+            try:
+                wish = await _birthday_writer(name)
+            except Exception:
+                log.exception("announcements: birthday writer failed for %s", name)
+                wish = None
+        if not wish:
+            wish = _fallback_wish(name, now)
+        if await _post(BIRTHDAY_CHANNEL_ID, _birthday_text(name, wish),
+                       f"birthday {name}", image=image):
+            if not DRY_RUN:
+                done.append(name)
+                if len(_state["birthday_done"]) > 10:
+                    for old in sorted(k for k in _state["birthday_done"] if k != today)[:-10]:
+                        _state["birthday_done"].pop(old, None)
+                        _state["birthday_img_fail"].pop(old, None)
+                save_state()
+
+async def birthday_loop():
+    await client_ref.wait_until_ready()
+    while True:
+        try:
+            if BIRTHDAY_ENABLED and not _state_broken:
+                await _birthday_check(_now_local(BIRTHDAY_TZ))
+        except Exception:
+            log.exception("announcements: birthday loop error")
         await asyncio.sleep(30)
 
 # --------------------------------------------------------------------------
@@ -815,12 +933,13 @@ _tasks = []
 
 _started = False
 
-def start(client):
-    global client_ref, _started
+def start(client, birthday_writer=None):
+    global client_ref, _started, _birthday_writer
     if _started:
         return  # on_ready can fire again after reconnects; never double-start
     _started = True
     client_ref = client
+    _birthday_writer = birthday_writer
     load_state()
     if not ANNOUNCE_ENABLED:
         log.info("announcements: disabled via ANNOUNCE_ENABLED=0")
@@ -829,13 +948,16 @@ def start(client):
         log.info("announcements: DRY RUN - nothing will actually be posted")
     _tasks.append(asyncio.create_task(morning_loop()))
     _tasks.append(asyncio.create_task(watch_loop()))
+    if BIRTHDAY_ENABLED:
+        _tasks.append(asyncio.create_task(birthday_loop()))
     if WELCOME_ENABLED:
         # on_member_join needs intents.members=True in bot.py AND the
         # "Server Members Intent" toggle ON in the Discord developer portal.
         client.event(_on_member_join)
         log.info("announcements: welcome listener registered -> %s", WELCOME_CHANNEL_ID)
-    log.info("announcements: started (morning %s %s -> %s, codes mode=%s -> %s, events -> %s)",
-             MORNING_TIME, MORNING_TZ, MORNING_CHANNEL_ID, CODES_MODE, CODES_CHANNEL_ID, EVENTS_CHANNEL_ID)
+    log.info("announcements: started (morning %s %s -> %s, codes mode=%s -> %s, events -> %s, birthdays %s %s -> %s)",
+             MORNING_TIME, MORNING_TZ, MORNING_CHANNEL_ID, CODES_MODE, CODES_CHANNEL_ID,
+             EVENTS_CHANNEL_ID, BIRTHDAY_TIME, BIRTHDAY_TZ, BIRTHDAY_CHANNEL_ID)
 
 # --------------------------------------------------------------------------
 # Standalone self-test: python announcements.py --selftest
