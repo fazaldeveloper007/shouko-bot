@@ -12,7 +12,8 @@ Everything here is config-by-env with safe defaults for Fazal's server:
   CODES_CHANNEL_ID        default 1438772091116847247 (clips & highlights)
   EVENTS_CHANNEL_ID       default = CODES_CHANNEL_ID
   ANNOUNCE_CHECK_MINUTES  codes/events poll cadence, default 60
-  BIRTHDAY_ENABLED        character birthday wishes, default 1
+  BIRTHDAY_ENABLED        character birthday wishes, default 0 (OFF; set 1 only
+                          after the owner approves the recurring wish wording)
   BIRTHDAY_CHANNEL_ID     default 1438772091116847247 (clips & highlights)
   BIRTHDAY_TIME           first post time, default 09:05 (after good-morning)
   BIRTHDAY_TZ             IANA zone, default = MORNING_TZ
@@ -82,14 +83,13 @@ MORNING_TZ = os.getenv("MORNING_TZ", "Asia/Kolkata").strip()
 CODES_MODE = os.getenv("ANNOUNCE_CODES_MODE", "community").strip().lower()
 WELCOME_ENABLED = _flag("WELCOME_ENABLED", "1")
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "1438772091116847246").strip()
-BIRTHDAY_ENABLED = _flag("BIRTHDAY_ENABLED", "1")
+BIRTHDAY_ENABLED = _flag("BIRTHDAY_ENABLED", "0")
 BIRTHDAY_CHANNEL_ID = os.getenv("BIRTHDAY_CHANNEL_ID", "1438772091116847247").strip()
 BIRTHDAY_TIME = os.getenv("BIRTHDAY_TIME", "09:05").strip()
 BIRTHDAY_TZ = os.getenv("BIRTHDAY_TZ", MORNING_TZ).strip()
 BIRTHDAY_PING = _flag("BIRTHDAY_PING", "0")
 BIRTHDAY_LAST_MINUTE = 12 * 60        # approved window ends at noon local
 BIRTHDAY_IMAGE_CAP = 9 * 1024 * 1024  # splash arts run ~2 MB
-BIRTHDAY_MAX_IMAGE_TRIES = 3          # then post text-only rather than skip
 try:
     CHECK_MINUTES = max(15, int(os.getenv("ANNOUNCE_CHECK_MINUTES", "60")))
 except ValueError:
@@ -604,19 +604,17 @@ async def _birthday_check(now):
     for name, url in todays:
         if name in done:
             continue
-        image = None
+        # The photo is the point of the wish: never post text-only. A failed
+        # art fetch retries on the next tick inside the window; if the window
+        # ends first, today's wish is skipped (logged), like the morning post.
         data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
-        if data:
-            image = (data, "png" if "png" in (ctype or "") else "jpg")
-        else:
+        if not data:
             fails[name] = fails.get(name, 0) + 1
             save_state()
-            if fails[name] < BIRTHDAY_MAX_IMAGE_TRIES:
-                log.warning("announcements: birthday image fetch failed for %s (try %d)",
-                            name, fails[name])
-                continue
-            log.warning("announcements: birthday post for %s going text-only after %d image failures",
+            log.warning("announcements: birthday image fetch failed for %s (try %d), will retry",
                         name, fails[name])
+            continue
+        image = (data, "png" if "png" in (ctype or "") else "jpg")
         wish = None
         if _birthday_writer is not None:
             try:
