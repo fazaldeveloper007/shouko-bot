@@ -88,19 +88,21 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             await announcements._birthday_check(datetime.datetime(2027, 12, 31, 9, 5))
         self.assertEqual(len(self.posts), 1)
 
-    async def test_image_failure_retries_then_text_only(self):
+    async def test_image_failure_never_posts_text_only(self):
         now = datetime.datetime(2027, 12, 31, 9, 30)  # Zhongli
         p = self.patched(self.fake_bytes_fail)
         with p[0], p[1], p[2]:
-            await announcements._birthday_check(now)
-            await announcements._birthday_check(now)
-        self.assertFalse(self.posts)
-        self.assertEqual(announcements._state['birthday_img_fail']['2027-12-31']['Zhongli'], 2)
-        with p[0], p[1], p[2]:
+            for _ in range(4):
+                await announcements._birthday_check(now)
+        self.assertFalse(self.posts)  # photo is required; no text-only fallback
+        self.assertNotIn('Zhongli', announcements._state['birthday_done'].get('2027-12-31', []))
+        self.assertEqual(announcements._state['birthday_img_fail']['2027-12-31']['Zhongli'], 4)
+        # art recovers later inside the window: post goes out with the image
+        q = self.patched(self.fake_bytes_ok)
+        with q[0], q[1], q[2]:
             await announcements._birthday_check(now)
         self.assertEqual(len(self.posts), 1)
-        self.assertIsNone(self.posts[0][3])  # text-only after 3 failed image tries
-        self.assertIn('Zhongli', announcements._state['birthday_done']['2027-12-31'])
+        self.assertIsNotNone(self.posts[0][3])
 
     async def test_writer_used_when_available(self):
         announcements._birthday_writer = AsyncMock(return_value='custom AI wish line')
