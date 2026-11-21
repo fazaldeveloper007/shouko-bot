@@ -63,6 +63,7 @@ _TZ_FALLBACK_OFFSETS = {
 from gifs import GIFS
 from birthdays import BIRTHDAYS, BIRTHDAY_EMOJI, BIRTHDAY_LINES, BIRTHDAY_LOCAL_ART
 import random
+import retrying
 
 log = logging.getLogger("kristy.announce")
 
@@ -997,7 +998,14 @@ async def _send_welcome(member, ch):
     """Send the approved welcome (live join and catch-up share this one path)."""
     gifs = GIFS.get("hello") or []
     gif = random.choice(gifs) if gifs else None
-    line = await _welcome_line()
+    # label the AI welcome-line call like the "welcomed X in Y" line it leads to
+    _op_tok = retrying.set_op(
+        f"welcome line for {retrying.clean_name(str(member))} in "
+        f"{retrying.clean_name(member.guild.name)}")
+    try:
+        line = await _welcome_line()
+    finally:
+        retrying.reset_op(_op_tok)
     if line:
         # Constant local lead-in keeps WELCOME_MARKER stable across fixed and
         # AI wording, so the catch-up history scan recognises both; the varied
