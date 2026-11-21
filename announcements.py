@@ -914,6 +914,30 @@ WELCOME_LINE_PROMPT = (
     "about their life, max 15 words. Reply with ONLY the welcome line.")
 
 
+def _unwrap_generated(text):
+    """Accept plain prose; if the provider still wraps the line in JSON
+    (plain or fenced), pull the text field out. Anything unrecognised
+    returns None so the caller falls back to the fixed approved line."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t[:1] in "{[\"`" or t.startswith("```"):
+        t = re.sub(r"^```(?:json)?\s*|```\s*$", "", t.strip(), flags=re.M).strip()
+        try:
+            data = json.loads(t)
+        except Exception:
+            return None
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        if isinstance(data, dict):
+            for key in ("message", "text", "line", "reply", "welcome"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+    return t
+
+
 def _sanitize_welcome_line(text):
     """A generated line must never ping anyone: strip mention syntax."""
     text = re.sub(r"<@!?\d+>|<@&\d+>", "", text)
@@ -929,7 +953,7 @@ async def _welcome_line():
     except Exception:
         log.exception("announcements: welcome line generation failed")
         return None
-    text = _sanitize_welcome_line((text or "").strip().strip('"'))
+    text = _sanitize_welcome_line((_unwrap_generated(text) or "").strip().strip('"'))
     if not text or len(text) > 200:
         return None
     return text
