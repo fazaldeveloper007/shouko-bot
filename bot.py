@@ -627,7 +627,8 @@ _channel_locks = defaultdict(asyncio.Lock)
 def _schedule_recap(channel_id):
     """Background recap update: never blocks or breaks replying."""
     try:
-        task = asyncio.create_task(recap.update(channel_id, summarize_recap))
+        task = asyncio.create_task(recap.update(
+            channel_id, lambda old, lines: summarize_recap(old, lines, channel_id=channel_id)))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
     except Exception:
@@ -2132,13 +2133,22 @@ async def _proactive_loop():
         await asyncio.sleep(60)
 
 
-async def summarize_recap(old_recap, lines):
+async def summarize_recap(old_recap, lines, channel_id=None):
     """One small AI call that folds overflowed chat lines into the channel recap.
 
     Raises on any failure so recap.update keeps the buffered lines for the
     next attempt instead of losing them.
     """
-    retrying.set_op("recap update")
+    where = ""
+    if channel_id is not None:
+        try:
+            ch = client.get_channel(channel_id)
+            ch_name = retrying.clean_name(getattr(ch, "name", None) or "?")
+            guild_name = retrying.clean_name(getattr(getattr(ch, "guild", None), "name", None) or "dm")
+            where = f" in #{ch_name} of {guild_name}"
+        except Exception:
+            where = ""
+    retrying.set_op(f"recap update{where}")
     chat = "\n".join(f"{author}: {text}" for author, text in lines)[-3000:]
     prompt = (
         "You maintain a running recap of a Discord channel, used as a chatbot's "
@@ -2832,6 +2842,7 @@ async def on_message(message):
     lock_held = None  # per-channel AI-path lock; set only on the AI branch
     gif_kind, gif_key = plan_gif(content, message.channel.id)
     gif_desc = None
+    gif_char_key = None  # character key of the gif being sent, when it is one
     if gif_kind in ("request", "hype"):
         # clear gif request (or short pure character hype): send the gif with a
         # short canned line and skip the AI brain entirely - zero API calls,
@@ -2839,6 +2850,7 @@ async def on_message(message):
         # alongside the gif
         gif_url = random.choice(CHARACTER_GIFS[gif_key]["gifs"])
         gif_desc = f"{gif_key} character"
+        gif_char_key = gif_key
         reply = random.choice(CHARACTER_GIF_LINES)
         reaction = heuristic_reaction("character")
     else:
@@ -2849,6 +2861,7 @@ async def on_message(message):
         if gif_kind == "mention":
             gif_url = random.choice(CHARACTER_GIFS[gif_key]["gifs"])
             gif_desc = f"{gif_key} character"
+            gif_char_key = gif_key
             _last_mention_gif[message.channel.id] = time.monotonic()
         elif gif_kind == "category":
             gif_url = random.choice(GIFS[gif_key])
@@ -3031,24 +3044,31 @@ async def on_message(message):
             await message.channel.send(extra_chunk)
         if gif_url:
             await message.channel.send(gif_url)  # Discord auto-embeds direct GIF links
-            # "send that one" later: the just-sent gif is a valid marker target
-            _last_gif_sent[message.channel.id] = (gif_char_key, time.monotonic())
-        await try_reaction(message, reaction)
-        # arm the continuation window only after the reply actually went out
-        _continuity.note_bot_reply(message.channel.id, user_id, reply)
-        # her direct reply answers any pending help bid from this member here,
-        # so the proactive loop never double-answers it at the next tick
-        if _proactive is not None and message.channel.id in {c.id for c in _proactive_channels.values()}:
-            try:
-                _proactive.cancel_addressed_by_reply(message.channel.id, user_id, message.id)
-            except Exception:
-                log.warning("proactive: pending cancel failed in channel %s", message.channel.id)
-        if _t_brain is not None:
-            log.info("reply timing: channel=%s wait=%.1fs prep=%.1fs brain=%.1fs total=%.1fs",
-                     message.channel.id, _t_wait, _t_prep - (_t0 + _t_wait),
-                     _t_brain - _t_prep, time.monotonic() - _t0)
     except Exception:
         log.exception("Failed to send reply in channel %s", message.channel.id)
+    else:
+        # the reply is OUT; failures below are bookkeeping, never a failed
+        # send, so they must not log as one
+        try:
+            if gif_url and gif_char_key is not None:
+                # "send that one" later: the just-sent gif is a valid marker target
+                _last_gif_sent[message.channel.id] = (gif_char_key, time.monotonic())
+            await try_reaction(message, reaction)
+            # arm the continuation window only after the reply actually went out
+            _continuity.note_bot_reply(message.channel.id, user_id, reply)
+            # her direct reply answers any pending help bid from this member here,
+            # so the proactive loop never double-answers it at the next tick
+            if _proactive is not None and message.channel.id in {c.id for c in _proactive_channels.values()}:
+                try:
+                    _proactive.cancel_addressed_by_reply(message.channel.id, user_id, message.id)
+                except Exception:
+                    log.warning("proactive: pending cancel failed in channel %s", message.channel.id)
+            if _t_brain is not None:
+                log.info("reply timing: channel=%s wait=%.1fs prep=%.1fs brain=%.1fs total=%.1fs",
+                         message.channel.id, _t_wait, _t_prep - (_t0 + _t_wait),
+                         _t_brain - _t_prep, time.monotonic() - _t0)
+        except Exception:
+            log.warning("post-send tracking failed in channel %s", message.channel.id, exc_info=True)
 
     # learn from this exchange in the background, after the reply is already out
     if content and reply not in FALLBACK_LINES and reply != EMPTY_REPLY_FALLBACK:
