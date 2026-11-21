@@ -2391,7 +2391,10 @@ async def on_ready():
     _voice_cache_connected = True
     log.info("%s is online as %s", BOT_NAME, client.user)
     await client.change_presence(activity=discord.Game(name=f"Genshin Impact | @{BOT_NAME} to chat"))
-    announcements.start(client)
+    # welcome_text_fn lets announcements generate a fresh sweet welcome line
+    # per joiner (prompt carries no member/server identifiers); failures
+    # fall back to the fixed approved line inside announcements.
+    announcements.start(client, welcome_text_fn=call_extractor)
     _schedule_worker.start()
     _proactive_start()
     if client.music:
