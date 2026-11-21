@@ -221,9 +221,12 @@ class Actions:
         for e in entries:
             if e.get('guild') != message.guild.id or e.get('author') != message.author.id:
                 continue
-            if e.get('status') not in ('awaiting_confirmation', 'confirmed'):
+            # store schema: status is preview/scheduled/...; the pending vs
+            # confirmed distinction lives on the reason field
+            if e.get('status') not in ('preview', 'scheduled') \
+                    or e.get('reason') not in ('awaiting_confirmation', 'confirmed'):
                 continue
-            rows.append(f"{e['id']} | {tm.shown(e['due'])} | {e['status']}")
+            rows.append(f"{e['id']} | {tm.shown(e['due'])} | {e['reason']}")
         if not rows:
             return 'tumhara koi pending reminder ya schedule nahi hai.'
         return ('tumhare saved schedules:\n' + '\n'.join(rows[:8])
