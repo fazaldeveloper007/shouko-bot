@@ -21,6 +21,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     def onstop(self):
         self.stops += 1
 
+    def allow(self, *ids):
+        # Rebuild the coordinator with a wider allowlisted audience.
+        self.scope = GroupScope(G, CH, BOT, frozenset(ids), NOTICE_REVISION)
+        self.p = GroupSessionPolicy(self.scope)
+        self.c = GroupCoordinator(self.p, lambda: dict(guild=G, channel=CH,
+            humans=self.roster), self.onstop)
+        self.c.refresh()
+
     def agree_all(self):
         for actor in (A, B):
             self.c.agree(actor=actor, guild=G, channel=CH, audience=(A, B),
@@ -49,15 +57,58 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.c.input(dict(type='speech_start', epoch=2, speaker=B))
         self.assertEqual(self.stops, 1)
 
-    async def test_queued_audio_not_uploaded_after_unknown_join(self):
+    async def test_queued_audio_from_ungranted_joiner_dropped(self):
+        self.allow(A, B, C)
         self.agree_all()
         bridge = NS(audio=asyncio.Queue(), write=AsyncMock())
         checked = CheckedBridge(bridge, self.c)
-        await bridge.audio.put(dict(type='speech_start', epoch=1, speaker=A))
         self.roster = (A, B, C)
-        with self.assertRaises(GroupPolicyError):
-            await checked.audio.get()
-        bridge.write.assert_not_awaited()
+        self.c.refresh()  # allowed but ungranted joiner pauses, never stops
+        self.assertTrue(self.c.paused)
+        await bridge.audio.put(dict(type='speech_start', epoch=1, speaker=C))
+        await bridge.audio.put(dict(type='speech_start', epoch=2, speaker=A))
+        event = await asyncio.wait_for(checked.audio.get(), 1)
+        self.assertEqual(event['epoch'], 2)  # ungranted member never uploaded
+        self.assertNotIn('speaker', event)
+        self.assertEqual(self.stops, 0)
+
+    def test_pause_blocks_playback_and_resumes(self):
+        self.allow(A, B, C)
+        self.agree_all()
+        self.roster = (A, B, C)
+        self.c.refresh()
+        self.assertTrue(self.c.paused)
+        self.assertEqual(self.c.pending_agreement, frozenset({C}))
+        self.assertIsNone(self.c.input(dict(type='speech_start', epoch=1, speaker=C)))
+        self.assertFalse(self.c.playback())  # dropped, not fatal
+        self.assertFalse(self.c.stopped)
+        self.roster = (A, B)
+        self.c.refresh()
+        self.assertFalse(self.c.paused)
+        self.assertTrue(self.c.playback())
+
+    def test_pause_resumes_when_joiner_agrees(self):
+        self.allow(A, B, C)
+        self.agree_all()
+        self.roster = (A, B, C)
+        self.c.refresh()
+        self.assertTrue(self.c.paused)
+        self.c.agree(actor=C, guild=G, channel=CH, audience=(A, B, C),
+            revision=NOTICE_REVISION, adult=True, processing=True)
+        self.c.refresh()
+        self.assertFalse(self.c.paused)
+        self.assertTrue(self.c.playback())
+
+    def test_pause_timeout_stops(self):
+        self.allow(A, B, C)
+        self.agree_all()
+        self.roster = (A, B, C)
+        self.c.refresh()
+        self.assertTrue(self.c.paused)
+        with patch('voice_live.group_runtime.PAUSE_LIMIT_SECONDS', 0):
+            with self.assertRaisesRegex(GroupPolicyError, 'AGREEMENT_MISSING'):
+                self.c.refresh()
+        self.assertEqual(self.stops, 1)
 
     async def test_output_blocked_after_decline(self):
         self.agree_all()
@@ -68,14 +119,24 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await checked.write(dict(type='output', epoch=1, data='AAAA'))
         bridge.write.assert_not_awaited()
 
-    async def test_output_blocked_on_member_leave(self):
+    async def test_output_allowed_after_granted_member_leaves(self):
         self.agree_all()
         bridge = NS(audio=asyncio.Queue(), write=AsyncMock())
         checked = CheckedBridge(bridge, self.c)
         self.roster = (A,)
-        with self.assertRaises(GroupPolicyError):
-            await checked.write(dict(type='output_end', epoch=1))
-        bridge.write.assert_not_awaited()
+        await checked.write(dict(type='output_end', epoch=1))
+        bridge.write.assert_awaited_once()
+        self.assertEqual(self.stops, 0)
+
+    async def test_output_dropped_while_paused(self):
+        self.allow(A, B, C)
+        self.agree_all()
+        bridge = NS(audio=asyncio.Queue(), write=AsyncMock())
+        checked = CheckedBridge(bridge, self.c)
+        self.roster = (A, B, C)
+        await checked.write(dict(type='output_end', epoch=1))
+        bridge.write.assert_not_awaited()  # paused: drop, session survives
+        self.assertEqual(self.stops, 0)
 
     async def test_stop_command_allowed_after_revoke(self):
         self.agree_all()
@@ -86,13 +147,24 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         bridge.write.assert_awaited_once()
 
     def test_malformed_or_replayed_epoch_stops(self):
-        for epoch in (0, 2, True, '1', None):
+        for epoch in (0, True, '1', None):
             with self.subTest(epoch=epoch):
                 self.setUp()
                 self.agree_all()
                 with self.assertRaises(GroupPolicyError):
                     self.c.input(dict(type='speech_start', epoch=epoch, speaker=A))
                 self.assertEqual(self.stops, 1)
+
+    def test_forward_epoch_gap_tolerated_but_replay_stops(self):
+        self.agree_all()
+        self.c.input(dict(type='speech_start', epoch=1, speaker=A))
+        self.c.input(dict(type='speech_end', epoch=1, speaker=A))
+        self.c.input(dict(type='speech_start', epoch=3, speaker=B))  # gap ok
+        self.c.input(dict(type='speech_end', epoch=3, speaker=B))
+        self.assertEqual(self.stops, 0)
+        with self.assertRaises(GroupPolicyError):
+            self.c.input(dict(type='speech_start', epoch=2, speaker=A))  # replay
+        self.assertEqual(self.stops, 1)
 
     def test_snapshot_failure_stops_once(self):
         def bad():
