@@ -74,12 +74,37 @@ class GroupPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(GroupPolicyError, 'CLOSED'):
             self.p.require_playback()
 
-    def test_even_approved_member_leave_stops(self):
+    def test_approved_member_leave_survives_once_adapter_rederives(self):
         self.active()
-        with self.assertRaisesRegex(GroupPolicyError, 'CHANGED'):
-            self.roster((A,))
-        with self.assertRaises(GroupPolicyError):
+        self.roster((A,))  # a leave inside the allowed audience no longer stops
+        self.p._agreed = {A}  # what the coordinator re-derives from grants
+        self.p.require_audio(speaker=A)
+        self.p.require_playback()
+
+    def test_audio_without_adapter_rederive_fails_closed(self):
+        self.active()
+        self.roster((A,))
+        # If the adapter ever skips re-derivation, the stale mismatch still
+        # fails closed rather than drifting.
+        with self.assertRaisesRegex(GroupPolicyError, 'NOT_ALLOWED'):
             self.p.require_audio(speaker=A)
+
+    def test_allowlisted_joiner_does_not_stop_session(self):
+        p = GroupSessionPolicy(GroupScope(G, CH, BOT, frozenset((A, B, C)), 'draft1'))
+        p.observe_roster(guild=G, channel=CH, humans=(A, B))
+        for actor in (A, B):
+            p.agree(actor=actor, guild=G, channel=CH, audience=(A, B),
+                    notice_revision='draft1', adult=True, processing=True)
+        p.start()
+        p.observe_roster(guild=G, channel=CH, humans=(A, B, C))  # allowed, ungranted
+        # Their audio is not allowed until the adapter records their agreement.
+        with self.assertRaisesRegex(GroupPolicyError, 'NOT_ALLOWED'):
+            p.require_audio(speaker=C)
+
+    def test_empty_channel_stops(self):
+        self.active()
+        with self.assertRaisesRegex(GroupPolicyError, 'NO_LISTENERS'):
+            self.roster(())
 
     def test_other_bot_not_silently_allowed(self):
         with self.assertRaisesRegex(GroupPolicyError, 'UNSAFE'):
