@@ -112,7 +112,7 @@ class Results(discord.ui.LayoutView):
         self.expires = time.monotonic() + 180
         self.claim_lock = asyncio.Lock()
         container = discord.ui.Container(accent_color=ACCENT)
-        container.add_item(discord.ui.TextDisplay('## Kristy • YouTube search\nAudio only. Play starts when idle; Add to queue only queues.'))
+        container.add_item(discord.ui.TextDisplay('## Kristy • YouTube search\nAudio only. Play interrupts the current track; Add to queue only queues.'))
         for index, track in enumerate(tracks):
             container.add_item(discord.ui.TextDisplay(f'**{index+1}. {clean(track.title, 140)}**\n{duration(track.duration)} • [YouTube]({track.url})'))
             row = discord.ui.ActionRow()
@@ -136,9 +136,13 @@ class Results(discord.ui.LayoutView):
                         from dataclasses import replace
                         track = replace(self.tracks[index], requester=interaction.user.id)
                         self.manager.caller_channel(interaction.user, interaction.channel)
-                        await p.add(track, start=action == 'Play')
+                        if action == 'Play':
+                            was_playing = p.current is not None
+                            await p.play_now(track)
+                        else:
+                            await p.add(track, start=False)
                         emit('REQUEST','OK',elapsed=time.monotonic()-request_began)
-                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Preparing audio now; playback starts after extraction/download.' if action == 'Play' and not p.started else (' Waiting behind the current track.' if action == 'Play' else ' Use /play to start if idle.')))
+                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Playing now, interrupting the current track.' if action == 'Play' and was_playing else (' Playing now.' if action == 'Play' else ' Use /play to start if idle.')))
                         await self.manager.panel(p)
                     except Exception as exc:
                         if claimed:
