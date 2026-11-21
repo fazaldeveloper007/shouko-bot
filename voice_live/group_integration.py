@@ -15,6 +15,51 @@ from music.player import MusicError
 from music.ui import answer
 
 
+# Content-free fixed end reasons for the VC notice; never raw exceptions,
+# never audio or transcript content. Worker STOPPED is only shown as a stop
+# when no earlier policy/worker cause was recorded.
+END_REASONS = {
+    'SESSION_LIMIT': 'the 10-minute session limit was reached',
+    'IDLE_LIMIT': '60 seconds of silence passed',
+    'GROUP_NO_LISTENERS': 'everyone left the voice channel',
+    'GROUP_AUDIENCE_UNSAFE': 'someone outside the allowed group joined the VC',
+    'GROUP_AGREEMENT_MISSING': 'a new member did not tap Agree in time',
+    'GROUP_CONSENT_REVOKED': 'a saved agreement was revoked',
+    'GROUP_DECLINED': 'someone pressed Decline / Stop',
+    'GROUP_MANUAL_STOP': 'stopped by /leavevckristy',
+    'GROUP_CONSENT_NOT_COMPLETED': 'not everyone agreed in time',
+    'GROUP_PERMISSION_SCOPE_CHANGED': 'the Live configuration changed mid-session',
+    'DAVE_TRANSITION_TIMEOUT': 'voice encryption was interrupted',
+    'DAVE_WAIT_FAILED': 'voice encryption could not start',
+    'DECODE_QUEUE_LIMIT': 'the phone could not decode audio fast enough',
+    'GOOGLE_CONNECTION_CLOSED': 'Google closed the connection',
+    'GOOGLE_API_REJECTED': 'Google rejected the request',
+    'GOOGLE_SETUP_REJECTED': 'Google rejected the session setup',
+    'GOOGLE_AUDIO_TOO_SHORT': 'Google returned no audio',
+    'GOOGLE_AUDIO_SILENT': 'Google returned no audio',
+    'GOOGLE_UNSOLICITED_OUTPUT': 'Google sent an unexpected reply',
+    'OUTPUT_QUEUE_LIMIT': 'playback failed on the phone',
+    'PLAYER_ERROR': 'playback failed on the phone',
+    'OUTPUT_STREAM_ERROR': 'playback failed on the phone',
+    'VOICE_DISCONNECTED': 'the Discord voice connection dropped',
+    'VOICE_MOVED': 'Kristy was moved out of the voice channel',
+    'VOICE_ERROR': 'the Discord voice connection dropped',
+    'VOICE_FAILURE': 'the Discord voice connection dropped',
+    'WORKER_EXITED': 'the voice worker stopped unexpectedly',
+    'CONNECT_TIMEOUT': 'could not connect to the voice channel',
+    'INPUT_LIMIT': 'the input limit was reached',
+    'SESSION_INPUT_LIMIT': 'the input limit was reached',
+    'COMPLETE': 'the session completed',
+    'STOPPED': 'the session stopped',
+}
+
+
+def end_text(code):
+    reason = END_REASONS.get(code or '', 'the session ended')
+    return ('Kristy Live ended: ' + reason +
+            '. These controls no longer work. /kristylive starts a new one.')
+
+
 class LiveGroups:
     def __init__(self, client, manager, config_path, *, notice_approved=False,
                  confirmed_free_tier=False):
@@ -50,7 +95,7 @@ class LiveGroups:
         self.consent_store.revoke(actor)
         session = self.sessions.get(interaction.guild_id)
         if session and session.coordinator:
-            session.coordinator.stop()
+            session.coordinator.stop('GROUP_CONSENT_REVOKED')
         await answer(interaction, 'Your saved Live agreement is removed. Any active session is stopping.', ephemeral=True)
 
     async def start(self, interaction):
@@ -83,7 +128,8 @@ class LiveGroups:
             if (p and not p.closed) or (me.voice and me.voice.channel) or vc.guild.voice_client:
                 raise GroupPolicyError('GROUP_VOICE_BUSY')
             session = SimpleNamespace(channel=vc, stopped=asyncio.Event(), task=None,
-                coordinator=None, view=None, message=None, leave_confirmed=True)
+                coordinator=None, view=None, message=None, leave_confirmed=True,
+                end_code=None, pause_view=None, pause_message=None)
             self.sessions[gid] = session
             self.manager.voice_reservations[gid] = session
         try:
@@ -117,6 +163,28 @@ class LiveGroups:
                 changed = configured_scope(dict(current, voice_channel_id=policy.scope.channel), ids, policy.scope.bot, policy.scope.guild)
                 self.consent_store.valid(changed)  # Clear old scope before stopping.
                 raise GroupPolicyError('GROUP_PERMISSION_SCOPE_CHANGED')
+        async def roster_notice(kind, members):
+            # VC-chat surface for a mid-session agreement pause; content-free.
+            try:
+                if kind == 'paused' and session.coordinator is not None:
+                    view = SharedConsentView(session.coordinator, asyncio.Event())
+                    session.pause_view = view
+                    mentions = ' '.join('<@%s>' % m for m in sorted(members))
+                    session.pause_message = await session.channel.send(
+                        'Kristy Live paused: ' + mentions + ' joined without a saved agreement. '
+                        'Tap 18+ Agree below to resume, or leave the VC. No voice is processed while paused. '
+                        'Session stops if this takes more than 90 seconds.',
+                        view=view, allowed_mentions=discord.AllowedMentions(users=True))
+                elif kind == 'resumed':
+                    if session.pause_view:
+                        session.pause_view.stop()
+                        session.pause_view = None
+                    if session.pause_message:
+                        await session.pause_message.edit(
+                            content='Agreement saved. Kristy Live resumed.', view=None)
+                        session.pause_message = None
+            except Exception:
+                pass  # The worker hold alone already keeps the pause safe.
         try:
             key = os.getenv('GEMINI_API_KEY', '').strip()
             if not key:
@@ -125,11 +193,13 @@ class LiveGroups:
                 raise GroupPolicyError('GROUP_EXISTING_KEY_NOT_FOUND')
             await run_approved_group(self.client, session.channel, policy, key,
                 consent_ready=consent, stopped=session.stopped, notice_approved=True,
-                confirmed_free_tier=True, outcome=session, grant_store=self.consent_store, validate_scope=validate_scope)
+                confirmed_free_tier=True, outcome=session, grant_store=self.consent_store, validate_scope=validate_scope,
+                roster_notice=roster_notice)
         except asyncio.CancelledError:
             raise
         except (GroupPolicyError, LiveError) as error:
             # Fixed reason codes only; end_line drops anything that is not one.
+            session.end_code = str(error)
             print(end_line({'code': str(error)}), flush=True)
         except Exception:
             # No model/user/exception text in logs or Discord diagnostics.
@@ -138,9 +208,12 @@ class LiveGroups:
             session.stopped.set()
             if session.view:
                 session.view.stop()
+            pause_view = getattr(session, 'pause_view', None)
+            if pause_view:
+                pause_view.stop()
             if session.message:
                 try:
-                    await session.message.edit(content='Restricted voice test ended. These controls no longer work.', view=None)
+                    await session.message.edit(content=end_text(getattr(session, 'end_code', None)), view=None)
                 except Exception:
                     pass
             lock = self.manager.guild_locks.setdefault(gid, asyncio.Lock())
@@ -161,6 +234,7 @@ class LiveGroups:
                 str(interaction.user.id) not in self._allowed_ids()):
             raise MusicError('Join the active restricted VC to stop Live')
         await answer(interaction, 'Stopping Live and leaving VC.', ephemeral=True)
+        session.end_code = 'GROUP_MANUAL_STOP'
         session.stopped.set()
         if session.coordinator:
             session.coordinator.stop()
