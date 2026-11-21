@@ -66,7 +66,10 @@ class GuildPlayer:
         # One track ahead only; the file is bounded by max_bytes and cleaned like any temp track file.
         if self.prefetch or self.closed or not self.queue: return
         track = self.queue[0]
-        path = self.media_dir / ('prefetch-' + secrets.token_hex(8) + '.webm')
+        # Name must satisfy the worker's safePath contract (^track-[a-f0-9]+\.webm$):
+        # any other prefix makes the engine reject the play as INVALID_COMMAND and
+        # shut down, which dropped the whole VC session on skip/track-advance.
+        path = self.media_dir / ('track-' + secrets.token_hex(8) + '.webm')
         self.prefetch = dict(id=track.id, task=asyncio.create_task(self.manager.media.download(track, path, background=True)), path=path)
 
     async def _prefetch_cancel(self):
@@ -212,6 +215,16 @@ class GuildPlayer:
             if enabled and not self.current and not self.queue and not self.closed and (not self.task or self.task.done()):
                 self.task = asyncio.create_task(self.run())
         await self.manager.panel(self)
+
+    async def play_now(self, track):
+        # Search-card Play: interrupt whatever is playing and start this track at
+        # once. The existing queue is preserved behind it, so nothing is lost.
+        async with self.lock:
+            if self.closed: raise MusicError('Voice session ended; join again')
+            if len(self.queue) >= self.manager.queue_limit: raise MusicError('Queue is full')
+            self.queue.appendleft(track)
+            self.queued_at[id(track)] = time.monotonic()
+        await self.interrupt()
 
     async def start_queue(self):
         async with self.lock:
