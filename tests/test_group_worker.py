@@ -16,12 +16,17 @@ GROUP_BODY=BODY.replace('assert.deepEqual(subscriptions,[target]);', 'assert.dee
 GROUP_BODY=GROUP_BODY.replace('await new Promise(setImmediate);\n }', 'await new Promise(r=>setTimeout(r,15));\n }')
 GROUP_BODY=GROUP_BODY.replace('async function inputPacket(silent=false){', "async function inputPacket(silent=false,actor=target){")
 GROUP_BODY=GROUP_BODY.replace('header.writeUInt32BE(ssrc,8);', 'header.writeUInt32BE(actor===target?ssrc:ssrc+1,8);')
-GROUP_BODY=GROUP_BODY.replace("else if(mode==='barge')for(let i=0;i<8;i++)await inputPacket();", "else if(mode==='barge')for(let i=0;i<8;i++)await inputPacket(false,second);")
+GROUP_BODY=GROUP_BODY.replace("else if(mode==='barge')for(let i=0;i<30;i++)await inputPacket();", "else if(mode==='barge')for(let i=0;i<30;i++)await inputPacket(false,second);")
+GROUP_BODY=GROUP_BODY.replace("else if(mode==='member')conn.receiver.speaking.emit('start','500000000000000');",
+    "else if(mode==='member'){conn.receiver.speaking.emit('start','500000000000000');await new Promise(setImmediate);assert.ok(!messages.some(m=>m.type==='result'));send({type:'stop'});}\n"
+    " else if(mode==='daverecover'){encrypted=false;timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();assert.ok(messages.some(m=>m.type==='transition_wait'));encrypted=true;await new Promise(r=>setTimeout(r,20));assert.ok(messages.some(m=>m.type==='transition_ready'));send({type:'stop'});}")
 GROUP_BODY=GROUP_BODY.replace("assert.equal(messages.filter(m=>m.type==='speech_start').length,2);", "assert.equal(messages.filter(m=>m.type==='speech_start').length,2);assert.equal(messages.filter(m=>m.type==='speech_start')[1].speaker,mode==='barge'?second:target);")
 
 class GroupWorkerTests(unittest.TestCase):
     def test_actual_group_receive_playback_barge_deadline_and_safety(self):
-        for mode, code in [('barge','STOPPED'), ('deadline','SESSION_LIMIT'), ('drainbarge','SESSION_LIMIT'), ('member','OTHER_SPEAKER'), ('dave','DAVE_NOT_READY'), ('stop','STOPPED')]:
+        # An unknown speaker is ignored (never subscribed), and a momentary
+        # encryption loss waits for re-keying instead of ending the session.
+        for mode, code in [('barge','STOPPED'), ('deadline','SESSION_LIMIT'), ('drainbarge','SESSION_LIMIT'), ('member','STOPPED'), ('dave','DAVE_TRANSITION_TIMEOUT'), ('daverecover','STOPPED'), ('stop','STOPPED')]:
             with self.subTest(mode=mode):
                 p=subprocess.run(['node','-e',GROUP_PREFIX+GROUP_BODY,str(ROOT),mode],capture_output=True,text=True,timeout=6)
                 self.assertEqual(p.returncode,0,p.stderr)
