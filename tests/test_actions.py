@@ -105,8 +105,8 @@ class MarkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reminder_list_own_only(self):
         entries = [
-            {'id': 'aaa111bbb2', 'guild': 10, 'author': int(OWNER), 'due': 1893456000, 'status': 'confirmed'},
-            {'id': 'ccc333ddd4', 'guild': 10, 'author': int(OTHER), 'due': 1893456000, 'status': 'confirmed'},
+            {'id': 'aaa111bbb2', 'guild': 10, 'author': int(OWNER), 'due': 1893456000, 'status': 'scheduled', 'reason': 'confirmed'},
+            {'id': 'ccc333ddd4', 'guild': 10, 'author': int(OTHER), 'due': 1893456000, 'status': 'scheduled', 'reason': 'confirmed'},
             {'id': 'eee555fff6', 'guild': 10, 'author': int(OWNER), 'due': 1893456000, 'status': 'cancelled'},
         ]
         a = make_actions(entries=entries)
