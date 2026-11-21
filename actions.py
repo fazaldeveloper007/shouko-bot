@@ -39,13 +39,19 @@ CAPABILITY = (
     "of these, reply with ONLY the matching marker on its own first line - "
     "the runtime performs it and writes the real result, which the member "
     "sees instead of your marker:\n"
-    "[[do:music status]] - what is playing now and what is queued\n"
+    "[[do:music status]] - what is playing now\n"
+    "[[do:music queue]] - the full waiting queue\n"
     "[[do:music pause]] / [[do:music resume]] / [[do:music skip]] / [[do:music stop]]\n"
     "[[do:reminder list]] - the member's own saved reminders\n"
-    "[[do:announce | full announcement text here]] - draft an @everyone "
-    "announcement for this channel when the server owner clearly asks for one; "
-    "write the complete polished announcement after the | (no @mentions in it). "
-    "The owner reviews the exact preview before anything is posted.\n"
+    "[[do:announce everyone | full announcement text here]] - draft an "
+    "announcement that pings everyone in this channel\n"
+    "[[do:announce quiet | full announcement text here]] - draft an "
+    "announcement with NO ping\n"
+    "Announce only when the server owner clearly asks for one: write the "
+    "complete polished announcement after the | (no @mentions in it), choose "
+    "everyone vs quiet from what they asked, and leave the scope word out when "
+    "they did not say - the runtime will ask them. The owner reviews the exact "
+    "preview before anything is posted.\n"
     "Rules: at most one marker per reply, only when the request is clear - "
     "ask a short question instead when it is not. NEVER claim you did one of "
     "these things in plain text; the marker is the only way, and the runtime "
@@ -95,10 +101,12 @@ class Actions:
             await message.reply('Channel ab accessible nahi hai; announcement post nahi hua.', mention_author=False)
             return True
         try:
-            sent = await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+            sent = await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=entry['ping'], users=False, roles=False))
         except Exception as exc:
-            log.warning('announce post failed: %s', type(exc).__name__)
-            await message.reply('Announcement post NAHI hua (Discord error). Dobara try karo.', mention_author=False)
+            # The error may have happened after Discord accepted the message.
+            # Never claim a definite failure and never auto-retry a duplicate.
+            log.warning('announce send outcome unknown: %s', type(exc).__name__)
+            await message.reply('Send ka result confirm nahi hua - ho sakta hai post ho gaya ho. Channel khud check karo; main apne aap dobara NAHI bhejungi. Naya preview chahiye toh phir se bolo.', mention_author=False)
             return True
         await message.reply(f'Announcement post ho gaya ✅ {sent.jump_url}', mention_author=False)
         return True
@@ -113,6 +121,8 @@ class Actions:
         try:
             if cmd == 'music status':
                 return await self._music_status(message)
+            if cmd == 'music queue':
+                return await self._music_queue(message)
             if cmd == 'music pause':
                 return await self._music_pause(message, True)
             if cmd == 'music resume':
@@ -123,8 +133,13 @@ class Actions:
                 return await self._music_stop(message)
             if cmd == 'reminder list':
                 return self._reminder_list(message)
+            if cmd == 'announce everyone':
+                return self._announce_preview(message, draft, ping=True)
+            if cmd == 'announce quiet':
+                return self._announce_preview(message, draft, ping=False)
             if cmd == 'announce':
-                return self._announce_preview(message, draft)
+                return ('everyone tag ke saath bhejna hai ya bina ping ke (quiet)? '
+                        'scope bata do, phir exact preview dungi.')
         except MusicError as exc:
             return str(exc)  # user-facing music rules (join VC, use VC chat)
         except Exception:
@@ -169,6 +184,9 @@ class Actions:
             await player.pause(paused)
         except MusicError as exc:
             return f'nahi ho paya: {exc}'
+        # Confirm from actual state, not from the request having been made.
+        if player.paused != paused:
+            return 'command gayi par state confirm nahi hui; panel ka actual status dekho.'
         return 'pause kar diya ⏸️' if paused else 'resume kar diya ▶️'
 
     async def _music_skip(self, message):
@@ -177,13 +195,19 @@ class Actions:
             return 'abhi koi track nahi chal raha; skip karne ko kuch nahi hai.'
         next_title = clean(player.queue[0].title, 60) if player.queue else None
         await player.interrupt()
-        return 'skip kar diya ⏭️' + (f' ab next: {next_title}' if next_title else '')
+        # The skip itself completed; the next track starts asynchronously and
+        # can still fail on its own, so name it as upcoming, never as playing.
+        if next_title:
+            return f'skip kar diya ⏭️ agla shuru ho raha hai: {next_title} (start hua ya nahi, panel par confirm hoga)'
+        return 'skip kar diya ⏭️ queue mein agla kuch nahi tha.'
 
     async def _music_stop(self, message):
         player = self._player(message)
         if player is None or player.closed or (player.current is None and not player.queue):
             return 'pehle se sab band hai; VC mein hoon, gaana bolo toh baja dungi.'
         await player.interrupt(clear=True)
+        if player.queue or player.current is not None:
+            return 'stop command gayi par queue/state confirm nahi hui; panel check karo.'
         return 'music band kar diya ⏹️ queue clear; VC mein hi rahi.'
 
     def _reminder_list(self, message):
@@ -205,7 +229,18 @@ class Actions:
         return ('tumhare saved schedules:\n' + '\n'.join(rows[:8])
                 + (f'\n...aur {len(rows) - 8}' if len(rows) > 8 else ''))
 
-    def _announce_preview(self, message, draft):
+    async def _music_queue(self, message):
+        player = self._player(message)
+        if player is None or player.closed or not player.queue:
+            return 'queue khaali hai.'
+        queued = list(player.queue)
+        lines = [f'queue mein {len(queued)} track:']
+        lines += [f'{i+1}. {clean(t.title, 80)}' for i, t in enumerate(queued[:10])]
+        if len(queued) > 10:
+            lines.append(f'...aur {len(queued) - 10}')
+        return '\n'.join(lines)
+
+    def _announce_preview(self, message, draft, ping):
         if message.guild is None:
             return 'announcement server channel mein banti hai, DM mein nahi.'
         if not self.owner_id:
@@ -215,8 +250,8 @@ class Actions:
         if not draft:
             return 'kis baare mein announce karna hai? thoda context do, phir draft bana dungi.'
         me = message.guild.me
-        if me is not None and not message.channel.permissions_for(me).mention_everyone:
-            return 'mere paas is channel mein @everyone mention ki permission nahi hai; pehle woh permission do.'
+        if ping and me is not None and not message.channel.permissions_for(me).mention_everyone:
+            return 'mere paas is channel mein @everyone mention ki permission nahi hai; pehle woh permission do, ya quiet announce bolo.'
         draft = re.sub(r'<@!?\d+>|<@&\d+>|@everyone|@here', '', draft, flags=re.I).strip()[:400]
         if not draft:
             return 'draft khaali reh gaya; thoda detail do.'
@@ -225,13 +260,14 @@ class Actions:
             'author': message.author.id,
             'channel': message.channel.id,
             'guild': message.guild.id,
-            'text': f'@everyone\n{draft}',
+            'ping': ping,
+            'text': ('@everyone\n' if ping else '') + draft,
             'expires': time.monotonic() + self.PREVIEW_TTL,
         }
         channel_name = getattr(message.channel, 'name', '?')
         return ('announcement preview (abhi post NAHI hua):\n'
                 f'channel: #{channel_name}\n'
-                'ping: everyone\n'
+                f'ping: {"everyone" if ping else "none (quiet post)"}\n'
                 f'---\n{draft}\n---\n'
                 f'bhejne ke liye: Kristy announce confirm {ident}\n'
                 f'cancel ke liye: Kristy announce cancel {ident}\n'
