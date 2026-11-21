@@ -29,7 +29,7 @@ conn.subscribe=player=>player.subscribe(conn);
 const target='400000000000000',ssrc=12345,key=crypto.randomBytes(32);
 conn.receiver.ssrcMap.update({userId:target,audioSSRC:ssrc});
 conn.receiver.connectionData={encryptionMode:'aead_aes256_gcm_rtpsize',nonceBuffer:Buffer.alloc(12),secretKey:key};
-const sandbox={Buffer,require:name=>{
+const sandbox={Buffer,AbortController,require:name=>{
  if(name==='node:readline')return{createInterface:()=>input};
  if(name==='node:stream')return require(name);
  if(name==='../voice_probe/node_modules/@discordjs/voice')return{...v,joinVoiceChannel:opts=>{assert.equal(opts.selfMute,false);assert.equal(opts.selfDeaf,false);assert.equal(opts.daveEncryption,true);return conn;}};
