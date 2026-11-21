@@ -85,10 +85,21 @@ secondary-account link or private-history recognition.
 
 Eight concurrent humans is a conservative unmeasured resource cap, not a phone
 capacity guarantee; allowlists may be longer. Each input Opus decoder has an
-isolated Node worker-thread heap and bounded 48-packet queue. Human overlap stops
-rather than merging speakers. Another member can interrupt Kristy's reply.
+isolated Node worker-thread heap and a bounded 120-packet (~2.4s) queue; a
+slow phone drops that speaker's packets instead of ending the session. Speakers
+are never merged: floor control lets the current speaker finish and holds back
+overlap (one content-free notice); a held-back speaker takes the floor after a
+pause. Another member can interrupt Kristy's reply with ~480ms of sustained
+speech, so brief noise/echo no longer cuts her off. Members joining/leaving
+mid-session no longer end it: allowlisted members with a saved agreement are
+added/dropped live, an allowlisted member without one pauses all voice
+processing until they agree or leave (90s, then a clean stop), and outsiders,
+bots or an empty channel still hard-stop. Discord's end-to-end encryption
+re-keys on every roster change: the worker waits out the re-key (up to 10s,
+like music playback) instead of leaving. A stalled provider reply drops the
+turn and keeps the session. The end message always names a content-free reason.
 Use earphones. At 600 seconds only an already pending/playing reply may finish;
-new speech during that final reply stops/leaves. Input/idle/provider/queue/error
+new speech during that final reply stops/leaves. Input/idle/provider/error
 stops remain. No reconnect or automatic model fallback.
 
 Non-sensitive-only is a real restriction. A notice, prompt or allowlist cannot
