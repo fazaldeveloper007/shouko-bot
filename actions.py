@@ -1,0 +1,238 @@
+"""Model-requested, code-executed actions - the bounded agent loop.
+
+The brain may START its reply with ONE marker asking the runtime to act:
+
+  [[do:music status]]     now playing + queue, composed from live player state
+  [[do:music pause]]      [[do:music resume]] [[do:music skip]] [[do:music stop]]
+  [[do:reminder list]]    the member's own saved schedules (ids + due times)
+  [[do:announce | draft]] owner-only: preview an @everyone announcement for this
+                          channel; it posts only after the owner's single-use
+                          confirm, then reports the real message link
+
+Code executes the marker and writes the result text itself, so a reply can
+never claim an action that did not happen. No marker: normal chat, zero extra
+API calls. Announce previews are single-use, expire, and are bound to the
+requesting owner and the channel they were made in; the preview text itself
+never pings (the normal reply path allows no everyone/role mentions), and the
+member/role mention syntax inside the model's draft is stripped before it is
+shown or posted - the only ping in the posted announcement is the code-added
+@everyone the preview declared.
+"""
+import logging
+import re
+import secrets
+import time
+
+import discord
+
+from music.player import MusicError
+from music.ui import clean
+import timed_messages as tm
+
+log = logging.getLogger('kristy.actions')
+
+DO_RE = re.compile(r"^\s*\[\[\s*do\s*:\s*([a-z]+(?:\s+[a-z]+){0,3})\s*(?:\|\s*([^\]]{5,600}?))?\s*\]\]", re.I)
+CONFIRM_RE = re.compile(r"announce\s+(confirm|cancel)\s+([a-f0-9]{10})\s*$", re.I)
+
+CAPABILITY = (
+    "\n\nACTIONS YOU CAN ACTUALLY DO: When a member clearly asks you to DO one "
+    "of these, reply with ONLY the matching marker on its own first line - "
+    "the runtime performs it and writes the real result, which the member "
+    "sees instead of your marker:\n"
+    "[[do:music status]] - what is playing now and what is queued\n"
+    "[[do:music pause]] / [[do:music resume]] / [[do:music skip]] / [[do:music stop]]\n"
+    "[[do:reminder list]] - the member's own saved reminders\n"
+    "[[do:announce | full announcement text here]] - draft an @everyone "
+    "announcement for this channel when the server owner clearly asks for one; "
+    "write the complete polished announcement after the | (no @mentions in it). "
+    "The owner reviews the exact preview before anything is posted.\n"
+    "Rules: at most one marker per reply, only when the request is clear - "
+    "ask a short question instead when it is not. NEVER claim you did one of "
+    "these things in plain text; the marker is the only way, and the runtime "
+    "reports the true outcome. For everything else (chat, questions, jokes) "
+    "answer normally with no marker."
+)
+
+
+class Actions:
+    PREVIEW_TTL = 300  # seconds
+
+    def __init__(self, client, owner_id, schedule_store):
+        self.client = client
+        self.owner_id = (owner_id or '').strip()
+        self.store = schedule_store
+        self.pending = {}
+
+    def is_owner(self, message):
+        return bool(self.owner_id) and str(message.author.id) == self.owner_id
+
+    async def handle(self, message, text):
+        """Deterministic announce confirm/cancel. True when the message is consumed."""
+        m = CONFIRM_RE.fullmatch((text or '').strip())
+        if not m:
+            return False
+        verb, ident = m.group(1).lower(), m.group(2).lower()
+        entry = self.pending.get(ident)
+        if entry is None:
+            await message.reply('Ye announcement preview nahi mila (expire ho gaya ya already done). Naya preview banao.', mention_author=False)
+            return True
+        if entry['author'] != message.author.id:
+            await message.reply('Ye preview kisi aur ka hai; sirf jisne banaya wahi confirm ya cancel kar sakta hai.', mention_author=False)
+            return True
+        if message.channel.id != entry['channel']:
+            await message.reply('Confirm wahi channel mein karo jahan preview bana tha.', mention_author=False)
+            return True
+        if time.monotonic() > entry['expires']:
+            self.pending.pop(ident, None)
+            await message.reply('Ye preview expire ho gaya; naya preview banao.', mention_author=False)
+            return True
+        self.pending.pop(ident, None)  # single-use for both verbs
+        if verb == 'cancel':
+            await message.reply('Announcement cancel kar diya; kuch post nahi hua.', mention_author=False)
+            return True
+        channel = self.client.get_channel(entry['channel'])
+        if channel is None:
+            await message.reply('Channel ab accessible nahi hai; announcement post nahi hua.', mention_author=False)
+            return True
+        try:
+            sent = await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+        except Exception as exc:
+            log.warning('announce post failed: %s', type(exc).__name__)
+            await message.reply('Announcement post NAHI hua (Discord error). Dobara try karo.', mention_author=False)
+            return True
+        await message.reply(f'Announcement post ho gaya ✅ {sent.jump_url}', mention_author=False)
+        return True
+
+    async def maybe_execute(self, message, reply):
+        """Execute a leading [[do:...]] marker; return the final reply text."""
+        m = DO_RE.match(reply or '')
+        if not m:
+            return reply
+        cmd, draft = m.group(1).lower(), (m.group(2) or '').strip()
+        log.info('action requested: %s (channel=%s)', cmd, message.channel.id)
+        try:
+            if cmd == 'music status':
+                return await self._music_status(message)
+            if cmd == 'music pause':
+                return await self._music_pause(message, True)
+            if cmd == 'music resume':
+                return await self._music_pause(message, False)
+            if cmd == 'music skip':
+                return await self._music_skip(message)
+            if cmd == 'music stop':
+                return await self._music_stop(message)
+            if cmd == 'reminder list':
+                return self._reminder_list(message)
+            if cmd == 'announce':
+                return self._announce_preview(message, draft)
+        except MusicError as exc:
+            return str(exc)  # user-facing music rules (join VC, use VC chat)
+        except Exception:
+            log.warning('action failed: %s', cmd, exc_info=True)
+            return 'wo kaam abhi complete nahi hua (internal error); kuch change nahi hua.'
+        log.warning('unknown action marker ignored: %s', cmd)
+        return 'samjhi nahi kya karna tha; thoda clearly bata do 🥺'
+
+    def _player(self, message):
+        music = getattr(self.client, 'music', None)
+        if music is None:
+            raise MusicError('Music abhi disabled hai.')
+        manager = music.manager
+        vc = manager.caller_channel(message.author, message.channel)
+        return manager.players.get(vc.guild.id)
+
+    async def _music_status(self, message):
+        player = self._player(message)
+        if player is None or player.closed or (player.current is None and not player.queue):
+            return 'abhi kuch nahi baj raha; queue bhi khaali hai.'
+        lines = []
+        if player.current is not None:
+            state = 'paused' if player.paused else 'playing'
+            lines.append(f'abhi chal raha hai: {clean(player.current.title, 90)} ({state})')
+        else:
+            lines.append('abhi koi track nahi chal raha.')
+        queued = list(player.queue)
+        if queued:
+            shown = '; '.join(clean(t.title, 60) for t in queued[:5])
+            lines.append(f'queue mein {len(queued)}: {shown}' + (' ...' if len(queued) > 5 else ''))
+        else:
+            lines.append('queue khaali hai.')
+        if player.autoplay:
+            lines.append('autoplay on hai: queue khatam hone par related gaane chalenge.')
+        return '\n'.join(lines)
+
+    async def _music_pause(self, message, paused):
+        player = self._player(message)
+        if player is None or player.closed or player.current is None:
+            return 'abhi koi track nahi chal raha.'
+        try:
+            await player.pause(paused)
+        except MusicError as exc:
+            return f'nahi ho paya: {exc}'
+        return 'pause kar diya ⏸️' if paused else 'resume kar diya ▶️'
+
+    async def _music_skip(self, message):
+        player = self._player(message)
+        if player is None or player.closed or player.current is None:
+            return 'abhi koi track nahi chal raha; skip karne ko kuch nahi hai.'
+        next_title = clean(player.queue[0].title, 60) if player.queue else None
+        await player.interrupt()
+        return 'skip kar diya ⏭️' + (f' ab next: {next_title}' if next_title else '')
+
+    async def _music_stop(self, message):
+        player = self._player(message)
+        if player is None or player.closed or (player.current is None and not player.queue):
+            return 'pehle se sab band hai; VC mein hoon, gaana bolo toh baja dungi.'
+        await player.interrupt(clear=True)
+        return 'music band kar diya ⏹️ queue clear; VC mein hi rahi.'
+
+    def _reminder_list(self, message):
+        if message.guild is None:
+            return 'DM mein server schedules nahi hote.'
+        try:
+            entries = self.store.load()
+        except OSError:
+            return 'schedule storage abhi padh nahi payi; kuch confirm nahi kar sakti.'
+        rows = []
+        for e in entries:
+            if e.get('guild') != message.guild.id or e.get('author') != message.author.id:
+                continue
+            if e.get('status') not in ('awaiting_confirmation', 'confirmed'):
+                continue
+            rows.append(f"{e['id']} | {tm.shown(e['due'])} | {e['status']}")
+        if not rows:
+            return 'tumhara koi pending reminder ya schedule nahi hai.'
+        return ('tumhare saved schedules:\n' + '\n'.join(rows[:8])
+                + (f'\n...aur {len(rows) - 8}' if len(rows) > 8 else ''))
+
+    def _announce_preview(self, message, draft):
+        if message.guild is None:
+            return 'announcement server channel mein banti hai, DM mein nahi.'
+        if not self.owner_id:
+            return 'announce abhi configured nahi hai (OWNER_ID set nahi).'
+        if not self.is_owner(message):
+            return 'announcement sirf server owner kara sakta hai.'
+        if not draft:
+            return 'kis baare mein announce karna hai? thoda context do, phir draft bana dungi.'
+        me = message.guild.me
+        if me is not None and not message.channel.permissions_for(me).mention_everyone:
+            return 'mere paas is channel mein @everyone mention ki permission nahi hai; pehle woh permission do.'
+        draft = re.sub(r'<@!?\d+>|<@&\d+>|@everyone|@here', '', draft, flags=re.I).strip()[:400]
+        if not draft:
+            return 'draft khaali reh gaya; thoda detail do.'
+        ident = secrets.token_hex(5)
+        self.pending[ident] = {
+            'author': message.author.id,
+            'channel': message.channel.id,
+            'guild': message.guild.id,
+            'text': f'@everyone\n{draft}',
+            'expires': time.monotonic() + self.PREVIEW_TTL,
+        }
+        channel_name = getattr(message.channel, 'name', '?')
+        return ('announcement preview (abhi post NAHI hua):\n'
+                f'channel: #{channel_name}\n'
+                'ping: everyone\n'
+                f'---\n{draft}\n---\n'
+                f'bhejne ke liye: Kristy announce confirm {ident}\n'
+                f'cancel ke liye: Kristy announce cancel {ident}\n'
+                'preview 5 minute mein expire ho jayega.')
