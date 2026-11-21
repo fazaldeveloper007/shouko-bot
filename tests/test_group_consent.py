@@ -122,12 +122,29 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(set(value),{'schema','current_scope','grants'})
         self.assertEqual(set(value['grants'][A]),{'scope','future','adult','processing'})
 
-    def test_active_roster_change_still_stops_but_next_subset_reuses(self):
+    def test_active_roster_change_survives_and_next_subset_reuses(self):
         self.grant(A);self.grant(B)
         c=self.coordinator();c.refresh();c.start()
         self.roster=(A,)
-        with self.assertRaises(GroupPolicyError):c.refresh()
+        c.refresh();c.playback()  # granted member leaving no longer stops
+        self.assertFalse(c.stopped)
+        self.assertFalse(c.paused)
         fresh=self.coordinator();fresh.refresh();fresh.start();fresh.playback()
+
+    def test_ungranted_allowed_joiner_pauses_until_grant(self):
+        # Grants are scoped to the exact allowlist, so grant under the wider one.
+        self.scope=GroupScope(G,CH,BOT,frozenset((A,B,C)),NOTICE_REVISION)
+        self.grant(A);self.grant(B)  # C is allowlisted but has no live grant
+        c=self.coordinator();c.refresh();c.start()
+        self.roster=(A,B,C)
+        c.refresh()
+        self.assertTrue(c.paused)
+        self.assertFalse(c.playback())  # dropped while paused, session alive
+        self.assertFalse(c.stopped)
+        self.grant(C)
+        c.refresh()
+        self.assertFalse(c.paused)
+        self.assertTrue(c.playback())
 
 
 class DurableViewTests(unittest.IsolatedAsyncioTestCase):
