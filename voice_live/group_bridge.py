@@ -27,7 +27,8 @@ class GroupBridge(Bridge):
         self.coordinator = coordinator
         self.abort = abort
         self.timings = Timings()
-        self.audio = asyncio.Queue(maxsize=96)
+        self.audio = asyncio.Queue(maxsize=480)
+        self.dropped_audio = 0
         self.result = asyncio.get_running_loop().create_future()
 
     def safe(self):
@@ -90,11 +91,34 @@ class GroupBridge(Bridge):
                 elif kind in ('speech_start', 'audio', 'speech_end'):
                     if not self.safe():
                         raise LiveError('MEMBERSHIP_CHANGED')
-                    self.audio.put_nowait(event)
+                    try:
+                        self.audio.put_nowait(event)
+                    except asyncio.QueueFull:
+                        # A backed-up reader must cost frames, never the session;
+                        # control events evict the oldest frame to get through.
+                        self.dropped_audio += 1
+                        if kind != 'audio':
+                            try:
+                                self.audio.get_nowait()
+                                self.audio.put_nowait(event)
+                            except Exception:
+                                pass
                     if kind == 'speech_start':
                         print('LIVE_USER_SPEECH: participant speech detected; old playback cleared.', flush=True)
                     elif kind == 'speech_end':
                         print('LIVE_REPLY_PENDING: local speech pause detected.', flush=True)
+                elif kind == 'overlap_held':
+                    print('LIVE_OVERLAP_HELD: simultaneous speech held back; one speaker at a time, pause to take the floor.', flush=True)
+                elif kind == 'transition_wait':
+                    print('LIVE_CONNECTION_REFRESH: voice encryption updating; audio paused briefly.', flush=True)
+                elif kind == 'transition_ready':
+                    print('LIVE_CONNECTION_REFRESH: encryption restored; session continues.', flush=True)
+                elif kind == 'hold':
+                    print('LIVE_PAUSED: agreement needed from a new member; capture and playback paused.', flush=True)
+                elif kind == 'resumed':
+                    print('LIVE_RESUMED: agreement saved; session continues.', flush=True)
+                elif kind == 'targets':
+                    pass
                 elif kind == 'playing':
                     self.timings.mark(event.get('epoch'), 'playing')
                     print('LIVE_PLAYING: speaking; participant can interrupt. STOP ends session.', flush=True)
