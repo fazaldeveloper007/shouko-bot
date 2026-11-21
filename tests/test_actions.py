@@ -74,8 +74,10 @@ class MarkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('koi track nahi', out)
 
     async def test_music_pause_executes(self):
+        async def pause_flips(paused):
+            player.paused = paused
         player = types.SimpleNamespace(closed=False, current=track('S'), paused=False, queue=[], autoplay=False,
-                                       pause=AsyncMock())
+                                       pause=AsyncMock(side_effect=pause_flips))
         a = make_actions(player=player)
         out = await a.maybe_execute(make_message(), '[[do:music pause]]')
         player.pause.assert_awaited_once_with(True)
@@ -88,10 +90,14 @@ class MarkerTests(unittest.IsolatedAsyncioTestCase):
         out = await a.maybe_execute(make_message(), '[[do:music skip]]')
         player.interrupt.assert_awaited_once_with()
         self.assertIn('Next Song', out)
+        self.assertIn('shuru ho raha hai', out)
+        self.assertNotIn('ab next:', out)  # never claims the next track is already playing
 
     async def test_music_stop_clears(self):
+        async def stop_clears(clear=False):
+            player.current = None; player.queue.clear()
         player = types.SimpleNamespace(closed=False, current=track('S'), paused=False,
-                                       queue=[track('Q')], autoplay=False, interrupt=AsyncMock())
+                                       queue=[track('Q')], autoplay=False, interrupt=AsyncMock(side_effect=stop_clears))
         a = make_actions(player=player)
         out = await a.maybe_execute(make_message(), '[[do:music stop]]')
         player.interrupt.assert_awaited_once_with(clear=True)
@@ -118,14 +124,14 @@ class MarkerTests(unittest.IsolatedAsyncioTestCase):
 class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_non_owner_rejected(self):
         a = make_actions()
-        out = await a.maybe_execute(make_message(author_id=OTHER), '[[do:announce | hello all]]')
+        out = await a.maybe_execute(make_message(author_id=OTHER), '[[do:announce everyone | hello all]]')
         self.assertIn('owner', out)
         self.assertFalse(a.pending)
 
     async def test_announce_owner_gets_preview_not_post(self):
         a = make_actions()
         msg = make_message()
-        out = await a.maybe_execute(msg, '[[do:announce | tournament kal raat 9 baje]]')
+        out = await a.maybe_execute(msg, '[[do:announce everyone | tournament kal raat 9 baje]]')
         self.assertIn('preview', out)
         self.assertIn('abhi post NAHI hua', out)
         self.assertIn('#music', out)
@@ -136,14 +142,14 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_draft_mentions_stripped(self):
         a = make_actions()
         msg = make_message()
-        out = await a.maybe_execute(msg, '[[do:announce | hey <@12345> and @here listen]]')
+        out = await a.maybe_execute(msg, '[[do:announce everyone | hey <@12345> and @here listen]]')
         self.assertNotIn('<@12345>', out)
         self.assertNotIn('@here', out)
 
     async def test_announce_confirm_posts_and_reports_link(self):
         a = make_actions()
         msg = make_message()
-        await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         ident = next(iter(a.pending))
         posted = types.SimpleNamespace(jump_url='https://discord.com/channels/10/20/30')
         msg.channel.send = AsyncMock(return_value=posted)
@@ -165,7 +171,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_confirm_wrong_user_rejected(self):
         a = make_actions()
         msg = make_message()
-        await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         ident = next(iter(a.pending))
         other = make_message(author_id=OTHER)
         consumed = await a.handle(other, f'announce confirm {ident}')
@@ -177,7 +183,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_confirm_wrong_channel_rejected(self):
         a = make_actions()
         msg = make_message()
-        await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         ident = next(iter(a.pending))
         elsewhere = make_message(channel_id=99)
         await a.handle(elsewhere, f'announce confirm {ident}')
@@ -187,7 +193,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_cancel_single_use(self):
         a = make_actions()
         msg = make_message()
-        await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         ident = next(iter(a.pending))
         await a.handle(msg, f'announce cancel {ident}')
         self.assertIn('cancel kar diya', msg.reply.await_args[0][0])
@@ -199,7 +205,7 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
     async def test_announce_expired_preview_rejected(self):
         a = make_actions()
         msg = make_message()
-        await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         ident = next(iter(a.pending))
         a.pending[ident]['expires'] = time.monotonic() - 1
         await a.handle(msg, f'announce confirm {ident}')
@@ -210,13 +216,82 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         a = make_actions()
         msg = make_message()
         msg.channel.permissions_for = lambda me: types.SimpleNamespace(mention_everyone=False)
-        out = await a.maybe_execute(msg, '[[do:announce | maintenance kal]]')
+        out = await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
         self.assertIn('permission nahi hai', out)
         self.assertFalse(a.pending)
 
     async def test_handle_ignores_unrelated_text(self):
         a = make_actions()
         self.assertFalse(await a.handle(make_message(), 'announce kar dena please'))
+
+    async def test_announce_without_scope_asks_clarifying_question(self):
+        a = make_actions()
+        out = await a.maybe_execute(make_message(), '[[do:announce | kal tournament hai]]')
+        self.assertIn('quiet', out)
+        self.assertIn('everyone', out)
+        self.assertFalse(a.pending)  # nothing prepared before scope is known
+
+    async def test_announce_quiet_posts_without_ping(self):
+        a = make_actions()
+        msg = make_message()
+        out = await a.maybe_execute(msg, '[[do:announce quiet | shanti se note]]')
+        self.assertIn('none (quiet post)', out)
+        ident = next(iter(a.pending))
+        posted = types.SimpleNamespace(jump_url='https://discord.com/channels/10/20/31')
+        msg.channel.send = AsyncMock(return_value=posted)
+        sent_channel[20] = msg.channel
+        await a.handle(msg, f'announce confirm {ident}')
+        args, kwargs = msg.channel.send.await_args
+        self.assertFalse(args[0].startswith('@everyone'))
+        self.assertIn('shanti se note', args[0])
+        self.assertFalse(kwargs['allowed_mentions'].everyone)
+
+    async def test_announce_send_error_reports_unknown_no_retry(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        ident = next(iter(a.pending))
+        msg.channel.send = AsyncMock(side_effect=RuntimeError('gateway boom'))
+        sent_channel[20] = msg.channel
+        await a.handle(msg, f'announce confirm {ident}')
+        reply_text = msg.reply.await_args[0][0]
+        self.assertIn('confirm nahi hua', reply_text)  # unknown, not "failed"
+        self.assertNotIn('post NAHI hua', reply_text)
+        self.assertEqual(msg.channel.send.await_count, 1)  # no automatic duplicate
+
+    async def test_music_queue_lists_tracks(self):
+        player = types.SimpleNamespace(closed=False, current=track('Now'), paused=False,
+                                       queue=[track('Q1'), track('Q2')], autoplay=False)
+        a = make_actions(player=player)
+        out = await a.maybe_execute(make_message(), '[[do:music queue]]')
+        self.assertIn('1. Q1', out)
+        self.assertIn('2. Q2', out)
+
+    async def test_music_queue_empty(self):
+        player = types.SimpleNamespace(closed=False, current=None, paused=False, queue=[], autoplay=False)
+        a = make_actions(player=player)
+        out = await a.maybe_execute(make_message(), '[[do:music queue]]')
+        self.assertIn('khaali', out)
+
+    async def test_pause_unverified_state_is_honest(self):
+        async def pause_noop(paused):
+            return None  # state never flips
+        player = types.SimpleNamespace(closed=False, current=track('S'), paused=False, queue=[],
+                                       autoplay=False, pause=AsyncMock(side_effect=pause_noop))
+        a = make_actions(player=player)
+        out = await a.maybe_execute(make_message(), '[[do:music pause]]')
+        self.assertIn('confirm nahi hui', out)
+        self.assertNotIn('pause kar diya', out)
+
+    async def test_stop_unverified_state_is_honest(self):
+        async def stop_noop(clear=False):
+            return None  # state never changes
+        player = types.SimpleNamespace(closed=False, current=track('S'), paused=False,
+                                       queue=[track('Q')], autoplay=False, interrupt=AsyncMock(side_effect=stop_noop))
+        a = make_actions(player=player)
+        out = await a.maybe_execute(make_message(), '[[do:music stop]]')
+        self.assertIn('confirm nahi hui', out)
+        self.assertNotIn('band kar diya', out)
 
 
 if __name__ == '__main__':
