@@ -11,17 +11,19 @@ const {Converter}=require('./audio.cjs');
 const {GroupGate}=require('./group_gate.cjs');
 const receiveReport=require('./receive_report.cjs');
 const out=m=>process.stdout.write(JSON.stringify(m)+'\n');
-let epoch=0,turnsCompleted=0,turnOutputBytes=0,turnNonzero=0,gate,droppedChunks=0;
+let epoch=0,turnsCompleted=0,turnOutputBytes=0,turnNonzero=0,gate,droppedChunks=0,droppedPackets=0;
 let cfg,conn,adapter,stream,decoder,encoder,player,resource,inputFilter,outputFilter;
-const sources=new Map();
+const sources=new Map(),targets=new Set();
 let diagnostics,receiveFailure,draining=false,awaitingReply=false;
 let ending=false,ready=false,listening=false,outputEnded=false,startedOutput=false;
+let consentHold=false,daveHold=false,daveAbort=null;
 let pending=Buffer.alloc(0),frames=[],audioStream,frameSent=0,issued=[],inputBytes=0,outputBytes=0,outputNonzeroSamples=0,packets=0;
 let inputTimer,overallTimer,connectTimer,securityTimer,serial=0,encryptionWaiting=false;
 const acks=new Map();
 function finish(code='STOPPED'){
  if(ending)return;ending=true;listening=false;
  const daveProof=conn?proof(conn):null;gate?.destroy();
+ daveAbort?.abort();
  for(const t of [inputTimer,overallTimer,connectTimer,securityTimer])clearTimeout(t);
  for(const t of acks.values())clearTimeout(t);acks.clear();
  diagnostics?.restore();diagnostics=null;
@@ -30,14 +32,33 @@ function finish(code='STOPPED'){
  inputFilter?.destroy();outputFilter?.destroy();
  try{decoder?.delete();}catch{}try{encoder?.delete();}catch{}
  try{conn?.destroy();}catch{}
- out({type:'result',...(receiveFailure||{}),code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,turnsCompleted,droppedChunks,daveProof});
+ out({type:'result',...(receiveFailure||{}),code,packets,inputBytes,outputBytes,outputNonzeroSamples,outputFramesRead:frameSent,turnsCompleted,droppedChunks,droppedPackets,daveProof});
  process.exitCode=['COMPLETE','STOPPED'].includes(code)?0:1;
  setImmediate(()=>process.exit(process.exitCode));
 }
+function paused(){return consentHold||daveHold;}
+function syncHold(){
+ const value=paused();
+ if(gate&&gate.held!==value)gate.setHeld(value);
+}
+function enterDaveHold(){
+ if(ending||daveHold||!ready)return;
+ daveHold=true;cancelOutput();awaitingReply=false;syncHold();
+ out({type:'transition_wait'});
+ const ac=new AbortController();daveAbort=ac;
+ // Momentary unencrypted MLS epochs are normal when the VC roster changes:
+ // wait for re-encryption instead of ending the session. Audio of either
+ // direction is dropped, never processed or sent, while this hold lasts.
+ waitEncrypted(conn,{timeoutMs:10000,signal:ac.signal}).then(()=>{
+  daveAbort=null;if(ending)return;
+  if(!encrypted(conn))return finish('DAVE_TRANSITION_TIMEOUT');
+  daveHold=false;syncHold();out({type:'transition_ready'});
+ }).catch(()=>{if(!ending)finish('DAVE_TRANSITION_TIMEOUT');});
+}
 function checkSecurity(){
  if(ending)return;
- if(ready&&!encrypted(conn))return finish('DAVE_NOT_READY');
- gate?.tick();
+ if(ready&&!encrypted(conn))enterDaveHold();
+ if(!paused())gate?.tick();
  securityTimer=setTimeout(checkSecurity,25);
 }
 function sendPayload(payload){
@@ -64,6 +85,7 @@ function gateEvent(m){
   if(inputBytes>19200000)return finish('SESSION_INPUT_LIMIT');
   if(!out(m))finish('IPC_BACKPRESSURE');
  }else if(m.type==='speech_end'){awaitingReply=true;out(m);}
+ else if(m.type==='overlap_held'){out({type:'overlap_held',epoch:m.epoch});}
 }
 function completeIfDone(){
  if(ending)return;
@@ -76,7 +98,7 @@ class OpusFrames extends Readable {
  constructor(){super({objectMode:true,highWaterMark:1});this.waiting=false;}
  _read(){
   if(ending)return;
-  if(!encrypted(conn))return finish('DAVE_NOT_READY');
+  if(!encrypted(conn))return enterDaveHold();
   const frame=frames.shift();
   if(frame){frameSent++;issued.push(frame);this.push(frame);}
   else if(outputEnded)this.push(null);
@@ -124,6 +146,49 @@ function sessionDeadline(){
  if(!awaitingReply||gate?.active)return finish('SESSION_LIMIT');
  draining=true;out({type:'session_draining'});
 }
+function addTarget(id){
+ if(targets.has(id)||targets.size>=8||!listening)return false;
+ const dec=new Worker(path.join(__dirname,'group_decoder.cjs'));
+ const source=conn.receiver.subscribe(id,{end:{behavior:v.EndBehaviorType.Manual}});
+ const state={stream:source,decoder:dec,pending:0};sources.set(id,state);targets.add(id);gate.add(id);
+ dec.on('error',()=>finish('DECODER_WORKER_ERROR'));
+ dec.on('exit',()=>{if(!ending)finish('DECODER_WORKER_EXITED');});
+ dec.on('message',m=>{
+  let mono;
+  try{
+   state.pending--;
+   if(m.error)return finish('DECODE_ERROR');
+   mono=Buffer.from(m.pcm);
+   if(!listening||ending)return;
+   if(paused()){droppedPackets++;return;}
+   if(!encrypted(conn))return enterDaveHold();
+   if(!mono.length||mono.length>7680||mono.length%2)return finish('DECODE_ERROR');
+   gate.accept(id,mono);
+  }catch{finish('DECODE_ERROR');}finally{mono?.fill(0);m.pcm?.fill(0);}
+ });
+ source.on('error',error=>{receiveFailure=diagnostics?.classify(error)||{receiveStage:'STREAM_OTHER',errorClass:'OTHER'};finish(receiveFailure.receiveStage==='CONTRACT_MISMATCH'?'DIAGNOSTIC_CONTRACT_MISMATCH':'RECEIVE_ERROR');});
+ source.on('data',packet=>{
+  try{
+   if(!listening||ending)return;
+   if(paused()){droppedPackets++;return;}
+   if(!encrypted(conn))return enterDaveHold();
+   // A slow phone must drop one speaker's packets, never the whole session.
+   // The backlog is bounded at ~2.4s (120 packets x 20ms) so decoded speech
+   // can never arrive absurdly late; beyond that the new packet is dropped.
+   if(state.pending>=120){droppedPackets++;return;}
+   ++state.pending;
+   packets++;dec.postMessage(packet);
+  }catch{finish('DECODE_ERROR');}finally{packet.fill(0);}
+ });
+ return true;
+}
+function removeTarget(id){
+ const state=sources.get(id);
+ if(!state)return false;
+ state.stream.destroy();state.decoder.terminate();sources.delete(id);
+ targets.delete(id);gate.remove(id);
+ return true;
+}
 function message(m){
  if(ending)return;
  if(m.type==='init'){
@@ -131,7 +196,7 @@ function message(m){
   cfg=m;overallTimer=setTimeout(sessionDeadline,600000);connectTimer=setTimeout(()=>finish('CONNECT_TIMEOUT'),12000);
   conn=v.joinVoiceChannel({guildId:m.guild,channelId:m.channel,selfDeaf:false,selfMute:false,daveEncryption:true,debug:false,group:'kristy-native-group-test',adapterCreator:api=>{adapter=api;return{sendPayload,destroy:()=>{}};}});
   conn.on('error',()=>finish('VOICE_ERROR'));
-  conn.receiver.speaking.on('start',id=>{if(!cfg.targets.includes(id))finish('OTHER_SPEAKER');});
+  // Only subscribed targets are ever decoded; the Python roster gate owns membership.
   conn.on('stateChange',(_,s)=>{
    if(ending)return;
    if(s.status===v.VoiceConnectionStatus.Ready&&!ready&&!encryptionWaiting){
@@ -146,50 +211,36 @@ function message(m){
   else if(m.kind==='server')adapter.onVoiceServerUpdate(m.data);
  }else if(m.type==='listen'){
   if(!ready||listening)throw Error();
-  gate=new GroupGate(cfg.targets,gateEvent,finish);listening=true;
+  gate=new GroupGate([],gateEvent,finish);listening=true;
   diagnostics=receiveReport.install(conn.receiver);
   if(!diagnostics)return finish('DIAGNOSTIC_CONTRACT_MISMATCH');
-  for(const id of cfg.targets){
-   const dec=new Worker(path.join(__dirname,'group_decoder.cjs'));
-   const source=conn.receiver.subscribe(id,{end:{behavior:v.EndBehaviorType.Manual}});
-   const state={stream:source,decoder:dec,pending:0};sources.set(id,state);
-   dec.on('error',()=>finish('DECODER_WORKER_ERROR'));
-   dec.on('exit',()=>{if(!ending)finish('DECODER_WORKER_EXITED');});
-   dec.on('message',m=>{
-    let mono;
-    try{
-     state.pending--;
-     if(m.error)return finish('DECODE_ERROR');
-     mono=Buffer.from(m.pcm);
-     if(!listening||ending)return;
-     if(!encrypted(conn))return finish('DAVE_NOT_READY');
-     if(!mono.length||mono.length>7680||mono.length%2)return finish('DECODE_ERROR');
-     gate.accept(id,mono);
-    }catch{finish('DECODE_ERROR');}finally{mono?.fill(0);m.pcm?.fill(0);}
-   });
-   source.on('error',error=>{receiveFailure=diagnostics?.classify(error)||{receiveStage:'STREAM_OTHER',errorClass:'OTHER'};finish(receiveFailure.receiveStage==='CONTRACT_MISMATCH'?'DIAGNOSTIC_CONTRACT_MISMATCH':'RECEIVE_ERROR');});
-   source.on('data',packet=>{
-    try{
-     if(!listening||ending)return;
-     if(!encrypted(conn))return finish('DAVE_NOT_READY');
-     if(++state.pending>48)return finish('DECODE_QUEUE_LIMIT');
-     packets++;dec.postMessage(packet);
-    }catch{finish('DECODE_ERROR');}finally{packet.fill(0);}
-   });
-  }
+  for(const id of cfg.targets)if(!addTarget(id))throw Error();
   out({type:'listening'});
+ }else if(m.type==='add_target'){
+  if(!listening||typeof m.id!=='string'||!/^\d{15,22}$/.test(m.id)||m.id===cfg.user||!addTarget(m.id))throw Error();
+  out({type:'targets',count:targets.size});
+ }else if(m.type==='remove_target'){
+  if(!listening||typeof m.id!=='string'||!/^\d{15,22}$/.test(m.id)||!removeTarget(m.id))throw Error();
+  out({type:'targets',count:targets.size});
+ }else if(m.type==='hold'){
+  if(consentHold)throw Error();
+  consentHold=true;cancelOutput();awaitingReply=false;syncHold();out({type:'hold'});
+ }else if(m.type==='resume'){
+  if(!consentHold)throw Error();
+  consentHold=false;syncHold();out({type:'resumed'});
  }else if(m.type==='output'){
   if(Number.isInteger(m.epoch)&&m.epoch<epoch){droppedChunks++;return;}
+  if(paused()){droppedChunks++;return;}
   if(m.epoch!==epoch||!epoch||gate.active||!ready||outputEnded||typeof m.data!=='string'||m.data.length>32768||!/^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(m.data))throw Error();
-  if(!encrypted(conn))return finish('DAVE_NOT_READY');
+  if(!encrypted(conn)){droppedChunks++;return enterDaveHold();}
   if(!encoder){encoder=new Opus(48000,2,Opus.Application.AUDIO);outputFilter=new Converter('output');}
   let pcm=Buffer.from(m.data,'base64'),converted;
   try{
    if(pcm.length%2)throw Error();
    if(pcm.length){outputBytes+=pcm.length;turnOutputBytes+=pcm.length;for(let i=0;i<pcm.length;i+=2)if(pcm.readInt16LE(i)!==0){outputNonzeroSamples++;turnNonzero++;}converted=outputFilter.convert(pcm);encodeOutput(converted);}
   }finally{pcm.fill(0);converted?.fill(0);}
- }else if(m.type==='output_end'){if(Number.isInteger(m.epoch)&&m.epoch<epoch){droppedChunks++;return;}if(m.epoch!==epoch||!epoch||gate.active)throw Error();endOutput();}
- else if(m.type==='cancel_output'){if(m.epoch===epoch)cancelOutput();else if(!Number.isInteger(m.epoch)||m.epoch>epoch)throw Error();}
+ }else if(m.type==='output_end'){if(Number.isInteger(m.epoch)&&m.epoch<epoch){droppedChunks++;return;}if(paused()){droppedChunks++;return;}if(m.epoch!==epoch||!epoch||gate.active)throw Error();endOutput();}
+ else if(m.type==='cancel_output'){if(paused())return;if(m.epoch===epoch)cancelOutput();else if(!Number.isInteger(m.epoch)||m.epoch>epoch)throw Error();}
  else if(m.type==='session_deadline')sessionDeadline();
  else if(m.type==='stop')finish();
  else throw Error();
