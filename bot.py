@@ -1804,7 +1804,7 @@ async def _proactive_opener(history_lines):
     """One opener string, or '' on any failure (fail quiet)."""
     chat = "\n".join(history_lines)[-2500:]
     try:
-        text = (await call_extractor(OPENER_PROMPT.format(history=chat or "(no recent chat)"))).strip()
+        text = (await call_text(OPENER_PROMPT.format(history=chat or "(no recent chat)"))).strip()
     except Exception:
         return ""
     # safety rails: strip any mention forms the model tried anyway
@@ -1986,6 +1986,30 @@ async def summarize_recap(old_recap, lines):
             return text
         raise RuntimeError("recap summarizer returned no text")
     raise RuntimeError("no AI key for recap")
+
+
+async def call_text(prompt):
+    """One small AI call that returns plain prose. call_extractor forces
+    responseMimeType=application/json, so prose requests (welcome lines,
+    quiet-channel openers) must NOT use it - they come back JSON-wrapped."""
+    session = await groq_session()
+    if GEMINI_API_KEY:
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 200, "temperature": 0.9},
+        }
+        data = await gemini_generate(payload)
+        parts = ((data["candidates"][0].get("content") or {}).get("parts")) or []
+        return "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 200,
+        "temperature": 0.9,
+    }
+    data = await retrying.post_json(session, GROQ_CHAT_URL, label="Groq(text)",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, payload=payload)
+    return data["choices"][0]["message"]["content"] or ""
 
 
 async def call_extractor(prompt):
@@ -2394,7 +2418,7 @@ async def on_ready():
     # welcome_text_fn lets announcements generate a fresh sweet welcome line
     # per joiner (prompt carries no member/server identifiers); failures
     # fall back to the fixed approved line inside announcements.
-    announcements.start(client, welcome_text_fn=call_extractor)
+    announcements.start(client, welcome_text_fn=call_text)
     _schedule_worker.start()
     _proactive_start()
     if client.music:
