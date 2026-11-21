@@ -74,7 +74,7 @@ class SharedConsentView(discord.ui.View):
 
     @discord.ui.button(label='Decline / Stop', style=discord.ButtonStyle.danger)
     async def decline_button(self, interaction, button):
-        self.coordinator.stop()
+        self.coordinator.stop('GROUP_DECLINED')
         await interaction.response.send_message('Session stopped. No further voice processing.', ephemeral=True)
 
 
@@ -88,7 +88,7 @@ class SharedConsentView(discord.ui.View):
     async def revoke_button(self, interaction, button):
         if self.coordinator.grant_store is not None:
             self.coordinator.grant_store.revoke(str(interaction.user.id))
-        self.coordinator.stop()
+        self.coordinator.stop('GROUP_CONSENT_REVOKED')
         await interaction.response.send_message('Your saved Live agreement is removed. Active session stopped.', ephemeral=True)
 
     async def on_timeout(self):
