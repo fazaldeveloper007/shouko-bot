@@ -13,6 +13,32 @@ import aiohttp
 log = logging.getLogger('kristy.retry')
 _current = contextvars.ContextVar('request_budget', default=None)
 
+# Operation context for API-call log lines: each async task labels what its
+# calls are FOR ("replying to X in Y", "welcome line for Z"), so bare
+# "Gemini call attempt" lines stay attributable when several background jobs
+# run at once. ContextVar = per-task, no cross-contamination between
+# concurrent operations. Never carries message text, prompts or keys - only
+# the operation kind plus bounded sanitized names.
+_op = contextvars.ContextVar('retrying_op', default='')
+
+_NAME_CTRL = __import__('re').compile(r'[\x00-\x1f\x7f]')
+
+def clean_name(value, limit=32):
+    """Bounded, control-char-free name safe for a log line."""
+    text = _NAME_CTRL.sub(' ', str(value or '')).strip()
+    return text[:limit] or '?'
+
+def set_op(label):
+    """Label this task's API calls; returns the token for reset_op."""
+    return _op.set(str(label or '')[:120])
+
+def reset_op(token):
+    _op.reset(token)
+
+def op_suffix():
+    op = _op.get()
+    return f' op="{op}"' if op else ''
+
 class Budget:
     def __init__(self):
         self.used = 0
@@ -111,7 +137,7 @@ async def post_json(session, url, *, label, headers, payload, timeout=20, valida
         budget.used += 1
         status, data, wait = None, None, min(2, budget.used)
         reason = 'transport'
-        log.info('%s call attempt=%d/3', label, budget.used)
+        log.info('%s call attempt=%d/3%s', label, budget.used, op_suffix())
         try:
             async with session.post(url, json=payload, headers=headers,
                     timeout=aiohttp.ClientTimeout(total=min(timeout, budget.seconds()), ceil_threshold=1000)) as resp:
@@ -123,16 +149,16 @@ async def post_json(session, url, *, label, headers, payload, timeout=20, valida
                 if status == 200 and isinstance(data, dict):
                     reason = validate(data) if validate else None
                     if reason == 'blocked':
-                        log.warning('%s stopped attempt=%d/3 status=200 reason=blocked', label, budget.used)
+                        log.warning('%s stopped attempt=%d/3 status=200 reason=blocked%s', label, budget.used, op_suffix())
                         raise RequestError(label, status, reason='blocked')
                     if reason is None:
-                        log.info('%s complete attempt=%d/3 status=200', label, budget.used)
+                        log.info('%s complete attempt=%d/3 status=200%s', label, budget.used, op_suffix())
                         return data
                 elif status == 200:
                     reason = 'malformed_json'
                 else:
                     reason = 'http'
-                log.warning('%s failed attempt=%d/3 status=%s reason=%s', label, budget.used, status, reason)
+                log.warning('%s failed attempt=%d/3 status=%s reason=%s%s', label, budget.used, status, reason, op_suffix())
                 if status == 400 and label == 'Gemini':
                     # Optional-model-field fix consumes the SAME budget.
                     config = payload.get('generationConfig') or {}
@@ -159,10 +185,10 @@ async def post_json(session, url, *, label, headers, payload, timeout=20, valida
             cause = getattr(exc, 'os_error', None)
             if cause is not None:
                 detail += f'({getattr(cause, "errno", None) or type(cause).__name__})'
-            log.warning('%s failed attempt=%d/3 status=%s reason=transport error=%s', label, budget.used, status, detail)
+            log.warning('%s failed attempt=%d/3 status=%s reason=transport error=%s%s', label, budget.used, status, detail, op_suffix())
         if budget.used >= 3 or wait >= budget.seconds():
             break
-        log.warning('%s transient failure; attempt %d/3', label, budget.used)
+        log.warning('%s transient failure; attempt %d/3%s', label, budget.used, op_suffix())
         await asyncio.sleep(wait)
-    log.warning('%s exhausted calls=%d/3 status=%s reason=budget_or_deadline', label, budget.used, status)
+    log.warning('%s exhausted calls=%d/3 status=%s reason=budget_or_deadline%s', label, budget.used, status, op_suffix())
     raise RequestError(label, status, reason=reason)
