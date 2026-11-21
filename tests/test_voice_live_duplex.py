@@ -147,16 +147,31 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         flow=self.flow();flow.pending=1;flow.turn.ws=Socket([{'goAway':{'timeLeft':'1s'}}])
         with self.assertRaisesRegex(LiveError,'GOOGLE_UNEXPECTED_ACTION'):await flow.receive_output()
 
-    async def test_watch_suppressed_and_response_timeouts_not_idle_timer(self):
-        for suppressed,code in [(True,'GOOGLE_RESPONSE_IDLE_TIMEOUT'),(False,'GOOGLE_RESPONSE_IDLE_TIMEOUT')]:
-            flow=self.flow();flow.deadline=0;flow.suppressed=suppressed
-            with self.assertRaisesRegex(LiveError,code):await flow.watch()
+    async def test_watch_recovers_stale_reply_without_killing_session(self):
+        for pending_ended in (False,True):
+            flow=self.flow();flow.pending=1;flow.pending_ended=pending_ended;flow.deadline=0;flow.barrier.clear()
+            task=asyncio.create_task(flow.watch())
+            await self.spin(lambda:flow.pending is None and flow.stale_turn_completes==1)
+            self.assertTrue(flow.barrier.is_set())
+            calls=[c.args[0] for c in flow.bridge.write.call_args_list]
+            self.assertEqual(calls,[{'type':'cancel_output','epoch':1}])
+            await self.stop(task)
 
     async def test_input_epoch_errors_fail_closed(self):
-        for event in ({'type':'speech_start','epoch':2},{'type':'speech_end','epoch':1},
-                      {'type':'audio','epoch':1,'data':'AAAA'}):
+        for event in ({'type':'speech_end','epoch':1},{'type':'audio','epoch':1,'data':'AAAA'}):
             flow=self.flow();flow.bridge.audio.put_nowait(event)
             with self.assertRaisesRegex(LiveError,'INPUT_EPOCH_INVALID'):await flow.send_input()
+        # A forward epoch gap (events dropped by a pause/hold) is tolerated...
+        flow=self.flow();task=asyncio.create_task(flow.send_input())
+        flow.bridge.audio.put_nowait({'type':'speech_start','epoch':2})
+        await self.spin(lambda:flow.active and flow.epoch==2)
+        flow.bridge.audio.put_nowait({'type':'audio','epoch':2,'data':base64.b64encode(bytes(640)).decode()})
+        flow.bridge.audio.put_nowait({'type':'speech_end','epoch':2})
+        await self.spin(lambda:flow.pending==2)
+        # ...but a replayed or non-monotonic epoch still fails closed.
+        flow.bridge.audio.put_nowait({'type':'speech_start','epoch':2})
+        await self.spin(lambda:task.done())
+        with self.assertRaisesRegex(LiveError,'INPUT_EPOCH_INVALID'):await task
 
     async def test_reply_longer_than_old_ten_seconds_reaches_generation_end(self):
         flow=self.flow();flow.pending=1
@@ -189,12 +204,19 @@ const {SpeechGate}=require(process.argv[1]+'/voice_live/speech_gate.cjs'),assert
 let now=0,events=[],reason=null;const gate=new SpeechGate(m=>events.push(m),r=>reason=r,()=>now);
 function frame(level){const b=Buffer.alloc(640);for(let i=0;i<640;i+=2)b.writeInt16LE(Math.round(level*Math.sin(i/2*440*2*Math.PI/16000)),i);return b;}
 for(let i=0;i<100;i++){now+=20;gate.accept(frame(0));gate.tick();}
-assert.equal(events.length,0);assert.equal(gate.pre.length,10);
+assert.equal(events.length,0);assert.equal(gate.pre.length,30);
 for(let i=0;i<2;i++){now+=20;gate.accept(frame(300));}assert.equal(events.length,0);
-now+=20;gate.accept(frame(300));assert.equal(events[0].type,'speech_start');assert.equal(events.filter(x=>x.type==='audio').length,10);
+now+=20;gate.accept(frame(300));assert.equal(events[0].type,'speech_start');assert.equal(events.filter(x=>x.type==='audio').length,30);
 assert.equal(Buffer.from(events[1].data,'base64').length,640);assert.equal(gate.active,true);
-now+=801;gate.tick();assert.equal(events.at(-1).type,'speech_end');assert.equal(gate.active,false);
+now+=1201;gate.tick();assert.equal(events.at(-1).type,'speech_end');assert.equal(gate.active,false);
 let original=gate.idle;gate.setPlaying(true);now+=59000;gate.tick();assert.equal(gate.idle,original);assert.equal(reason,null);
+// During playback only a sustained (~480ms) interruption starts a new utterance.
+let playingEvents=events.length;for(let i=0;i<10;i++){now+=20;gate.accept(frame(300));gate.tick();}
+assert.equal(events.length,playingEvents);
+for(let i=0;i<14;i++){now+=20;gate.accept(frame(300));gate.tick();}
+assert.equal(events.filter(e=>e.type==='speech_start').length,2);
+for(let i=0;i<70;i++){now+=20;gate.accept(frame(0));gate.tick();}
+assert.equal(events.at(-1).type,'speech_end');
 gate.setPlaying(false);now+=60000;gate.tick();assert.equal(reason,'IDLE_LIMIT');gate.destroy();assert.equal(gate.pre.length,0);
 // Long real utterance survives8s but is stopped at60s; low energy noise never starts.
 now=0;events=[];reason=null;const long=new SpeechGate(m=>events.push(m),r=>reason=r,()=>now);
@@ -225,24 +247,24 @@ BODY=r'''
  assert.equal(messages.filter(m=>m.type==='audio').length,0);assert.equal(messages.filter(m=>m.type==='speech_start').length,0);
  for(let i=0;i<8;i++)await inputPacket();
  assert.equal(messages.filter(m=>m.type==='speech_start').length,1);
- await new Promise(r=>setTimeout(r,850));timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();
+ await new Promise(r=>setTimeout(r,1250));timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();
  assert.equal(messages.filter(m=>m.type==='speech_end').length,1);
  const response=mode==='tiny'?Buffer.alloc(2):mode==='silent'?Buffer.alloc(24000):mono;
  if(mode==='long'){for(let i=0;i<24;i++)send({type:'output',epoch:1,data:mono.toString('base64')});send({type:'output_end',epoch:1});}
  else send({type:'output',epoch:1,data:response.toString('base64')});
  if(['tiny','silent'].includes(mode)){send({type:'output_end',epoch:1});}
  else if(mode==='buffering'){
-  for(let i=0;i<8;i++)await inputPacket();
+  for(let i=0;i<30;i++)await inputPacket();
  }else{
   await new Promise(r=>setTimeout(r,90));assert.ok(messages.some(m=>m.type==='playing'));
   if(mode==='long'){assert.ok(!messages.some(m=>m.type==='result'));assert.equal(timers.filter(t=>t.ms===10000&&!t.cancelled).length,1);send({type:'stop'});}
-  else if(mode==='barge')for(let i=0;i<8;i++)await inputPacket();
+  else if(mode==='barge')for(let i=0;i<30;i++)await inputPacket();
   else if(mode==='stop')send({type:'stop'});
   else if(mode==='dave'){encrypted=false;timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();}
   else if(mode==='member')conn.receiver.speaking.emit('start','500000000000000');
   else if(['deadline','drainbarge','drainstop','drainmember'].includes(mode)){
    timers.find(t=>t.ms===600000).fn();assert.ok(messages.some(m=>m.type==='session_draining'));assert.ok(!messages.some(m=>m.type==='result'));
-   if(mode==='drainbarge')for(let i=0;i<8;i++)await inputPacket();
+   if(mode==='drainbarge')for(let i=0;i<30;i++)await inputPacket();
    else if(mode==='drainstop')send({type:'stop'});
    else if(mode==='drainmember')conn.receiver.speaking.emit('start','500000000000000');
    else {send({type:'output_end',epoch:1});await new Promise(r=>setTimeout(r,650));}
@@ -252,7 +274,7 @@ BODY=r'''
   assert.equal(messages.filter(m=>m.type==='speech_start').length,2);
   // Late old epoch chunks and its cancellation cannot destroy new input/output.
   send({type:'output',epoch:1,data:mono.toString('base64')});send({type:'output_end',epoch:1});send({type:'cancel_output',epoch:1});
-  await new Promise(r=>setTimeout(r,850));timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();
+  await new Promise(r=>setTimeout(r,1250));timers.filter(t=>t.ms===25&&!t.cancelled).at(-1).fn();
   send({type:'output',epoch:2,data:mono.subarray(0,9600).toString('base64')});send({type:'output_end',epoch:2});
   await new Promise(r=>setTimeout(r,450));assert.ok(messages.some(m=>m.type==='reply_done'&&m.epoch===2));send({type:'stop'});
  }
