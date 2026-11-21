@@ -81,7 +81,11 @@ class HarnessBase(unittest.IsolatedAsyncioTestCase):
         self.channel.typing = MagicMock()
         self.channel.typing.return_value.__aenter__ = AsyncMock()
         self.channel.typing.return_value.__aexit__ = AsyncMock()
-        self.bot.client.get_channel = lambda cid: {CHAN: self.channel}.get(cid)
+        self.events = types.SimpleNamespace(
+            id=CHAN + 1, name='events', send=AsyncMock(return_value=self.sent),
+            permissions_for=lambda who: types.SimpleNamespace(mention_everyone=True))
+        self.guild.text_channels = [self.channel, self.events]
+        self.bot.client.get_channel = lambda cid: {CHAN: self.channel, CHAN + 1: self.events}.get(cid)
         self.bot.client.music = None
         self.brain = AsyncMock()
         for name, mock in (('try_reaction', AsyncMock()),
@@ -193,6 +197,25 @@ class Harness(HarnessBase):
         await self.bot.on_message(m2)
         self.assertIn('kis baare mein', self.reply_text(m2))
         self.channel.send.assert_not_called()
+
+    async def test_cross_channel_target_resolves_and_unknown_clarifies(self):
+        # named real channel -> preview targets it (not silently current)
+        self.script('[[do:announce everyone #events | Tournament Saturday 9 baje]]')
+        m1 = self.msg(self.owner, 'Kristy #events mein announcement daal do everyone tag karke tournament ke baare mein')
+        await self.bot.on_message(m1)
+        out = self.reply_text(m1)
+        self.assertIn('#events', out)
+        self.events.send.assert_not_called()
+        ident = next(iter(self.bot._actions.pending))
+        m2 = self.msg(self.owner, f'Kristy announce confirm {ident}')
+        await self.bot.on_message(m2)
+        self.events.send.assert_awaited_once()  # posted to #events, not here
+        self.channel.send.assert_not_called()
+        # unknown channel name -> clarify, never silent current-channel bind
+        self.script('[[do:announce everyone #secret | leaked draft text]]')
+        m3 = self.msg(self.owner, 'Kristy #secret mein announce kar do')
+        await self.bot.on_message(m3)
+        self.assertIn('nahi mila', self.reply_text(m3))
 
     async def test_normal_chat_passthrough_zero_side_effects(self):
         self.script('badhiya! tum batao 😊')
