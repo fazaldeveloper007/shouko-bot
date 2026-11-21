@@ -4,6 +4,7 @@ Not wired into bot.py or existing runners. Notice text must be owner approved
 before a future command activation. In-memory session only, never a diary.
 """
 import asyncio
+import time
 import discord
 from voice_live.group_policy import GroupPolicyError
 from voice_live.duplex_protocol import DuplexFlow, DuplexTurn
@@ -306,30 +307,82 @@ Make every conversation feel natural, attentive, and sincere.
 """.strip()
 
 
+PAUSE_LIMIT_SECONDS = 90
+
+
 class GroupCoordinator:
-    """Trusted adapter must refresh roster before every grant/audio/output."""
+    """Trusted adapter must refresh roster before every grant/audio/output.
+
+    Roster changes inside the allowed audience are handled, not fatal: granted
+    members join/leave seamlessly, an ungranted (but allowed) joiner pauses all
+    playback and fresh capture until they agree or leave, and only an outsider,
+    another bot, an empty channel or a revoke stops the session.
+    """
     def __init__(self, policy, snapshot, stop_worker, grant_store=None):
         self.grant_store = grant_store
         self.policy = policy
         self.snapshot = snapshot
         self.stop_worker = stop_worker
         self.stopped = False
+        self.stop_reason = None
         self.speaker = None
         self.epoch = 0
+        self.paused = False
+        self.pause_started = None
+        self.pending_agreement = frozenset()
+        # Optional synchronous hooks set by the live adapter after connect.
+        self.on_targets = None  # desired heard set changed
+        self.on_pause = None    # ungranted member ids now blocking
+        self.on_resume = None   # pause resolved
 
     def refresh(self):
         try:
+            old_roster = self.policy._roster
+            old_agreed = set(self.policy._agreed)
             self.policy.observe_roster(**self.snapshot())
-            if self.grant_store is not None:
-                valid = self.grant_store.valid(self.policy.scope)
-                if self.policy._active and not self.policy._roster <= valid:
-                    raise GroupPolicyError('GROUP_CONSENT_REVOKED')
+            valid = (self.grant_store.valid(self.policy.scope)
+                     if self.grant_store is not None else None)
+            if self.policy._active:
+                if valid is not None:
+                    if old_agreed - valid:
+                        raise GroupPolicyError('GROUP_CONSENT_REVOKED')
+                    self.policy._agreed = set(self.policy._roster & valid)
+                else:
+                    self.policy._agreed = set(self.policy._roster & old_agreed)
+                if self.on_targets is not None:
+                    self.on_targets(set(self.policy._agreed))
+                self._update_pause(set(self.policy._roster) - self.policy._agreed)
+            elif valid is not None:
+                # Saved grants seed the collected agreements so a restart of an
+                # already-consented fixed group needs no fresh button presses.
                 self.policy._agreed = set(self.policy._roster & valid)
+        except GroupPolicyError as error:
+            self.stop(str(error))
+            raise
         except BaseException:
             self.stop()
             raise
 
-    def stop(self):
+    def _update_pause(self, ungranted):
+        if ungranted:
+            if not self.paused:
+                self.paused = True
+                self.pause_started = time.monotonic()
+                if self.on_pause is not None:
+                    self.on_pause(ungranted)
+            self.pending_agreement = frozenset(ungranted)
+            if time.monotonic() - self.pause_started > PAUSE_LIMIT_SECONDS:
+                raise GroupPolicyError('GROUP_AGREEMENT_MISSING')
+        elif self.paused:
+            self.paused = False
+            self.pause_started = None
+            self.pending_agreement = frozenset()
+            if self.on_resume is not None:
+                self.on_resume()
+
+    def stop(self, reason=None):
+        if reason is not None and self.stop_reason is None:
+            self.stop_reason = reason
         if self.stopped:
             return
         self.stopped = True
@@ -357,12 +410,19 @@ class GroupCoordinator:
         try:
             self.refresh()
             actor = event.get('speaker')
-            self.policy.require_audio(speaker=actor)
+            if self.paused:
+                # Paused: only bookkeeping for already-captured consented speech
+                # passes; nothing new is captured (worker is held) or played.
+                if actor not in self.policy._agreed:
+                    return None
+            else:
+                self.policy.require_audio(speaker=actor)
             kind, epoch = event.get('type'), event.get('epoch')
             if type(epoch) is not int:
                 raise GroupPolicyError('GROUP_EPOCH_INVALID')
             if kind == 'speech_start':
-                if self.speaker is not None or epoch != self.epoch + 1:
+                # Monotonic epochs; a gap only means locally dropped events.
+                if self.speaker is not None or epoch <= self.epoch:
                     raise GroupPolicyError('GROUP_EPOCH_INVALID')
                 self.speaker, self.epoch = actor, epoch
             elif kind in ('audio', 'speech_end'):
@@ -378,9 +438,13 @@ class GroupCoordinator:
             raise
 
     def playback(self):
+        """False while paused (drop, never raise); raises on a real violation."""
         try:
             self.refresh()
+            if self.paused:
+                return False
             self.policy.require_playback()
+            return True
         except BaseException:
             self.stop()
             raise
@@ -399,7 +463,10 @@ class CheckedAudio:
 
     async def get(self):
         # Revalidate on dequeue, not just when IPC enqueues it.
-        return self.coordinator.input(await self.queue.get())
+        while True:
+            event = self.coordinator.input(await self.queue.get())
+            if event is not None:
+                return event
 
 
 class CheckedBridge:
@@ -409,7 +476,8 @@ class CheckedBridge:
 
     async def write(self, payload):
         if payload.get('type') in ('output', 'output_end'):
-            self.coordinator.playback()
+            if not self.coordinator.playback():
+                return  # Paused: replies are dropped silently, session survives.
         await self.bridge.write(payload)
 
 
@@ -459,7 +527,7 @@ class ConsentView(discord.ui.View):
 
     @discord.ui.button(label='Decline / Stop', style=discord.ButtonStyle.danger)
     async def decline_button(self, interaction, button):
-        self.coordinator.stop()
+        self.coordinator.stop('GROUP_DECLINED')
         await interaction.response.edit_message(content='Session stopped. No further voice processing.', view=None)
         self.stop()
 
@@ -505,13 +573,15 @@ def discord_snapshot(channel, scope):
 
 
 async def run_approved_group(client, channel, policy, key, *, consent_ready,
-                             stopped, notice_approved=False, confirmed_free_tier=False, outcome=None, grant_store=None, validate_scope=None):
+                             stopped, notice_approved=False, confirmed_free_tier=False, outcome=None, grant_store=None, validate_scope=None, roster_notice=None):
     """Draft lifecycle. Owner-reviewed adapter must collect actual member grants.
 
     consent_ready receives the coordinator, binds the agreed audience to each
     authenticated interaction, and returns only when all members agree. The
     caller owns Discord credentials/login and command activation. No fallback.
-    No sends are performed by this lifecycle except voice gateway/playback.
+    roster_notice, when given, is an async callback ('paused'|'resumed', ids)
+    the caller uses for its own user-visible surfaces. No sends are performed
+    by this lifecycle except voice gateway/playback.
     """
     from voice_live.group_bridge import GroupBridge
     if notice_approved is not True:
@@ -532,6 +602,37 @@ async def run_approved_group(client, channel, policy, key, *, consent_ready,
         return discord_snapshot(channel, policy.scope)
     coordinator = GroupCoordinator(policy, snapshot, cancel, grant_store)
     flow = watcher = consent = None
+    scheduled = set()
+    def schedule(coro):
+        task = asyncio.create_task(coro)
+        scheduled.add(task)
+        task.add_done_callback(scheduled.discard)
+    def bind_roster_hooks():
+        heard = set(coordinator.policy._agreed)
+        def targets(desired):
+            nonlocal heard
+            added, removed = desired - heard, heard - desired
+            if not added and not removed:
+                return
+            heard = set(desired)
+            for actor in sorted(added):
+                schedule(bridge.write({'type': 'add_target', 'id': actor}))
+            for actor in sorted(removed):
+                schedule(bridge.write({'type': 'remove_target', 'id': actor}))
+            print('LIVE_ROSTER: allowed member change; session continues.', flush=True)
+        def pause(ungranted):
+            schedule(bridge.write({'type': 'hold'}))
+            print('LIVE_PAUSED: waiting for a new member agreement; voice processing paused.', flush=True)
+            if roster_notice is not None:
+                schedule(roster_notice('paused', ungranted))
+        def resume():
+            schedule(bridge.write({'type': 'resume'}))
+            print('LIVE_RESUMED: agreement complete; session continues.', flush=True)
+            if roster_notice is not None:
+                schedule(roster_notice('resumed', frozenset()))
+        coordinator.on_targets = targets
+        coordinator.on_pause = pause
+        coordinator.on_resume = resume
     async def watch():
         while not abort.is_set():
             coordinator.refresh()
@@ -557,6 +658,7 @@ async def run_approved_group(client, channel, policy, key, *, consent_ready,
             await consent
             coordinator.start()
             bridge = GroupBridge(client, channel, coordinator, abort)
+            bind_roster_hooks()
             flow = asyncio.create_task(session())
             done, _ = await asyncio.wait((flow, watcher, gate_stop, bridge.result),
                 timeout=600, return_when=asyncio.FIRST_COMPLETED)
@@ -583,9 +685,21 @@ async def run_approved_group(client, channel, policy, key, *, consent_ready,
             if task and not task.done():
                 task.cancel()
         await asyncio.gather(*(t for t in (flow, watcher, consent) if t), return_exceptions=True)
+        for task in tuple(scheduled):
+            task.cancel()
+        await asyncio.gather(*scheduled, return_exceptions=True)
         confirmed = await bridge.disconnect(force=True) if bridge else True
         if outcome is not None:
             outcome.leave_confirmed = bool(confirmed)
+            code = coordinator.stop_reason
+            if code is None and bridge is not None and bridge.result.done():
+                try:
+                    result = bridge.result.result()
+                    if isinstance(result, dict):
+                        code = result.get('code')
+                except Exception:
+                    code = None
+            outcome.end_code = code
 
 
 def draft_notice(coordinator):
