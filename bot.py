@@ -2631,14 +2631,21 @@ async def on_ready():
     # welcome_text_fn lets announcements generate a fresh sweet welcome line
     # per joiner (prompt carries no member/server identifiers); failures
     # fall back to the fixed approved line inside announcements.
-    announcements.start(client, welcome_text_fn=call_text)
-    _schedule_worker.start()
-    _proactive_start()
+    if ONLY_GUILD_ID:
+        # trial instance: never fire background posters/schedulers aimed at
+        # production channels, even if their env flags were left on
+        log.info("trial guild gate %s: background announcements/schedules/proactive disabled", ONLY_GUILD_ID)
+    else:
+        announcements.start(client, welcome_text_fn=call_text)
+        _schedule_worker.start()
+        _proactive_start()
     if client.music:
         await client.music.ready()
 
 @client.event
 async def on_voice_state_update(member, before, after):
+    if ONLY_GUILD_ID and str(getattr(member.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: production voice state is not ours
     if client.music:
         await client.music.voice_changed(member, before, after)
 
@@ -3108,6 +3115,8 @@ async def on_message(message):
 
 @client.event
 async def on_message_edit(before, after):
+    if ONLY_GUILD_ID and str(getattr(after.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: production edits are not ours to record
     """Fold late-arriving embeds (link unfurls, edited bot cards) into memory.
 
     Discord often sends a message first and fills its embeds a moment later
