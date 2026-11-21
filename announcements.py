@@ -900,6 +900,40 @@ async def watch_loop():
 # mention are filled in automatically; only the joining member is pinged.
 WELCOME_TEXT = "Welcome to **{server}**, {mention}! Make yourself at home, we're glad you're here 💙"
 
+# Dynamic welcome line (Fazal 2026-11-21: use the API so every welcome is a
+# different sweet one, not the same fixed intro). The prompt carries NO names
+# or member/server data - the mention and server name are appended locally,
+# never sent to the provider. Any failure falls back to the fixed line above.
+_welcome_text_fn = None  # injected by start(): async (prompt) -> str
+
+WELCOME_LINE_PROMPT = (
+    "You are Kristy, a warm playful Genshin Impact player bot in a small "
+    "Discord server. A new member just joined. Write ONE short sweet Hinglish "
+    "welcome line for them: warm, playful, natural, different every time. "
+    "Rules: no names, no mentions or tags, no personal facts, no questions "
+    "about their life, max 15 words. Reply with ONLY the welcome line.")
+
+
+def _sanitize_welcome_line(text):
+    """A generated line must never ping anyone: strip mention syntax."""
+    text = re.sub(r"<@!?\d+>|<@&\d+>", "", text)
+    return text.replace("@everyone", "everyone").replace("@here", "here").strip()
+
+
+async def _welcome_line():
+    """A fresh sweet line from the AI, or None on any failure (fallback used)."""
+    if _welcome_text_fn is None:
+        return None
+    try:
+        text = await asyncio.wait_for(_welcome_text_fn(WELCOME_LINE_PROMPT), 15)
+    except Exception:
+        log.exception("announcements: welcome line generation failed")
+        return None
+    text = _sanitize_welcome_line((text or "").strip().strip('"'))
+    if not text or len(text) > 200:
+        return None
+    return text
+
 def _member_mentions(member):
     """Ping ONLY the joining member - never everyone or roles."""
     return discord.AllowedMentions(users=[member], everyone=False, roles=False)
@@ -939,7 +973,14 @@ async def _send_welcome(member, ch):
     """Send the approved welcome (live join and catch-up share this one path)."""
     gifs = GIFS.get("hello") or []
     gif = random.choice(gifs) if gifs else None
-    text = WELCOME_TEXT.format(server=member.guild.name, mention=member.mention)
+    line = await _welcome_line()
+    if line:
+        # Constant local lead-in keeps WELCOME_MARKER stable across fixed and
+        # AI wording, so the catch-up history scan recognises both; the varied
+        # part is the identifier-free AI line.
+        text = f"Welcome to **{member.guild.name}**, {member.mention}! {line}"
+    else:
+        text = WELCOME_TEXT.format(server=member.guild.name, mention=member.mention)
     if gif:
         text += "\n" + gif
     if DRY_RUN:
@@ -954,7 +995,11 @@ async def _send_welcome(member, ch):
         log.exception("announcements: welcome failed: %s", e)
         return False
 
-async def _on_member_join(member):
+# Registered via client.event(): discord.py binds handlers by the function's
+# __name__, so this must be named exactly on_member_join - any other name
+# (e.g. _on_member_join) is stored under that name and join events never
+# reach it, with no error anywhere.
+async def on_member_join(member):
     if member.bot:
         return  # don't welcome other bots
     ch = await _get_channel(WELCOME_CHANNEL_ID, "welcome")
@@ -1031,12 +1076,13 @@ _tasks = []
 
 _started = False
 
-def start(client):
-    global client_ref, _started
+def start(client, welcome_text_fn=None):
+    global client_ref, _started, _welcome_text_fn
     if _started:
         return  # on_ready can fire again after reconnects; never double-start
     _started = True
     client_ref = client
+    _welcome_text_fn = welcome_text_fn
     load_state()
     if not ANNOUNCE_ENABLED:
         log.info("announcements: disabled via ANNOUNCE_ENABLED=0")
@@ -1050,7 +1096,7 @@ def start(client):
     if WELCOME_ENABLED:
         # on_member_join needs intents.members=True in bot.py AND the
         # "Server Members Intent" toggle ON in the Discord developer portal.
-        client.event(_on_member_join)
+        client.event(on_member_join)
         log.info("announcements: welcome listener registered -> %s", WELCOME_CHANNEL_ID)
         _tasks.append(asyncio.create_task(_welcome_catchup()))
     log.info("announcements: started (morning %s %s -> %s, codes mode=%s -> %s, events -> %s, birthdays %s %s -> %s)",
