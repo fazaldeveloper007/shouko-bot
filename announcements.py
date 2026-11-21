@@ -152,6 +152,7 @@ def _default_state():
         "birthday_done": {},     # date -> [character names already posted]
         "birthday_img_fail": {}, # date -> {name: failed image fetches}
         "feeds_seeded": False,  # True once events/posts baseline is recorded
+        "welcomed": {"date": "", "ids": []},  # same-day welcome dedupe (date = MORNING_TZ)
     }
 
 def load_state():
@@ -903,9 +904,39 @@ def _member_mentions(member):
     """Ping ONLY the joining member - never everyone or roles."""
     return discord.AllowedMentions(users=[member], everyone=False, roles=False)
 
-async def _on_member_join(member):
-    if member.bot:
-        return  # don't welcome other bots
+# Prefix of the approved welcome text, used to recognise welcomes the bot
+# already posted when deduping the same-day catch-up against channel history.
+WELCOME_MARKER = "Welcome to **"
+
+# Serialises check+send+mark across the live join handler and the startup
+# catch-up: without it a join during catch-up could pass the dedupe check in
+# both paths before either marks, double-welcoming the member.
+_welcome_lock = asyncio.Lock()
+
+def _welcome_today():
+    """Today's date string in the announcements timezone (default IST)."""
+    return _now_local().strftime("%Y-%m-%d")
+
+def _welcomed_today():
+    """Member ids already welcomed today; resets when the local day rolls over."""
+    entry = _state.get("welcomed") or {"date": "", "ids": []}
+    if entry.get("date") != _welcome_today():
+        return set()
+    return set(entry.get("ids") or [])
+
+def _mark_welcomed(user_id):
+    """Persist a welcome so restarts never re-welcome the same member today."""
+    today = _welcome_today()
+    entry = _state.get("welcomed") or {"date": "", "ids": []}
+    if entry.get("date") != today:
+        entry = {"date": today, "ids": []}  # new day: older ids dropped, no retro welcomes
+    if user_id not in entry["ids"]:
+        entry["ids"].append(user_id)
+    _state["welcomed"] = entry
+    save_state()
+
+async def _send_welcome(member, ch):
+    """Send the approved welcome (live join and catch-up share this one path)."""
     gifs = GIFS.get("hello") or []
     gif = random.choice(gifs) if gifs else None
     text = WELCOME_TEXT.format(server=member.guild.name, mention=member.mention)
@@ -913,15 +944,83 @@ async def _on_member_join(member):
         text += "\n" + gif
     if DRY_RUN:
         log.info("announcements DRY-RUN would welcome %s in %s:\n%s", member, member.guild.name, text)
-        return
+        return False
+    try:
+        await ch.send(text, allowed_mentions=_member_mentions(member))
+        _mark_welcomed(member.id)
+        log.info("announcements: welcomed %s in %s", member, member.guild.name)
+        return True
+    except Exception as e:
+        log.exception("announcements: welcome failed: %s", e)
+        return False
+
+async def _on_member_join(member):
+    if member.bot:
+        return  # don't welcome other bots
     ch = await _get_channel(WELCOME_CHANNEL_ID, "welcome")
     if ch is None:
         return
+    if ch.guild is not None and member.guild.id != ch.guild.id:
+        # A join in another shared guild (e.g. the test server) must not post
+        # into the configured welcome channel's server.
+        log.info("announcements: skipping welcome for %s from other guild %s", member, member.guild.id)
+        return
+    async with _welcome_lock:
+        if member.id in _welcomed_today():
+            return  # already welcomed today (rejoin, or catch-up got them)
+        await _send_welcome(member, ch)
+
+async def _welcome_catchup():
+    """Welcome members who joined TODAY (local day) while the bot was offline.
+
+    Runs once at startup. Older days are never touched. Members already
+    welcomed today are skipped twice over: the persisted same-day dedupe set,
+    and a scan of this day's own welcome posts in the channel (covers welcomes
+    sent before the dedupe record existed). If that history scan fails, the
+    catch-up aborts rather than risk a duplicate welcome.
+    """
+    ch = await _get_channel(WELCOME_CHANNEL_ID, "welcome")
+    if ch is None or ch.guild is None:
+        log.error("announcements: welcome catch-up aborted, channel unresolved")
+        return
+    today = _welcome_today()
+    now_local = _now_local()
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    after = start_local.astimezone(datetime.timezone.utc)
+    already = set()
     try:
-        await ch.send(text, allowed_mentions=_member_mentions(member))
-        log.info("announcements: welcomed %s in %s", member, member.guild.name)
+        async for msg in ch.history(limit=200, after=after):
+            if client_ref is not None and msg.author == client_ref.user and \
+                    msg.content.startswith(WELCOME_MARKER):
+                already.update(u.id for u in msg.mentions)
     except Exception as e:
-        log.exception("announcements: welcome failed: %s", e)
+        log.error("announcements: welcome catch-up aborted, history scan failed: %s", e)
+        return  # fail-safe: no catch-up beats a possible duplicate welcome
+    skipped_state = _welcomed_today()
+    sent = skipped = 0
+    try:
+        members = [m async for m in ch.guild.fetch_members(limit=None)]
+    except Exception as e:
+        log.error("announcements: welcome catch-up aborted, member list failed: %s", e)
+        return
+    for m in members:
+        if m.bot or m.joined_at is None:
+            continue
+        if m.joined_at.astimezone(start_local.tzinfo).strftime("%Y-%m-%d") != today:
+            continue  # joined on an earlier day: no retroactive welcomes
+        if m.id in skipped_state or m.id in already:
+            skipped += 1
+            continue
+        async with _welcome_lock:
+            # Recheck inside the lock: a live join event may have welcomed and
+            # marked this member while the catch-up was listing candidates.
+            if m.id in _welcomed_today():
+                skipped += 1
+                continue
+            if await _send_welcome(m, ch):
+                sent += 1
+        await asyncio.sleep(1)
+    log.info("announcements: welcome catch-up done: %d sent, %d already welcomed today", sent, skipped)
 
 # --------------------------------------------------------------------------
 # Wiring
@@ -953,6 +1052,7 @@ def start(client):
         # "Server Members Intent" toggle ON in the Discord developer portal.
         client.event(_on_member_join)
         log.info("announcements: welcome listener registered -> %s", WELCOME_CHANNEL_ID)
+        _tasks.append(asyncio.create_task(_welcome_catchup()))
     log.info("announcements: started (morning %s %s -> %s, codes mode=%s -> %s, events -> %s, birthdays %s %s -> %s)",
              MORNING_TIME, MORNING_TZ, MORNING_CHANNEL_ID, CODES_MODE, CODES_CHANNEL_ID,
              EVENTS_CHANNEL_ID, BIRTHDAY_TIME, BIRTHDAY_TZ, BIRTHDAY_CHANNEL_ID)
