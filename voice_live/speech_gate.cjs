@@ -8,6 +8,9 @@ class SpeechGate {
   this.idle=0;this.lastTick=now();this.playing=false;this.dead=false;
  }
  clearPre(){for(const b of this.pre)b.fill(0);this.pre=[];this.pending.fill(0);this.pending=Buffer.alloc(0);}
+ // Silent local reset (no events): used when a speaker's partial utterance is
+ // held back so a later fresh start is clean. Never erases past emitted audio.
+ reset(){this.active=false;this.hits=0;this.bytes=0;this.idle=0;this.clearPre();}
  accept(pcm){
   if(this.dead){pcm.fill(0);return;}
   const all=Buffer.concat([this.pending,pcm]);this.pending.fill(0);pcm.fill(0);
@@ -20,9 +23,11 @@ class SpeechGate {
   for(let i=0;i<b.length;i+=2){const x=b.readInt16LE(i);sum+=x*x;peak=Math.max(peak,Math.abs(x));}
   const voiced=Math.sqrt(sum/320)>=80&&peak>=200;
   if(!this.active){
-   this.pre.push(b);if(this.pre.length>10)this.pre.shift().fill(0);
+   this.pre.push(b);if(this.pre.length>30)this.pre.shift().fill(0);
    this.hits=voiced?this.hits+1:0;
-   if(this.hits<3)return;
+   // While Kristy is speaking, demand sustained speech (~480ms) before an
+   // interruption starts: brief noises and echo blips must not cut her off.
+   if(this.hits<(this.playing?24:3))return;
    this.active=true;this.epoch++;this.bytes=0;this.idle=0;this.lastVoice=now;
    this.started=now-this.pre.length*20;
    this.emit({type:'speech_start',epoch:this.epoch});
@@ -32,7 +37,7 @@ class SpeechGate {
    this.audio(b);b.fill(0);
   }
   if(this.bytes>=1920000||now-this.started>=60000)this.finish('INPUT_LIMIT');
-  else if(now-this.lastVoice>=800)this.end();
+  else if(now-this.lastVoice>=1200)this.end();
  }
  audio(frame){
   const remaining=1920000-this.bytes;
@@ -51,7 +56,7 @@ class SpeechGate {
   const now=this.now(),delta=Math.max(0,now-this.lastTick);this.lastTick=now;
   if(this.active){
    if(now-this.started>=60000)return this.finish('INPUT_LIMIT');
-   if(now-this.lastVoice>=800)this.end();
+   if(now-this.lastVoice>=1200)this.end();
   }
   if(!this.playing){this.idle+=delta;if(this.idle>=60000)this.finish('IDLE_LIMIT');}
  }
