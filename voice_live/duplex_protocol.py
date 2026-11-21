@@ -72,7 +72,9 @@ class DuplexFlow:
             event = await self.bridge.audio.get()
             kind, epoch = event.get('type'), event.get('epoch')
             if kind == 'speech_start':
-                if self.active or epoch != self.epoch + 1:
+                # Epochs are monotonic; a gap means events were dropped by a
+                # pause/hold, which must not poison the next utterance.
+                if self.active or type(epoch) is not int or epoch <= self.epoch:
                     raise LiveError('INPUT_EPOCH_INVALID')
                 self.epoch = epoch
                 self.active = True
@@ -110,7 +112,7 @@ class DuplexFlow:
                 self.pending_bytes = 0
                 self.pending_ended = self.suppressed = False
                 self.barrier.clear()
-                self.deadline = asyncio.get_running_loop().time() + 8
+                self.deadline = asyncio.get_running_loop().time() + 15
                 if self.timings is not None:
                     self.timings.mark(epoch, 'input_end')
                 await bounded(self.turn.ws.send_json({'realtimeInput': {'activityEnd': {}}}), 1)
@@ -138,7 +140,7 @@ class DuplexFlow:
                     raise LiveError('GOOGLE_UNSOLICITED_OUTPUT')
                 continue
             if not self.suppressed:
-                self.deadline = asyncio.get_running_loop().time() + 8
+                self.deadline = asyncio.get_running_loop().time() + 10
             if content.get('interrupted'):
                 if self.suppressed:
                     self.interrupt_seen = True
@@ -180,7 +182,7 @@ class DuplexFlow:
                     self.pending_ended = True
                     await self.bridge.write({'type': 'output_end', 'epoch': self.pending})
                     if not self.suppressed:
-                        self.deadline = asyncio.get_running_loop().time() + 12
+                        self.deadline = asyncio.get_running_loop().time() + 15
             if content.get('turnComplete'):
                 if self.stale_turn_completes:
                     self.stale_turn_completes -= 1
@@ -192,13 +194,37 @@ class DuplexFlow:
                 self.deadline = None
                 self.barrier.set()
 
+    async def recover_stale(self):
+        """A stalled reply must cost one answer, never the whole session.
+
+        The late turn, if it ever arrives, is dropped through the same stale
+        credit used for interrupted turns. The socket itself is still healthy:
+        a dead connection raises from receive() and remains terminal.
+        """
+        if self.pending is None:
+            self.deadline = None
+            return
+        epoch = self.pending
+        self.stale_turn_completes += 1
+        self.pending = None
+        self.pending_bytes = 0
+        self.pending_ended = self.suppressed = False
+        self.interrupt_seen = False
+        self.drain_interrupt_pending = False
+        self.deadline = None
+        self.barrier.set()
+        print('LIVE_REPLY_TIMEOUT: slow reply dropped; still listening.', flush=True)
+        try:
+            await bounded(self.bridge.write({'type': 'cancel_output', 'epoch': epoch}), 1)
+        except Exception:
+            pass
+
     async def watch(self):
         while True:
             await asyncio.sleep(.05)
             self.turn.check()
             if self.deadline is not None and asyncio.get_running_loop().time() >= self.deadline:
-                raise LiveError('GOOGLE_TURN_COMPLETE_TIMEOUT' if self.pending_ended else
-                    'GOOGLE_RESPONSE_IDLE_TIMEOUT')
+                await self.recover_stale()
 
     async def run(self):
         tasks = [asyncio.create_task(self.send_input()), asyncio.create_task(self.receive_output()), asyncio.create_task(self.watch())]
