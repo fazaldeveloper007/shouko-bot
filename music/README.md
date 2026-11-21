@@ -20,7 +20,7 @@ Regular YouTube video/audio-only, not YouTube Music or Bloomee. No AI calls in m
 - Stop stops and clears queue, stays connected. Leave clears and disconnects.
 - Player buttons: Pause/Resume, Skip, Queue, Stop, Leave. All callbacks revalidate membership/session.
 
-Play appends and starts when idle; Add to queue only queues while idle. /play or the idle-panel Play button starts a waiting queue. During playback either appends without interrupting the current track.
+Play interrupts the current track and starts the selection at once, keeping the existing queue behind it; Add to queue only queues. /play or the idle-panel Play button starts a waiting queue.
 
 ## Resource safeguards for review
 
