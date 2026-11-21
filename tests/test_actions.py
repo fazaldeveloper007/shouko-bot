@@ -139,6 +139,35 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(a.pending), 1)
         msg.channel.send.assert_not_called()
 
+    async def test_announce_unknown_named_channel_clarifies(self):
+        a = make_actions()
+        msg = make_message()
+        msg.guild.text_channels = [msg.channel]
+        out = await a.maybe_execute(msg, '[[do:announce everyone #nope | hello all]]')
+        self.assertIn('nahi mila', out)
+        self.assertFalse(a.pending)
+
+    async def test_announce_named_channel_posts_there(self):
+        events = types.SimpleNamespace(
+            id=21, name='events', send=AsyncMock(),
+            permissions_for=lambda me: types.SimpleNamespace(mention_everyone=True))
+        events.send.return_value = types.SimpleNamespace(
+            jump_url='https://discord.com/channels/10/21/5')
+        msg = make_message()
+        msg.guild.text_channels = [msg.channel, events]
+        a = make_actions()
+        out = await a.maybe_execute(msg, '[[do:announce everyone #events | tournament kal raat 9 baje]]')
+        self.assertIn('#events', out)
+        ident = next(iter(a.pending))
+        sent_channel[21] = events
+        try:
+            ok = await a.handle(msg, f'announce confirm {ident}')
+        finally:
+            sent_channel.pop(21, None)
+        self.assertTrue(ok)
+        events.send.assert_awaited_once()
+        msg.channel.send.assert_not_called()
+
     async def test_announce_draft_mentions_stripped(self):
         a = make_actions()
         msg = make_message()
