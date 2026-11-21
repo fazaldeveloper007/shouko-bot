@@ -295,3 +295,77 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
                 break
         self.assertEqual(len(channel.sent), 1)
         self.assertIn("<@42>", channel.sent[0])
+
+
+class GeneratedContractTests(unittest.TestCase):
+    """The generated welcome line must be plain prose even when the provider
+    wraps it in JSON; anything unparseable falls back, never renders braces."""
+
+    def unwrap(self, text):
+        return announcements._unwrap_generated(text)
+
+    def test_plain_prose_passes_through(self):
+        self.assertEqual(self.unwrap("Aao naye dost!"), "Aao naye dost!")
+
+    def test_json_message_field_unwrapped(self):
+        raw = '{\n"message": "Arre welcome! Grab a seat"\n}'
+        self.assertEqual(self.unwrap(raw), "Arre welcome! Grab a seat")
+
+    def test_fenced_json_unwrapped(self):
+        raw = '```json\n{"reply": "welcome yaar"}\n```'
+        self.assertEqual(self.unwrap(raw), "welcome yaar")
+
+    def test_malformed_and_shapeless_json_rejected(self):
+        self.assertIsNone(self.unwrap("{not json"))
+        self.assertIsNone(self.unwrap('{"count": 3}'))
+        self.assertIsNone(self.unwrap('[1, 2]'))
+        self.assertIsNone(self.unwrap(""))
+        self.assertIsNone(self.unwrap(None))
+
+    def test_other_text_fields_unwrapped(self):
+        self.assertEqual(self.unwrap('{"line": "hi there"}'), "hi there")
+        self.assertEqual(self.unwrap('"just a quoted string"'), "just a quoted string")
+
+
+class WrappedOutputWelcomeTests(unittest.IsolatedAsyncioTestCase):
+    """End to end: a JSON-wrapped provider reply must never reach Discord."""
+
+    def setUp(self):
+        announcements._state = announcements._default_state()
+        self.client = FakeClient()
+        self.guild = FakeGuild(1438772090130923584)
+        self.channel = FakeChannel(self.guild)
+        patches = [
+            patch.object(announcements, "client_ref", self.client),
+            patch.object(announcements, "_now_local", lambda tz_name=None: NOW_LOCAL),
+            patch.object(announcements, "save_state", lambda: None),
+            patch.object(announcements, "DRY_RUN", False),
+            patch.object(announcements, "_get_channel", lambda cid, label: self._channel()),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(setattr, announcements, "_welcome_text_fn", None)
+
+    async def _channel(self):
+        return self.channel
+
+    async def test_json_wrapped_line_renders_clean(self):
+        async def gen(prompt):
+            return '{\n"message": "Arre welcome! Grab a seat and kuch chai-wai piyo!"\n}'
+        announcements._welcome_text_fn = gen
+        m = FakeMember(42, self.guild, joined_at=joined(2026, 11, 21, 10, 0))
+        await announcements.on_member_join(m)
+        text = self.channel.sent[0]
+        self.assertNotIn("{", text)
+        self.assertNotIn('"message"', text)
+        self.assertIn("Arre welcome!", text)
+        self.assertTrue(text.startswith(announcements.WELCOME_MARKER))
+
+    async def test_unparseable_output_falls_back(self):
+        async def gen(prompt):
+            return "{broken"
+        announcements._welcome_text_fn = gen
+        m = FakeMember(42, self.guild, joined_at=joined(2026, 11, 21, 10, 0))
+        await announcements.on_member_join(m)
+        self.assertIn("Make yourself at home", self.channel.sent[0])
