@@ -60,8 +60,37 @@ _QUESTION_RE = re.compile(
     re.IGNORECASE)
 
 
+# A short greeting seeking acknowledgement ("hello", "hi koi hai", "good
+# morning guys") is also a response bid. Tracking is cheap; the AI verdict at
+# expiry decides whether anyone actually acknowledged them, so an active chat
+# saying hi back produces no post. A greeting inside a longer message is not a
+# bid by itself (the question pattern above still applies to those).
+_GREETING_WORDS = {
+    "hello", "helloo", "hi", "hii", "hiii", "hey", "heyy", "heyyy", "yo",
+    "namaste", "namaskar", "salaam", "salam", "adaab", "hola", "gm", "gn",
+    "good", "morning", "afternoon", "evening", "night",
+}
+_GREETING_FILLER = {
+    "guys", "guise", "all", "everyone", "koi", "hai", "bhai", "bro",
+    "sab", "doston", "log", "kya", "haal", "?", "!", ".", "..",
+}
+
+
+def _is_greeting_bid(text):
+    words = re.findall(r"[a-z]+|[?!.]+", text.lower())
+    if not words or len(words) > 5:
+        return False
+    if not any(w in _GREETING_WORDS for w in words):
+        return False
+    return all(w in _GREETING_WORDS or w in _GREETING_FILLER for w in words)
+
+
 def looks_like_help_bid(content):
     text = (content or "").strip()
+    if not text:
+        return False
+    if _is_greeting_bid(text):
+        return True
     return len(text) >= 8 and bool(_QUESTION_RE.search(text))
 
 
