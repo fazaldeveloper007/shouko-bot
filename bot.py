@@ -59,6 +59,7 @@ import voice_roster
 import timed_messages
 import schedule_commands
 import delete_own
+import actions
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -2356,7 +2357,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
     for author, _author_id, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -2402,7 +2403,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -2574,6 +2575,7 @@ async def reminder_wording(core):
 _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected,
                                          rewrite=reminder_wording)
 _schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+_actions = actions.Actions(client, OWNER_ID, _schedule_store)
 _schedule_commands.bot_id = lambda: client.user.id if client.user else None
 _own_deleter = delete_own.Deleter(OWNER_ID, lambda: client.user.id if client.user else None)
 _schedule_commands.health = _schedule_worker.health
@@ -2777,6 +2779,8 @@ async def on_message(message):
     if await _own_deleter.handle(message, _addressed_text(content), action_text):
         return
     if await _schedule_commands.handle(message, _addressed_text(content), client, action_text):
+        return
+    if await _actions.handle(message, _addressed_text(content)):
         return
     if client.music and await client.music.natural(message, _addressed_text(content)):
         return
@@ -3012,6 +3016,7 @@ async def on_message(message):
             reply = schedule_commands.NOT_SAVED  # nothing was saved this turn
         ping_requested, reply = extract_ping_request(reply)
         reply = sanitize_mentions(reply) or EMPTY_REPLY_FALLBACK
+        reply = await _actions.maybe_execute(message, reply)
         # only now, after model-written mention syntax is stripped, reinsert real
         # mentions for verified [[tag:...]] targets; unclear names get a
         # clarification ask instead of a guessed ping
