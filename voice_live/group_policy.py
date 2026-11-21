@@ -74,7 +74,15 @@ class GroupSessionPolicy:
         return guild == self.scope.guild and channel == self.scope.channel
 
     def observe_roster(self, *, guild, channel, humans, other_bots=()):
-        """All occupants, including non-consenting listeners, matter."""
+        """All occupants, including non-consenting listeners, matter.
+
+        Before start, any change clears collected agreements. Once active, a
+        roster change inside the allowed audience is survivable: the adapter
+        re-derives who may be heard from persistent grants (allowed member
+        leaving or a granted member joining continues; an ungranted member
+        pauses the session until they agree or leave). An outsider, another
+        bot, or an empty channel still stops the session.
+        """
         self._open()
         try:
             roster = _ids(humans)
@@ -82,15 +90,15 @@ class GroupSessionPolicy:
         except GroupPolicyError:
             self.stop()
             raise
-        if (not self._scope_matches(guild, channel) or bots or not roster or
-                not roster <= self.scope.allowlist):
+        if not self._scope_matches(guild, channel) or bots or not roster <= self.scope.allowlist:
             self.stop()
             raise GroupPolicyError('GROUP_AUDIENCE_UNSAFE')
+        if not roster:
+            self.stop()
+            raise GroupPolicyError('GROUP_NO_LISTENERS')
         if roster != self._roster:
-            self._agreed.clear()
-            if self._active:
-                self.stop()
-                raise GroupPolicyError('GROUP_AUDIENCE_CHANGED')
+            if not self._active:
+                self._agreed.clear()
             self._roster = roster
 
     def agree(self, *, actor, guild, channel, audience, notice_revision,
