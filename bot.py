@@ -87,6 +87,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
 OWNER_ID = (os.getenv("OWNER_ID") or "").strip()
+# Test-guild isolation for a second trial instance (agent test branch): when
+# set, on_message ignores every guild/DM except this one. Scheduled features
+# (announcements, birthdays, proactive, voice Live) are separately env-gated
+# and must be OFF in the trial instance's start command.
+ONLY_GUILD_ID = (os.getenv("KRISTY_ONLY_GUILD_ID") or "").strip()
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily").strip().lower()
 SEARCH_API_KEY = (os.environ.get("SEARCH_API_KEY") or "").strip()
 # Tavily search endpoint, called directly with aiohttp like everything else
@@ -2674,6 +2679,9 @@ _owner_id_fallback_notice_sent = False
 @client.event
 async def on_message(message):
     global _owner_id_fallback_notice_sent
+
+    if ONLY_GUILD_ID and str(getattr(message.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: test guild only, everything else untouched
 
     # Owner utility commands work in DMs as well as server channels.
     if message.author.bot or getattr(message, "webhook_id", None):
