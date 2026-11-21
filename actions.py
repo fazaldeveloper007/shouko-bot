@@ -31,7 +31,7 @@ import timed_messages as tm
 
 log = logging.getLogger('kristy.actions')
 
-DO_RE = re.compile(r"^\s*\[\[\s*do\s*:\s*([a-z]+(?:\s+[a-z]+){0,3})\s*(?:\|\s*([^\]]{5,600}?))?\s*\]\]", re.I)
+DO_RE = re.compile(r"^\s*\[\[\s*do\s*:\s*([a-z]+(?:\s+[a-z]+){0,3})(?:\s+#([a-z0-9_-]{1,32}))?\s*(?:\|\s*([^\]]{5,600}?))?\s*\]\]", re.I)
 CONFIRM_RE = re.compile(r"announce\s+(confirm|cancel)\s+([a-f0-9]{10})\s*$", re.I)
 
 CAPABILITY = (
@@ -47,6 +47,9 @@ CAPABILITY = (
     "announcement that pings everyone in this channel\n"
     "[[do:announce quiet | full announcement text here]] - draft an "
     "announcement with NO ping\n"
+    "If they name a DIFFERENT target channel, add it after the scope word, "
+    "e.g. [[do:announce everyone #events | text]]; leave it out for the "
+    "channel they are in.\n"
     "Announce only when the server owner clearly asks for one: write the "
     "complete polished announcement after the | (no @mentions in it), choose "
     "everyone vs quiet from what they asked, and leave the scope word out when "
@@ -96,7 +99,7 @@ class Actions:
         if verb == 'cancel':
             await message.reply('Announcement cancel kar diya; kuch post nahi hua.', mention_author=False)
             return True
-        channel = self.client.get_channel(entry['channel'])
+        channel = self.client.get_channel(entry.get('target', entry['channel']))
         if channel is None:
             await message.reply('Channel ab accessible nahi hai; announcement post nahi hua.', mention_author=False)
             return True
@@ -116,7 +119,8 @@ class Actions:
         m = DO_RE.match(reply or '')
         if not m:
             return reply
-        cmd, draft = m.group(1).lower(), (m.group(2) or '').strip()
+        cmd, chan_name = m.group(1).lower(), m.group(2)
+        draft = (m.group(3) or '').strip()
         log.info('action requested: %s (channel=%s)', cmd, message.channel.id)
         try:
             if cmd == 'music status':
@@ -134,9 +138,9 @@ class Actions:
             if cmd == 'reminder list':
                 return self._reminder_list(message)
             if cmd == 'announce everyone':
-                return self._announce_preview(message, draft, ping=True)
+                return self._announce_preview(message, draft, ping=True, chan_name=chan_name)
             if cmd == 'announce quiet':
-                return self._announce_preview(message, draft, ping=False)
+                return self._announce_preview(message, draft, ping=False, chan_name=chan_name)
             if cmd == 'announce':
                 return ('everyone tag ke saath bhejna hai ya bina ping ke (quiet)? '
                         'scope bata do, phir exact preview dungi.')
@@ -243,18 +247,44 @@ class Actions:
             lines.append(f'...aur {len(queued) - 10}')
         return '\n'.join(lines)
 
-    def _announce_preview(self, message, draft, ping):
+    def _resolve_channel(self, message, chan_name):
+        """Resolve a model-named target channel inside this guild.
+
+        Returns (channel, clarification). Unknown or ambiguous names never
+        fall back to the current channel silently - they get a question.
+        """
+        if not chan_name:
+            return message.channel, None
+        want = chan_name.lower().replace('_', '-')
+        pool = list(getattr(message.guild, 'text_channels', None)
+                    or getattr(message.guild, 'channels', []) or [])
+        named = [c for c in pool if getattr(c, 'name', '').lower() == want]
+        if getattr(message.channel, 'name', '').lower() == want:
+            return message.channel, None
+        if not named:
+            return None, (f'#{want} naam ka channel is server mein nahi mila; '
+                          'sahi channel naam bata do, ya bina naam ke bolo toh '
+                          'isi channel mein preview bana dungi.')
+        if len(named) > 1:
+            return None, (f'#{want} naam ke kai channels hain; kaunsa wala? '
+                          'thoda specific bata do.')
+        return named[0], None
+
+    def _announce_preview(self, message, draft, ping, chan_name=None):
         if message.guild is None:
             return 'announcement server channel mein banti hai, DM mein nahi.'
         if not self.owner_id:
             return 'announce abhi configured nahi hai (OWNER_ID set nahi).'
         if not self.is_owner(message):
             return 'announcement sirf server owner kara sakta hai.'
+        target, clarify = self._resolve_channel(message, chan_name)
+        if clarify:
+            return clarify
         if not draft:
             return 'kis baare mein announce karna hai? thoda context do, phir draft bana dungi.'
         me = message.guild.me
-        if ping and me is not None and not message.channel.permissions_for(me).mention_everyone:
-            return 'mere paas is channel mein @everyone mention ki permission nahi hai; pehle woh permission do, ya quiet announce bolo.'
+        if ping and me is not None and not target.permissions_for(me).mention_everyone:
+            return f'mere paas #{getattr(target, "name", "?")} mein @everyone mention ki permission nahi hai; pehle woh permission do, ya quiet announce bolo.'
         draft = re.sub(r'<@!?\d+>|<@&\d+>|@everyone|@here', '', draft, flags=re.I).strip()[:400]
         if not draft:
             return 'draft khaali reh gaya; thoda detail do.'
@@ -262,12 +292,13 @@ class Actions:
         self.pending[ident] = {
             'author': message.author.id,
             'channel': message.channel.id,
+            'target': target.id,
             'guild': message.guild.id,
             'ping': ping,
             'text': ('@everyone\n' if ping else '') + draft,
             'expires': time.monotonic() + self.PREVIEW_TTL,
         }
-        channel_name = getattr(message.channel, 'name', '?')
+        channel_name = getattr(target, 'name', '?')
         return ('announcement preview (abhi post NAHI hua):\n'
                 f'channel: #{channel_name}\n'
                 f'ping: {"everyone" if ping else "none (quiet post)"}\n'
