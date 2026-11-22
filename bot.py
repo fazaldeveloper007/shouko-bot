@@ -59,6 +59,7 @@ import voice_roster
 import timed_messages
 import schedule_commands
 import delete_own
+import actions
 import announcements
 
 # Local dev convenience: load a .env file if one exists
@@ -86,6 +87,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 BOT_NAME = os.getenv("BOT_NAME", "Kristy")
 OWNER_ID = (os.getenv("OWNER_ID") or "").strip()
+# Test-guild isolation for a second trial instance (agent test branch): when
+# set, on_message ignores every guild/DM except this one. Scheduled features
+# (announcements, birthdays, proactive, voice Live) are separately env-gated
+# and must be OFF in the trial instance's start command.
+ONLY_GUILD_ID = (os.getenv("KRISTY_ONLY_GUILD_ID") or "").strip()
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "tavily").strip().lower()
 SEARCH_API_KEY = (os.environ.get("SEARCH_API_KEY") or "").strip()
 # Tavily search endpoint, called directly with aiohttp like everything else
@@ -2356,7 +2362,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
     for author, _author_id, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -2402,7 +2408,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -2574,6 +2580,7 @@ async def reminder_wording(core):
 _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected,
                                          rewrite=reminder_wording)
 _schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+_actions = actions.Actions(client, OWNER_ID, _schedule_store)
 _schedule_commands.bot_id = lambda: client.user.id if client.user else None
 _own_deleter = delete_own.Deleter(OWNER_ID, lambda: client.user.id if client.user else None)
 _schedule_commands.health = _schedule_worker.health
@@ -2624,14 +2631,21 @@ async def on_ready():
     # welcome_text_fn lets announcements generate a fresh sweet welcome line
     # per joiner (prompt carries no member/server identifiers); failures
     # fall back to the fixed approved line inside announcements.
-    announcements.start(client, welcome_text_fn=call_text)
-    _schedule_worker.start()
-    _proactive_start()
+    if ONLY_GUILD_ID:
+        # trial instance: never fire background posters/schedulers aimed at
+        # production channels, even if their env flags were left on
+        log.info("trial guild gate %s: background announcements/schedules/proactive disabled", ONLY_GUILD_ID)
+    else:
+        announcements.start(client, welcome_text_fn=call_text)
+        _schedule_worker.start()
+        _proactive_start()
     if client.music:
         await client.music.ready()
 
 @client.event
 async def on_voice_state_update(member, before, after):
+    if ONLY_GUILD_ID and str(getattr(member.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: production voice state is not ours
     if client.music:
         await client.music.voice_changed(member, before, after)
 
@@ -2673,6 +2687,9 @@ _owner_id_fallback_notice_sent = False
 async def on_message(message):
     global _owner_id_fallback_notice_sent
 
+    if ONLY_GUILD_ID and str(getattr(message.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: test guild only, everything else untouched
+
     # Owner utility commands work in DMs as well as server channels.
     if message.author.bot or getattr(message, "webhook_id", None):
         # Other bots/apps (Loti, game bots, webhooks) never get a reply -
@@ -2705,6 +2722,12 @@ async def on_message(message):
     if content:
         stored = f"{reply_hint(message)} {stored_text(message, content)}".strip()[:300]
         record_message(message.channel.id, message.author.display_name, message.author.id, stored)
+
+    # Announce confirm/cancel works with plain words, addressed or not; the
+    # handler consumes only a real pending-preview match, else returns False
+    # and the normal addressing gates below decide as usual.
+    if await _actions.handle(message, _addressed_text(content)):
+        return
 
     roster_followup = (action_text(message, content, question=True) is not None
                        and _roster_clarifications.matches(message))
@@ -3012,6 +3035,7 @@ async def on_message(message):
             reply = schedule_commands.NOT_SAVED  # nothing was saved this turn
         ping_requested, reply = extract_ping_request(reply)
         reply = sanitize_mentions(reply) or EMPTY_REPLY_FALLBACK
+        reply = await _actions.maybe_execute(message, reply)
         # only now, after model-written mention syntax is stripped, reinsert real
         # mentions for verified [[tag:...]] targets; unclear names get a
         # clarification ask instead of a guessed ping
@@ -3035,11 +3059,14 @@ async def on_message(message):
         # the ping and the reaction stay on the first message only
         chunks = chunk_reply(reply)
         first = f"<@{message.author.id}> {chunks[0]}" if ping_requested else chunks[0]
-        await message.reply(
+        sent_first = await message.reply(
             first,
             mention_author=False,
             allowed_mentions=reply_mentions(message, extra_users=tag_members),
         )
+        # a just-sent announce preview gets its message id bound, so a plain
+        # confirm/cancel replying to it can be told apart from other pendings
+        _actions.note_preview_sent(message.channel.id, getattr(sent_first, 'id', None))
         for extra_chunk in chunks[1:]:
             await message.channel.send(extra_chunk)
         if gif_url:
@@ -3095,6 +3122,8 @@ async def on_message(message):
 
 @client.event
 async def on_message_edit(before, after):
+    if ONLY_GUILD_ID and str(getattr(after.guild, "id", "")) != ONLY_GUILD_ID:
+        return  # trial instance: production edits are not ours to record
     """Fold late-arriving embeds (link unfurls, edited bot cards) into memory.
 
     Discord often sends a message first and fills its embeds a moment later

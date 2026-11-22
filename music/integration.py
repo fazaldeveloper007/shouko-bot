@@ -19,6 +19,15 @@ class Music:
         self.tree = app_commands.CommandTree(client)
         self.synced = False
         self.busy = set()
+        only_guild = (os.getenv('KRISTY_ONLY_GUILD_ID') or '').strip()
+        if only_guild:
+            # trial instance: slash commands/button flows from any other guild
+            # are refused before they reach a handler (production untouched).
+            # discord.py 2.7: CommandTree.interaction_check is a coroutine to
+            # OVERRIDE by assignment, not a decorator.
+            async def _trial_guild_only(interaction: discord.Interaction) -> bool:
+                return str(interaction.guild_id or '') == only_guild
+            self.tree.interaction_check = _trial_guild_only
         self.register()
         self.live = None
         if os.getenv('KRISTY_LIVE_ENABLED') == '1':
