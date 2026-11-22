@@ -435,3 +435,79 @@ class PlainConfirmTests(unittest.IsolatedAsyncioTestCase):
         out = await a.maybe_execute(msg, '[[do:announce quiet | hello]]')
         self.assertIn('permission nahi hai', out)
         self.assertFalse(a.pending)
+
+
+class PlainConfirmSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_confirm_other_channel_not_consumed(self):
+        # a pending preview from one guild/channel can never be executed by a
+        # plain confirm arriving in a different channel (e.g. trial vs prod)
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        elsewhere = make_message(channel_id=99, guild_id=77)
+        consumed = await a.handle(elsewhere, 'confirm')
+        self.assertFalse(consumed)
+        elsewhere.reply.assert_not_called()
+        self.assertEqual(len(a.pending), 1)
+        msg.channel.send.assert_not_called()
+
+    async def test_reply_to_unrelated_message_does_not_choose(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce quiet | pehla draft]]')
+        a.note_preview_sent(20, 101)
+        await a.maybe_execute(msg, '[[do:announce quiet | doosra draft]]')
+        a.note_preview_sent(20, 102)
+        unrelated = make_message()
+        unrelated.reference = types.SimpleNamespace(message_id=555)  # some other message
+        consumed = await a.handle(unrelated, 'confirm')
+        self.assertTrue(consumed)
+        self.assertIn('zyada announcement preview', unrelated.reply.await_args[0][0])
+        self.assertEqual(len(a.pending), 2)  # nothing executed
+        msg.channel.send.assert_not_called()
+
+    async def test_expired_pending_plain_confirm_not_consumed(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        for entry in a.pending.values():
+            entry['expires'] = time.monotonic() - 1  # stale
+        consumed = await a.handle(msg, 'confirm')
+        self.assertFalse(consumed)  # falls through as ordinary chat
+        self.assertFalse(a.pending)  # stale entry swept
+        msg.reply.assert_not_called()
+        msg.channel.send.assert_not_called()
+
+    async def test_coded_schedule_confirm_not_hijacked(self):
+        # schedule_commands owns "confirm <hexcode>"; announce must leave it alone
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        consumed = await a.handle(msg, 'confirm a1b2c3d4e5')
+        self.assertFalse(consumed)
+        self.assertEqual(len(a.pending), 1)  # untouched
+        msg.channel.send.assert_not_called()
+
+    async def test_plain_confirm_executes_latest_then_earlier_stored_text(self):
+        # stored text/target are immutable: confirm posts what was previewed,
+        # newest first, regardless of anything said afterwards
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce quiet | pehla draft]]')
+        a.note_preview_sent(20, 101)
+        await a.maybe_execute(msg, '[[do:announce quiet | doosra draft]]')
+        a.note_preview_sent(20, 102)
+        msg.channel.send = AsyncMock(return_value=types.SimpleNamespace(jump_url='https://x/1'))
+        sent_channel[20] = msg.channel
+        try:
+            bound = make_message()
+            bound.reference = types.SimpleNamespace(message_id=102)
+            await a.handle(bound, 'confirm')
+            self.assertIn('doosra draft', msg.channel.send.await_args[0][0])
+            bound2 = make_message()
+            bound2.reference = types.SimpleNamespace(message_id=101)
+            await a.handle(bound2, 'confirm')
+            self.assertIn('pehla draft', msg.channel.send.await_args[0][0])
+        finally:
+            sent_channel.pop(20, None)
+        self.assertFalse(a.pending)
