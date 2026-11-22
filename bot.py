@@ -2723,6 +2723,12 @@ async def on_message(message):
         stored = f"{reply_hint(message)} {stored_text(message, content)}".strip()[:300]
         record_message(message.channel.id, message.author.display_name, message.author.id, stored)
 
+    # Announce confirm/cancel works with plain words, addressed or not; the
+    # handler consumes only a real pending-preview match, else returns False
+    # and the normal addressing gates below decide as usual.
+    if await _actions.handle(message, _addressed_text(content)):
+        return
+
     roster_followup = (action_text(message, content, question=True) is not None
                        and _roster_clarifications.matches(message))
     schedule_followup = (action_text(message, content, question=True) is not None
@@ -2794,8 +2800,6 @@ async def on_message(message):
     if await _own_deleter.handle(message, _addressed_text(content), action_text):
         return
     if await _schedule_commands.handle(message, _addressed_text(content), client, action_text):
-        return
-    if await _actions.handle(message, _addressed_text(content)):
         return
     if client.music and await client.music.natural(message, _addressed_text(content)):
         return
@@ -3055,11 +3059,14 @@ async def on_message(message):
         # the ping and the reaction stay on the first message only
         chunks = chunk_reply(reply)
         first = f"<@{message.author.id}> {chunks[0]}" if ping_requested else chunks[0]
-        await message.reply(
+        sent_first = await message.reply(
             first,
             mention_author=False,
             allowed_mentions=reply_mentions(message, extra_users=tag_members),
         )
+        # a just-sent announce preview gets its message id bound, so a plain
+        # confirm/cancel replying to it can be told apart from other pendings
+        _actions.note_preview_sent(message.channel.id, getattr(sent_first, 'id', None))
         for extra_chunk in chunks[1:]:
             await message.channel.send(extra_chunk)
         if gif_url:
