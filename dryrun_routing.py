@@ -107,6 +107,14 @@ async def scenario(label, asker_line, judge, seeds=()):
     await asyncio.sleep(PACE_SECONDS)
 
 
+async def _cleanup():
+    # close the shared AI-API session (gemini and groq calls share it) and
+    # the discord client, so the script exits without unclosed-session noise
+    if bot._groq_session is not None and not bot._groq_session.closed:
+        await bot._groq_session.close()
+    await bot.client.close()
+
+
 async def main():
     print(f'model under test: {bot.GEMINI_MODEL} (from your config)\n')
 
@@ -161,8 +169,14 @@ async def main():
     print(f'\n{_http_calls} Gemini HTTP attempts spent '
           f'(6 nominal, 18 worst case). Model: {bot.GEMINI_MODEL}.')
     print('No Discord connection was made; nothing was posted or persisted.')
-    await bot.client.close()
+
+
+async def run():
+    try:
+        await main()
+    finally:
+        await _cleanup()
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(run())
