@@ -191,11 +191,19 @@ class Harness(HarnessBase):
         self.assertIn('quiet', self.reply_text(m1))
         self.assertFalse(self.bot._actions.pending)
         self.channel.send.assert_not_called()
-        # no topic anywhere -> code asks what to announce
+        # scope answered later with no fresh draft -> the interrupted draft
+        # is preserved from the clarification, preview carries it through
         self.script('[[do:announce everyone]]')
-        m2 = self.msg(self.owner, 'Kristy announce karo')
+        m2 = self.msg(self.owner, 'Kristy everyone ke saath announce karo')
         await self.bot.on_message(m2)
-        self.assertIn('kis baare mein', self.reply_text(m2))
+        self.assertIn('preview', self.reply_text(m2))
+        self.assertIn('Scrim Saturday 8 baje hai', self.reply_text(m2))
+        self.channel.send.assert_not_called()
+        # no topic anywhere and nothing stashed -> code asks what to announce
+        self.script('[[do:announce everyone]]')
+        m3 = self.msg(self.owner, 'Kristy announce karo')
+        await self.bot.on_message(m3)
+        self.assertIn('kis baare mein', self.reply_text(m3))
         self.channel.send.assert_not_called()
 
     async def test_cross_channel_target_resolves_and_unknown_clarifies(self):
