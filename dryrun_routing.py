@@ -22,7 +22,7 @@ named channel must be carried; an unintended action on plain chat FAILS),
 not merely that some marker exists.
 
 Cost is bounded: one think() call per scenario, and the HTTP layer retries
-at most 3 attempts per call (retrying.py), so 6 scenarios spend 6 calls
+at most 3 attempts per call (retrying.py), so 7 scenarios spend 7 calls
 nominally, 18 worst case, paced 15s apart. Nothing reaches Discord: the
 gateway never connects and actions run against in-memory fakes; announce
 stops at its preview by design. Nothing persists: history seeds are
@@ -50,7 +50,7 @@ import bot  # noqa: E402  module import builds the client but never logs in
 
 CHAN = 424242
 OWNER = (os.environ.get('OWNER_ID') or '1').strip()
-MAX_HTTP = 20  # paranoia cap: 6 scenarios x 3 retries = 18 max
+MAX_HTTP = 24  # paranoia cap: 7 scenarios x 3 retries = 21 max
 PACE_SECONDS = 15
 
 _http_calls = 0
@@ -86,6 +86,8 @@ async def execute_against_fakes(reply):
 
 async def scenario(label, asker_line, judge, seeds=()):
     """One scenario: seed synthetic history, real model reply, judge outcome."""
+    if ONLY and ONLY not in label.lower():
+        return
     bot.history.pop(CHAN, None)  # fresh deque; 3 seeds never trigger recap
     for author, content in seeds:
         bot.record_message(CHAN, author, 2, content)
@@ -114,6 +116,10 @@ async def _cleanup():
         await bot._groq_session.close()
     await bot.client.close()
 
+
+ONLY = os.environ.get('KRISTY_DRYRUN_ONLY', '').strip().lower()
+# Retest filter: KRISTY_DRYRUN_ONLY=<substring> runs only matching scenario(s),
+# e.g. KRISTY_DRYRUN_ONLY=prepare spends 1 model call instead of all 7.
 
 async def main():
     print(f'model under test: {bot.GEMINI_MODEL} (from your config)\n')
@@ -163,11 +169,16 @@ async def main():
                    'ek announcement daal do scrim ke baare mein', j_unclear)
     await scenario('cross-channel target',
                    '#events mein announcement daal do tournament ke baare mein', j_cross)
+    await scenario('prepare-phrased quiet announce',
+                   'isi channel mein bina kisi ko tag kiye upcoming Minecraft '
+                   'gameplay series tayyar karo jisme sab log join kar sake jo interested ho',
+                   j_expect('announce quiet'),
+                   )  # regression: his live 10:23 phrasing - preview IS the preparation
     await scenario('music status', 'kya baj raha hai abhi?', j_expect('music status'))
     await scenario('reminder list', 'mere reminders dikha do', j_expect('reminder list'))
 
     print(f'\n{_http_calls} Gemini HTTP attempts spent '
-          f'(6 nominal, 18 worst case). Model: {bot.GEMINI_MODEL}.')
+          f'(7 nominal, 21 worst case). Model: {bot.GEMINI_MODEL}.')
     print('No Discord connection was made; nothing was posted or persisted.')
 
 
