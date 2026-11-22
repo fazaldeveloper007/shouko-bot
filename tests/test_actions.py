@@ -325,3 +325,113 @@ class AnnounceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PlainConfirmTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_confirm_posts_pending_preview(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        posted = types.SimpleNamespace(jump_url='https://discord.com/channels/10/20/30')
+        msg.channel.send = AsyncMock(return_value=posted)
+        sent_channel[20] = msg.channel
+        try:
+            consumed = await a.handle(msg, 'confirm')
+        finally:
+            sent_channel.pop(20, None)
+        self.assertTrue(consumed)
+        msg.channel.send.assert_awaited_once()
+        self.assertFalse(a.pending)
+
+    async def test_plain_cancel_cancels(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce everyone | maintenance kal]]')
+        consumed = await a.handle(msg, 'cancel')
+        self.assertTrue(consumed)
+        self.assertIn('cancel kar diya', msg.reply.await_args[0][0])
+        msg.channel.send.assert_not_called()
+        self.assertFalse(a.pending)
+
+    async def test_plain_confirm_without_pending_not_consumed(self):
+        a = make_actions()
+        msg = make_message()
+        consumed = await a.handle(msg, 'confirm')
+        self.assertFalse(consumed)  # ordinary chat must not be hijacked
+        msg.reply.assert_not_called()
+
+    async def test_announce_confirm_words_still_work(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce quiet | update hai]]')
+        msg.channel.send = AsyncMock(return_value=types.SimpleNamespace(jump_url='https://x/1'))
+        sent_channel[20] = msg.channel
+        try:
+            consumed = await a.handle(msg, 'announce confirm')
+        finally:
+            sent_channel.pop(20, None)
+        self.assertTrue(consumed)
+        msg.channel.send.assert_awaited_once()
+
+    async def test_multiple_pending_need_reply_binding(self):
+        a = make_actions()
+        msg = make_message()
+        await a.maybe_execute(msg, '[[do:announce quiet | pehla draft]]')
+        a.note_preview_sent(20, 101)
+        await a.maybe_execute(msg, '[[do:announce quiet | doosra draft]]')
+        a.note_preview_sent(20, 102)
+        msg.channel.send = AsyncMock(return_value=types.SimpleNamespace(jump_url='https://x/1'))
+        sent_channel[20] = msg.channel
+        try:
+            consumed = await a.handle(msg, 'confirm')
+            self.assertTrue(consumed)
+            self.assertIn('zyada announcement preview', msg.reply.await_args[0][0])
+            msg.channel.send.assert_not_called()  # never guessed
+            bound = make_message()
+            bound.reference = types.SimpleNamespace(message_id=101)
+            consumed = await a.handle(bound, 'confirm')
+        finally:
+            sent_channel.pop(20, None)
+        self.assertTrue(consumed)
+        args, _ = msg.channel.send.await_args
+        self.assertIn('pehla draft', args[0])
+
+    async def test_channel_mention_id_resolves(self):
+        events = types.SimpleNamespace(
+            id=123456789012345678, name='general-chat', send=AsyncMock(),
+            permissions_for=lambda me: types.SimpleNamespace(mention_everyone=True))
+        msg = make_message()
+        msg.guild.text_channels = [msg.channel, events]
+        a = make_actions()
+        out = await a.maybe_execute(msg, '[[do:announce everyone #123456789012345678 | hello all]]')
+        self.assertIn('#general-chat', out)
+        self.assertIn('preview', out)
+
+    async def test_unknown_id_clarifies_without_echoing_id(self):
+        msg = make_message()
+        msg.guild.text_channels = [msg.channel]
+        a = make_actions()
+        out = await a.maybe_execute(msg, '[[do:announce everyone #123456789012345678 | hello all]]')
+        self.assertIn('nahi mila', out)
+        self.assertNotIn('123456789012345678', out)  # no raw id rendered as a name
+
+    async def test_clarify_preserves_draft_and_scope(self):
+        msg = make_message()
+        msg.guild.text_channels = [msg.channel]
+        a = make_actions()
+        out = await a.maybe_execute(msg, '[[do:announce everyone #nope | tournament kal raat]]')
+        self.assertIn('nahi mila', out)
+        out = await a.maybe_execute(msg, '[[do:announce]]')
+        self.assertIn('preview', out)
+        self.assertIn('#music', out)
+        self.assertIn('ping: everyone', out)
+        self.assertIn('tournament kal raat', out)
+
+    async def test_no_post_permission_refused(self):
+        a = make_actions()
+        msg = make_message()
+        msg.channel.permissions_for = lambda me: types.SimpleNamespace(
+            view_channel=False, send_messages=False, mention_everyone=True)
+        out = await a.maybe_execute(msg, '[[do:announce quiet | hello]]')
+        self.assertIn('permission nahi hai', out)
+        self.assertFalse(a.pending)
