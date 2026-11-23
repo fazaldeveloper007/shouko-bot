@@ -236,6 +236,23 @@ async def fetch_bytes(url, cap):
             return None, None
         return data, ctype
 
+def sniff_image(data):
+    """Return 'png'/'jpg'/'gif'/'webp' when data starts with that format's
+    magic bytes, else None. A 200 response can still be an HTML error or
+    challenge page; posting those bytes as event.jpg leaves a wish with no
+    visible photo, so the bytes must prove they are an image first."""
+    if not data:
+        return None
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    if data[:3] == b'\xff\xd8\xff':
+        return 'jpg'
+    if data[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
 # --------------------------------------------------------------------------
 # game8 codes page parsing
 # --------------------------------------------------------------------------
@@ -482,7 +499,20 @@ async def _post(channel_id, text, label, image=None):
         if image is not None:
             data, ext = image
             kwargs["file"] = discord.File(io.BytesIO(data), filename=f"event.{ext}")
-        await ch.send(text, **kwargs)
+        msg = await ch.send(text, **kwargs)
+        if image is not None and not getattr(msg, 'attachments', None):
+            # Discord kept the text but the photo never attached; a text-only
+            # wish is exactly what must not stay up. Remove the broken post
+            # and report failure so the caller retries on the next tick. If
+            # the delete itself fails, treat the post as done instead: a
+            # duplicate wish is worse than one missing photo.
+            log.warning("announcements: %s posted without its image, deleting and retrying", label)
+            try:
+                await msg.delete()
+            except Exception:
+                log.exception("announcements: could not delete image-less %s post; not retrying", label)
+                return True
+            return False
         log.info("announcements: posted %s to %s", label, channel_id)
         return True
     except Exception as e:
@@ -620,13 +650,21 @@ async def _birthday_check(now):
                 log.warning("announcements: birthday art file unreadable for %s (%s)", name, local)
         else:
             data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
+            if data and sniff_image(data) is None:
+                # 200 but not an image (error/challenge page, truncated body):
+                # posting it would show the wish with no photo. Count it as a
+                # failed load and retry on the next tick inside the window.
+                log.warning("announcements: birthday art for %s is not an image "
+                            "(ctype=%r, %d bytes); treating as failed load",
+                            name, ctype, len(data))
+                data = None
         if not data:
             fails[name] = fails.get(name, 0) + 1
             save_state()
             log.warning("announcements: birthday image load failed for %s (try %d), will retry",
                         name, fails[name])
             continue
-        image = (data, "png" if "png" in (ctype or "") else "jpg")
+        image = (data, sniff_image(data) or ("png" if "png" in (ctype or "") else "jpg"))
         text = _birthday_text(name, BIRTHDAY_EMOJI.get(name, ''), line)
         if await _post(BIRTHDAY_CHANNEL_ID, text, f"birthday {name}", image=image):
             if not DRY_RUN:
