@@ -424,9 +424,9 @@ without provider response bodies, request headers or keys. These logs distinguis
 silent retries from an immediate non-retryable stop. Only one final Discord
 answer/fallback is sent; screenshot timestamps alone cannot count attempts.
 
-## Preview-confirmed reminders and timed messages
+## Reminders and timed messages
 
-One-shot only, for every human member. Examples (the `|` separators are
+One-shot and weekly, for every human member. Examples (the `|` separators are
 required in this strict form; natural one-line requests below also work):
 
 ```text
@@ -450,10 +450,10 @@ after the last separator. Payloads must be 1-1000 characters and cannot contain
 Discord mention markup, @everyone/@here, or bot tag/search control markers. Tags
 come only from the target field; role/everyone/here/reply pings are disabled.
 
-Nothing is armed immediately. Kristy saves a **preview** showing the exact
-outgoing text, stable member IDs in mention form (without pinging), destination
-name/ID and full weekday/date/time in IST (Asia/Kolkata). Within two minutes,
-the same creator confirms from the source text channel:
+Clear requests are saved immediately after code validates them. One-shot replies
+are `OK` only after the disk save succeeds. Weekly replies include the recurrence,
+next full date/time in IST and a stable series ID. No confirmation step is needed
+for new requests. Legacy unexpired previews can still be confirmed by their creator:
 
 ```text
 Kristy schedule confirm PREVIEW_ID
@@ -474,8 +474,7 @@ Supported time formats:
 - `2026-11-03 20:30` (explicit date and 24-hour clock)
 
 Bare `8 baje`, passed times and unclear dates are not guessed. Between midnight
-and 4 AM, use an explicit date instead of `kal`/`tomorrow`. The preview is the
-final authority for the resolved date/time. Jobs must be 1 minute to 30 days
+and 4 AM, use an explicit date instead of `kal`/`tomorrow`. The saved result/list shows the resolved date/time. Jobs must be 1 minute to 30 days
 in the future. Limits include previews: 10 active per member/server, 50 per
 server and 1000 total; last 200 terminal jobs are retained. This is a bounded
 command grammar, not unrestricted natural-language scheduling.
@@ -504,8 +503,40 @@ job. A failure saving final state halts the worker, not replaying the send.
 **Missed-time policy:** delivery can occur within two minutes of the due time
 (e.g. a short reconnect); anything later is marked `missed` and skipped, never
 caught up hours later. The normal 15-second check cadence is not exact-second
-delivery. The preview and confirmation state this before arming.
+delivery. Weekly confirmation explains the skip policy.
 
+
+### Weekly recurring reminders
+
+```text
+Kristy remind me every Monday at 9 PM to study
+Kristy remind me har Friday at 8:30 AM pani peene
+Kristy remind every Monday 9 PM | here | Study
+```
+
+The API reads the request; code independently checks the weekday and explicit
+AM/PM against the human's own words. One full English weekday per series is
+supported (Monday through Sunday), in **IST / Asia/Kolkata**, every week until
+cancelled. Missing time/weekday, conflicting times, non-IST timezones and
+unsupported recurrence need clarification, not a silently one-time reminder.
+The next occurrence is today if the chosen weekday/time is still ahead, otherwise
+next week; it must be at least one minute ahead. A series does not expire after
+30 days. No daily, alternate-week, multiple-day or custom start/end-date rules yet.
+
+The saved reply gives a series ID. `Kristy schedule list` shows the weekday/time,
+next occurrence and last result. `Kristy schedule cancel ID` stops the **entire
+series**, using that same ID each week. The existing creator/server and exact
+owner controls still apply. An already in-flight Discord send cannot be recalled;
+cancelling then stops future occurrences and says the current send may finish.
+
+Series survive restarts in the same local schedule file. If the phone is offline
+more than two minutes after an occurrence, that occurrence is skipped and the
+next future week stays scheduled, with no backlog burst. An ambiguous send or
+restart during send is recorded as uncertain and never retried for that occurrence;
+the next week remains scheduled. Access/member validation failure stops the series
+as failed, rather than resuming unwanted pings later. The single-process and
+Termux-running requirements still apply. This does not move hosting online or
+create any real reminder as part of the update.
 
 ### Reminder routing and safe status
 
@@ -514,14 +545,14 @@ normal AI chat when the fields are incomplete. Kristy responds with a code-owned
 "not saved/active" clarification and the required format instead of pretending
 an "okay" has scheduled a delivery. A short same-user/server/channel follow-up
 like "haan isi channel mein dena" is linked to that clarification for two minutes
-(or must reply to that exact clarification); it still **cannot arm a job**.
-Only the creator's exact `schedule confirm ID` arms the unchanged preview.
+(or must reply to that exact clarification). A completed, validated request is
+saved immediately; incomplete or unrelated replies do not create jobs.
 
 A bounded short form also works:
 `Kristy reminder 10 min baad: Paani pi lena`
-This creates a current-channel self-reminder **preview**, not an armed job.
+This saves a current-channel self-reminder.
 
-Natural one-line requests also create previews, for example
+Natural one-line requests also save reminders, for example
 `Kristy remind me after 5 minutes to play genshin`,
 `Kristy remind me kal 8 PM paani pi lena`, or with a different destination
 `Kristy remind me after 10 minutes #gaming-chat pe ki VC join karna hai`
