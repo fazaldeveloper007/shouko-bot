@@ -1,4 +1,4 @@
-"""One-shot timed messages, saved on request (no confirm step). Single process only; no send retries."""
+"""One-shot and weekly timed messages, saved on request (no confirm step). Single process only; no send retries."""
 import asyncio
 import datetime as dt
 import json
@@ -45,6 +45,45 @@ def parse_time(text, anchor):
     return due.timestamp()
 
 
+WEEKDAYS = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+_WEEKLY = re.compile(r'(?:every|har)\s+('+'|'.join(WEEKDAYS)+r')\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)', re.I)
+
+def weekly_time(text, anchor):
+    """One weekday and explicit AM/PM, always local IST. No model date arithmetic."""
+    m = _WEEKLY.fullmatch(text.strip())
+    if not m: raise ValueError('Weekly time: every Monday at 9 PM. Ek weekday aur AM/PM do.')
+    hour, minute = int(m[2]), int(m[3] or 0)
+    if not 1 <= hour <= 12 or not 0 <= minute < 60:
+        raise ValueError('Weekly time mein valid hour/minute aur AM/PM do.')
+    hour = hour % 12 + (12 if m[4].lower() == 'pm' else 0)
+    weekday = WEEKDAYS.index(m[1].lower())
+    local = anchor.astimezone(IST)
+    due = dt.datetime.combine(local.date(), dt.time(hour, minute), IST)
+    due += dt.timedelta(days=(weekday-local.weekday()) % 7)
+    if due <= local: due += dt.timedelta(days=7)
+    if (due-local).total_seconds() < 60:
+        raise ValueError('Pehli weekly reminder kam se kam 1 minute aage honi chahiye.')
+    return due.timestamp(), dict(kind='weekly', weekday=weekday, hour=hour, minute=minute, timezone='Asia/Kolkata')
+
+def recurrence_label(e):
+    r = e.get('recurrence')
+    if not r: return ''
+    return f"Every {WEEKDAYS[r['weekday']].title()} {r['hour']:02}:{r['minute']:02} IST"
+
+def finish_occurrence(e, status, reason, now, late_seconds=120, **extra):
+    """Keep one stable series ID; skip backlog, never replay an uncertain occurrence."""
+    e.update(status=status, reason=reason, **extra)
+    if not e.get('recurrence') or status == 'failed': return
+    if e.get('cancel_after_send'):
+        e.update(status='cancelled', reason='creator_or_owner_cancelled')
+        return
+    previous = e['due']
+    steps = (max(1, math.ceil((now-late_seconds-previous)/(7*86400))) if status=='missed'
+             else max(1, math.floor((now-previous)/(7*86400))+1))
+    e.update(last_due=previous, last_status=status, last_reason=reason,
+             due=previous+steps*7*86400, status='scheduled')
+
+
 def shown(timestamp):
     return dt.datetime.fromtimestamp(timestamp,IST).strftime('%A, %d %B %Y, %I:%M %p IST (Asia/Kolkata)')
 
@@ -66,6 +105,16 @@ class Store:
                     or not isinstance(e['body'],str) or not 1<=len(e['body'])<=1200
                     or not all(type(e[k]) in (int,float) and math.isfinite(e[k]) for k in ('due','created','expires'))):
                 raise ValueError('Invalid schedule values')
+            if 'recurrence' in e:
+                r=e['recurrence']
+                if (not isinstance(r,dict) or set(r)!={'kind','weekday','hour','minute','timezone'}
+                        or r.get('kind')!='weekly' or r.get('timezone')!='Asia/Kolkata'
+                        or any(type(r.get(k)) is not int for k in ('weekday','hour','minute'))
+                        or not 0<=r['weekday']<7 or not 0<=r['hour']<24 or not 0<=r['minute']<60):
+                    raise ValueError('Invalid weekly recurrence')
+                local=dt.datetime.fromtimestamp(e['due'],IST)
+                if (local.weekday(),local.hour,local.minute,local.second)!=(r['weekday'],r['hour'],r['minute'],0):
+                    raise ValueError('Weekly due/recurrence mismatch')
         return data
     def save(self,data):
         # Never prune live jobs; bounded retained terminal history.
@@ -80,13 +129,14 @@ class Store:
     def expire(self,data,now):
         for e in data:
             if e['status']=='preview' and now>e['expires']:e.update(status='cancelled',reason='preview_expired')
-    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None):
+    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None,recurrence=None):
         data=self.load();self.expire(data,now)
         active=[e for e in data if e['status'] in ACTIVE]
         if len(active)>=1000 or sum(e['guild']==guild for e in active)>=50 or sum(e['author']==author and e['guild']==guild for e in active)>=10:
             raise ValueError('Schedule limit: 10/member, 50/server, 1000 total active previews/jobs.')
         e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='scheduled' if armed else 'preview',reason='confirmed' if armed else 'awaiting_confirmation')
         if core:e['core']=core
+        if recurrence is not None:e['recurrence']=recurrence
         data.append(e);self.save(data);return e
     def control(self,ident,guild,author,action,now,owner=False):
         data=self.load();self.expire(data,now)
@@ -97,6 +147,9 @@ class Store:
             if e['due']<=now:raise ValueError('Time nikal gaya. Naya preview banao.')
             e.update(status='scheduled',reason='confirmed')
         elif action=='cancel':
+            if e['status']=='dispatching' and e.get('recurrence'):
+                e['cancel_after_send']=True
+                self.save(data);return e
             if e['status'] not in ('preview','scheduled'):raise ValueError('Ye job ab cancel nahi ho sakti; list mein status dekho.')
             e.update(status='cancelled',reason='creator_or_owner_cancelled')
         self.save(data);return e
@@ -139,7 +192,7 @@ class Worker:
             # Never replay a pre-crash send with unknown delivery outcome.
             data=self.store.load()
             for e in data:
-                if e['status']=='dispatching':e.update(status='uncertain',reason='restart_during_send')
+                if e['status']=='dispatching':finish_occurrence(e,'uncertain','restart_during_send',time.time())
             self.store.save(data)
             while not self.halted:
                 await self.tick()
@@ -165,7 +218,7 @@ class Worker:
             if not due:return
             e=due[0]
             if clock-e['due']>self.late:
-                e.update(status='missed',reason='late_over_2min');self.store.save(data);continue
+                finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
             if not self.connected() or not self.client.is_ready():return
             try:dest,targets=access(self.client,e)
             except ValueError:
@@ -185,7 +238,7 @@ class Worker:
                 if cur is None or cur['status']!='scheduled':continue
                 e=cur
                 if clock-e['due']>self.late:
-                    e.update(status='missed',reason='late_over_2min');self.store.save(data);continue
+                    finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
                 if not self.connected() or not self.client.is_ready():return
                 try:dest,targets=access(self.client,e)
                 except ValueError:
@@ -198,12 +251,15 @@ class Worker:
                 sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=targets,roles=False,everyone=False,replied_user=False))
             except asyncio.CancelledError:raise
             except Exception:
-                e.update(status='uncertain',reason='send_outcome_unknown')
-            else:e.update(status='sent',reason='discord_accepted',sent_message=sent.id)
+                finish_occurrence(e,'uncertain','send_outcome_unknown',time.time() if now is None else now)
+            else:finish_occurrence(e,'sent','discord_accepted',time.time() if now is None else now,sent_message=sent.id)
             # A user can create/cancel another job during the awaited send.
             fresh=self.store.load()
             for ix,latest in enumerate(fresh):
-                if latest['id']==e['id']:fresh[ix]=e;break
+                if latest['id']==e['id']:
+                    if latest.get('cancel_after_send'):
+                        e.update(cancel_after_send=True,status='cancelled',reason='creator_or_owner_cancelled')
+                    fresh[ix]=e;break
             try:self.store.save(fresh)
             except (OSError,ValueError,TypeError):self.halted=True;raise
             log.info('Schedule delivery status=%s reason=%s',e['status'],e['reason'])
