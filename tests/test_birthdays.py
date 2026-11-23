@@ -285,8 +285,9 @@ class RaisingChannel:
 
 class AmbiguousSendTests(unittest.IsolatedAsyncioTestCase):
     """A send error after the message may have landed must never cause a
-    blind retry (duplicate wish). Retry only when the post is confirmed
-    absent, or was confirmed deleted for missing its image."""
+    blind retry (duplicate wish). Only a confirmed deletion of a landed
+    photo-less post may retry; every other ambiguous outcome (including a
+    history no-match, which cannot prove absence) suppresses the retry."""
     BOT_ID = 999
     PNG = b'\x89PNG\r\n\x1a\n' + b'x' * 64
 
@@ -311,9 +312,11 @@ class AmbiguousSendTests(unittest.IsolatedAsyncioTestCase):
         return PostedMessage(author_id if author_id is not None else self.BOT_ID,
                              content, list(attachments), created)
 
-    async def test_send_error_confirmed_absent_retries(self):
+    async def test_send_error_no_match_not_retried(self):
+        # History no-match cannot prove absence (the message may not be
+        # visible yet), so the ambiguous outcome suppresses the retry.
         channel = RaisingChannel(history=[])
-        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+        self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
 
     async def test_send_error_landed_with_image_not_retried(self):
         landed = self._msg(attachments=('a',))
@@ -327,15 +330,15 @@ class AmbiguousSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
         self.assertTrue(landed.deleted)
 
-    async def test_send_error_stale_match_is_not_the_landed_post(self):
-        # Identical text posted long ago (e.g. daily morning post) must not
-        # count as the message that may have just landed.
+    async def test_send_error_stale_match_not_retried(self):
+        # Identical text posted long ago (e.g. daily morning post) is not the
+        # message that may have just landed; outcome stays ambiguous, no retry.
         channel = RaisingChannel(history=[self._msg(seconds_ago=600)])
-        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+        self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
 
-    async def test_send_error_other_authors_match_ignored(self):
+    async def test_send_error_other_authors_match_not_retried(self):
         channel = RaisingChannel(history=[self._msg(author_id=12345)])
-        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+        self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
 
     async def test_send_error_unverifiable_history_not_retried(self):
         channel = RaisingChannel(history_error=RuntimeError('no history perm'))
