@@ -243,6 +243,117 @@ class FakeChannel:
         return self.message
 
 
+class PostedMessage:
+    """A message already visible in channel history."""
+    def __init__(self, author_id, content, attachments, created_at):
+        import types
+        self.author = types.SimpleNamespace(id=author_id)
+        self.content = content
+        self.attachments = attachments
+        self.created_at = created_at
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class RaisingChannel:
+    """Channel whose send always fails after possibly delivering, with a
+    fixed history for the landed-post check."""
+    def __init__(self, history=(), history_error=None):
+        self.sent = []
+        self._history = list(history)
+        self._history_error = history_error
+
+    async def send(self, text, **kwargs):
+        self.sent.append((text, kwargs))
+        raise RuntimeError('response lost')
+
+    def history(self, limit=5):
+        if self._history_error is not None:
+            raise self._history_error
+        items = self._history[:limit]
+
+        class _It:
+            def __aiter__(self):
+                async def gen():
+                    for item in items:
+                        yield item
+                return gen()
+        return _It()
+
+
+class AmbiguousSendTests(unittest.IsolatedAsyncioTestCase):
+    """A send error after the message may have landed must never cause a
+    blind retry (duplicate wish). Retry only when the post is confirmed
+    absent, or was confirmed deleted for missing its image."""
+    BOT_ID = 999
+    PNG = b'\x89PNG\r\n\x1a\n' + b'x' * 64
+
+    def setUp(self):
+        import types
+        announcements.DRY_RUN = False
+        self.client = types.SimpleNamespace(user=types.SimpleNamespace(id=self.BOT_ID))
+        self.client_patch = patch.object(announcements, 'client_ref', self.client)
+        self.client_patch.start()
+
+    def tearDown(self):
+        self.client_patch.stop()
+
+    async def _post_to(self, channel, text='wish text', image=None):
+        async def fake_get_channel(channel_id, label):
+            return channel
+        with patch.object(announcements, '_get_channel', fake_get_channel):
+            return await announcements._post(1, text, 'birthday Test', image=image)
+
+    def _msg(self, content='wish text', attachments=('a',), seconds_ago=5, author_id=None):
+        created = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+        return PostedMessage(author_id if author_id is not None else self.BOT_ID,
+                             content, list(attachments), created)
+
+    async def test_send_error_confirmed_absent_retries(self):
+        channel = RaisingChannel(history=[])
+        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+
+    async def test_send_error_landed_with_image_not_retried(self):
+        landed = self._msg(attachments=('a',))
+        channel = RaisingChannel(history=[landed])
+        self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
+        self.assertFalse(landed.deleted)
+
+    async def test_send_error_landed_text_only_deleted_and_retried(self):
+        landed = self._msg(attachments=[])
+        channel = RaisingChannel(history=[landed])
+        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+        self.assertTrue(landed.deleted)
+
+    async def test_send_error_stale_match_is_not_the_landed_post(self):
+        # Identical text posted long ago (e.g. daily morning post) must not
+        # count as the message that may have just landed.
+        channel = RaisingChannel(history=[self._msg(seconds_ago=600)])
+        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+
+    async def test_send_error_other_authors_match_ignored(self):
+        channel = RaisingChannel(history=[self._msg(author_id=12345)])
+        self.assertFalse(await self._post_to(channel, image=(self.PNG, 'png')))
+
+    async def test_send_error_unverifiable_history_not_retried(self):
+        channel = RaisingChannel(history_error=RuntimeError('no history perm'))
+        self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
+
+    async def test_send_error_unknown_bot_identity_not_retried(self):
+        import types
+        with patch.object(announcements, 'client_ref', types.SimpleNamespace(user=None)):
+            channel = RaisingChannel(history=[])
+            self.assertTrue(await self._post_to(channel, image=(self.PNG, 'png')))
+
+    async def test_send_error_text_post_landed_not_retried(self):
+        landed = self._msg(attachments=[])
+        channel = RaisingChannel(history=[landed])
+        self.assertTrue(await self._post_to(channel, image=None))  # text-only post needs no photo
+        self.assertFalse(landed.deleted)
+
+
 class PostImageVerifyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         announcements.DRY_RUN = False
