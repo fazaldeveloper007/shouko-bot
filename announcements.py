@@ -516,7 +516,41 @@ async def _post(channel_id, text, label, image=None):
         log.info("announcements: posted %s to %s", label, channel_id)
         return True
     except Exception as e:
-        log.exception("announcements: failed posting %s: %s", label, e)
+        # The send may have completed server-side before the error (response
+        # lost on the wire). Retrying blind could double-post, so first look
+        # for the message we may have created. Only a confirmed-absent post
+        # may retry; any ambiguity is treated as posted (no duplicate risk),
+        # which can at worst skip one announcement for the day.
+        log.warning("announcements: %s send errored (%s); checking whether it landed", label, e)
+        try:
+            me_id = getattr(getattr(client_ref, 'user', None), 'id', None)
+            if me_id is None:
+                raise RuntimeError("bot identity unknown")
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120)
+            async for recent in ch.history(limit=5):
+                if getattr(getattr(recent, 'author', None), 'id', None) != me_id:
+                    continue
+                if getattr(recent, 'content', '') != text:
+                    continue
+                created = getattr(recent, 'created_at', None)
+                if created is None or created < cutoff:
+                    continue
+                # It did land. If its photo is missing, remove it so the
+                # caller's retry posts a complete wish; otherwise keep it.
+                if image is not None and not getattr(recent, 'attachments', None):
+                    log.warning("announcements: %s landed without its image after send error; deleting and retrying", label)
+                    try:
+                        await recent.delete()
+                    except Exception:
+                        log.exception("announcements: could not delete image-less %s post; not retrying", label)
+                        return True
+                    return False
+                log.info("announcements: %s send errored but the post landed; keeping it", label)
+                return True
+        except Exception:
+            log.exception("announcements: could not verify whether %s posted after send error; not retrying", label)
+            return True
+        log.info("announcements: %s confirmed not posted after send error; will retry", label)
         return False
 
 # --------------------------------------------------------------------------
