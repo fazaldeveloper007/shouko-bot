@@ -10,7 +10,8 @@ HELP = ('Kristy remind me 10 min baad pani peene\n'
         'Kristy remind me tagging Mayank 10 min baad to watch anime\n'
         'Kristy schedule kal 8 PM | #text-channel | Mayank, Naiyo | message\n'
         'Kisi message ko reply karke: 5 min baad same message dena\n'
-        'schedule list / schedule cancel ID')
+        'Every Monday: Kristy remind me every Monday at 9 PM to study\n'
+        'schedule list / schedule cancel ID (weekly ID cancels entire series)')
 
 # Natural free-form time phrases, converted into the strict deterministic
 # grammar before parsing. Bare clock times resolve to today only; a passed
@@ -82,6 +83,37 @@ def time_candidates(text,anchor):
         n,unit=(m[1],m[2]) if m[1] else (m[3],m[4])
         add(f"{n} {'minute' if unit.lower().startswith('min') else 'hour'} baad",m,'rel')
     return found
+
+# Recurrence is grounded in the human's weekday and clock, never invented by AI.
+_WEEKDAY = re.compile(r'\b(?:every|har)\s+('+'|'.join(tm.WEEKDAYS)+r')\b', re.I)
+_RECURRENCE = re.compile(r'\b(?:every|weekly|daily|weekdays|weekends|har|repeat(?:ing)?)\b', re.I)
+
+def pick_weekly(ai_when, sources):
+    text=' '.join(t for t,a in sources)
+    days=list(_WEEKDAY.finditer(text))
+    named_days=re.findall(r'\b('+'|'.join(tm.WEEKDAYS)+r')\b',text,re.I)
+    if len({d.lower() for d in named_days})>1:
+        return None,'Ek weekly series mein ek hi weekday do.'
+    if not days:
+        return None,'Weekly reminder ke liye ek weekday do, jaise every Monday at 9 PM.'
+    if len({m[1].lower() for m in days})!=1:
+        return None,'Ek weekly series mein ek hi weekday do.'
+    if re.search(r'\b(?:UTC|GMT|PST|PDT|EST|EDT|CST|CDT|MST|MDT|BST|CET|CEST|JST|PT|ET|timezone|next)\b|\d{4}-\d{2}-\d{2}|\b(?:for|after)\s+\d+\s+weeks?\b',text,re.I):
+        return None,'Weekly reminders abhi IST (Asia/Kolkata) mein hain, bina start/end date. IST time confirm karke likho.'
+    clocks=list(_CLOCK.finditer(text))
+    if not clocks or len({(m[2],m[3] or '00',m[4].lower()) for m in clocks})!=1:
+        return None,'Weekly reminder ka ek exact time aur AM/PM do, jaise every Monday at 9 PM.'
+    if re.search(r'\b(?:daily|weekdays|weekends|other|alternate|until|till|starting|start|from)\b|\bevery\s+\d',text,re.I):
+        return None,'Abhi sirf har hafte ek weekday supported hai, bina end date. Exact weekly time do.'
+    m=clocks[0];when=f'every {days[0][1].lower()} {m[2]}:{m[3] or "00"} {m[4].lower()}'
+    anchor=sources[0][1]
+    try:
+        expected,r=tm.weekly_time(when,anchor)
+        actual,ar=tm.weekly_time(ai_when,anchor)
+        if expected!=actual or r!=ar:raise ValueError
+    except (ValueError,TypeError):
+        return None,'Weekly time clearly samajh nahi aaya. Jaise: every Monday at 9 PM.'
+    return (when,anchor),None
 
 def pick_time(ai_when,sources):
     """(when_string, anchor) the user's own words support AND the model agrees with;
@@ -158,6 +190,7 @@ class Commands:
         request is genuinely ambiguous. Identity comes from the message
         author, never from a typed username. Everything still lands as an
         unarmed preview showing the exact outgoing text."""
+        if _RECURRENCE.search(rest):return None  # never degrade a series to one-shot in fallback
         text=rest
         dests=re.findall(r'<#(\d+)>',text)
         if len(dests)>1:return None
@@ -207,6 +240,8 @@ class Commands:
         message (Kristy's own or the requester's own) in the same channel.
         The quoted text is data only: its mentions become targets, nothing in
         it is executed, and broadcast/channel/command markers are refused."""
+        if _RECURRENCE.search(text):
+            await self.reply(message,'Weekly reminder naya task likhkar banao: remind me every Monday at 9 PM to study. Same-message shortcut one-time hai.');return True
         time_part=None;rest=text
         for pattern,convert in _NATURAL_TIME:
             m=pattern.search(rest)
@@ -303,7 +338,7 @@ class Commands:
             # here; the model's `when` only has to AGREE with it.
             sources=[(orig,anchor)] if orig else []
             sources.append((text,getattr(message,'created_at',None) or anchor))
-            chosen,problem=pick_time(when,sources)
+            chosen,problem=(pick_weekly(when,sources) if _RECURRENCE.search(request) else pick_time(when,sources))
             if chosen is None:
                 await self.clarify(message,problem,request,anchor);return True
             when,when_anchor=chosen
@@ -349,7 +384,9 @@ class Commands:
         if reminder and len(parts)==4:kind='schedule'
         when,destination=parts[:2]
         if anchor is None:raise ValueError('Original message ka time verify nahi hua.')
-        due=tm.parse_time(when,anchor)
+        recurrence=None
+        if re.match(r'^(every|har)\b',when,re.I):due,recurrence=tm.weekly_time(when,anchor)
+        else:due=tm.parse_time(when,anchor)
         if due<=now:raise ValueError('Time nikal gaya; naya time do.')
         if destination.casefold()=='here':dest=message.channel
         elif re.fullmatch(r'<#\d+>',destination):dest=guild.get_channel(int(destination[2:-1]))
@@ -373,11 +410,11 @@ class Commands:
         core=None
         if reminder:core=body;body=f'Reminder: {body}'
         full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
-        draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core)
+        draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core,recurrence=recurrence)
         tm.access(client,draft)
-        self.store.create(**draft,now=now,armed=True)
+        entry=self.store.create(**draft,now=now,armed=True)
         self.pending.pop(self.key(message),None)
-        await self.reply(message,'OK')
+        await self.reply(message,('Weekly reminder saved: '+tm.recurrence_label(entry)+'; next: '+tm.shown(due)+f". Series ID: {entry['id']}. Cancel: Kristy schedule cancel {entry['id']}. Bot time par running chahiye; missed occurrence skip hogi, series chalegi.") if recurrence else 'OK')
 
 
     async def handle(self,message,text,client,guard):
@@ -412,7 +449,7 @@ class Commands:
                     if entry['source']!=message.channel.id:raise ValueError('Confirm wahi channel mein karo jahan preview bana tha.')
                     tm.access(client,entry)
                 entry=self.store.control(ident,guild.id,message.author.id,action,now,owner)
-                await self.reply(message,f"{entry['id']}: {'scheduled' if action=='confirm' else 'cancelled'}." + (' Bot time par chalni chahiye; 2 minute se zyada late hua toh missed, catch-up ping nahi.' if action=='confirm' else ''))
+                await self.reply(message,f"{entry['id']}: {('future weekly reminders cancelled; current send may already be in flight' if entry.get('cancel_after_send') else ('scheduled' if action=='confirm' else 'cancelled'))}." + (' Bot time par chalni chahiye; 2 minute se zyada late hua toh missed, catch-up ping nahi.' if action=='confirm' else ''))
                 return True
             status=re.fullmatch(r'status(?:\s+([a-f0-9]{10}))?',rest,re.I)
             if rest.lower()=='list' or status:
@@ -424,7 +461,7 @@ class Commands:
                     # destination/body/target identifiers from diagnostics.
                     reason=e.get('reason','legacy_status')
                     if reason not in {'awaiting_confirmation','confirmed','creator_or_owner_cancelled','preview_expired','late_over_2min','access_or_member_check_failed','send_started','send_outcome_unknown','discord_accepted','restart_during_send'}:reason='legacy_status'
-                    rows.append(f"{e['id']} | {e['status']} | {tm.shown(e['due'])} | reason={reason}")
+                    rows.append(f"{e['id']} | {e['status']} | {tm.shown(e['due'])} | reason={reason}" + (f" | {tm.recurrence_label(e)} | last={e.get('last_status','none')}" if e.get('recurrence') else ''))
                 for start in range(0,max(1,len(rows)),8):await self.reply(message,'Worker: '+self.health()+'\n'+('\n'.join(rows[start:start+8]) or 'Is server mein apna saved schedule nahi mila. Normal chat ka okay schedule nahi hota.'))
                 return True
             parts=[x.strip() for x in rest.split('|')]
