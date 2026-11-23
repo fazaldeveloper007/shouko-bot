@@ -286,7 +286,7 @@ class Actions:
             return 'DM mein server schedules nahi hote.'
         try:
             entries = self.store.load()
-        except OSError:
+        except (OSError, ValueError, TypeError):
             return 'schedule storage abhi padh nahi payi; kuch confirm nahi kar sakti.'
         rows = []
         for e in entries:
@@ -295,9 +295,9 @@ class Actions:
             # store schema: status is preview/scheduled/...; the pending vs
             # confirmed distinction lives on the reason field
             if e.get('status') not in ('preview', 'scheduled') \
-                    or e.get('reason') not in ('awaiting_confirmation', 'confirmed'):
+                    or (not e.get('recurrence') and e.get('reason') not in ('awaiting_confirmation', 'confirmed')):
                 continue
-            rows.append(f"{e['id']} | {tm.shown(e['due'])} | {e['reason']}")
+            rows.append(f"{e['id']} | {tm.shown(e['due'])} | {e['reason']}" + (f" | {tm.recurrence_label(e)} | last={e.get('last_status','none')}" if e.get('recurrence') else ''))
         if not rows:
             return 'tumhara koi pending reminder ya schedule nahi hai.'
         return ('tumhare saved schedules:\n' + '\n'.join(rows[:8])
