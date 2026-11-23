@@ -71,7 +71,7 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(announcements, 'save_state', lambda: None))
 
     async def fake_bytes_ok(self, url, cap):
-        return (b'\x89PNG-fake', 'image/png')
+        return (b'\x89PNG\r\n\x1a\n-fake', 'image/png')
 
     async def fake_bytes_fail(self, url, cap):
         return (None, None)
@@ -166,6 +166,128 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             if not announcements._state_broken:
                 await announcements._birthday_check(datetime.datetime(2027, 12, 18, 9, 30))
         self.assertFalse(self.posts)
+
+
+class SniffTests(unittest.TestCase):
+    def test_magic_bytes(self):
+        sniff = announcements.sniff_image
+        self.assertEqual(sniff(b'\x89PNG\r\n\x1a\n' + b'x' * 100), 'png')
+        self.assertEqual(sniff(b'\xff\xd8\xff\xe0' + b'x' * 100), 'jpg')
+        self.assertEqual(sniff(b'GIF89a' + b'x' * 100), 'gif')
+        self.assertEqual(sniff(b'RIFF' + b'\x00' * 4 + b'WEBP' + b'x' * 100), 'webp')
+        self.assertIsNone(sniff(b'<html><body>Attention Required</body></html>'))
+        self.assertIsNone(sniff(b''))
+        self.assertIsNone(sniff(None))
+        self.assertIsNone(sniff(b'RIFFtoo-short'))
+
+
+class NonImageBytesTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        announcements._state = announcements._default_state()
+        announcements._state_broken = False
+        announcements.BIRTHDAY_PING = False
+        announcements.BIRTHDAY_TIME = "09:05"
+        announcements.BIRTHDAY_LAST_MINUTE = 720
+        announcements.DRY_RUN = False
+        self.posts = []
+
+    async def fake_post(self, channel_id, text, label, image=None):
+        self.posts.append((channel_id, text, label, image))
+        return True
+
+    async def test_html_200_response_never_posts_then_recovers(self):
+        # A 200 carrying an HTML error/challenge page must be treated as a
+        # failed load: posting those bytes as event.jpg is what leaves a
+        # birthday wish with no visible photo.
+        async def fake_bytes_html(url, cap):
+            return (b'<html><body>Just a moment...</body></html>', 'text/html')
+        now = datetime.datetime(2027, 12, 18, 9, 30)
+        with patch.dict(announcements.BIRTHDAY_LOCAL_ART, {}, clear=True):  # force CDN path
+            with (patch.object(announcements, '_post', self.fake_post),
+                  patch.object(announcements, 'fetch_bytes', fake_bytes_html),
+                  patch.object(announcements, 'save_state', lambda: None)):
+                for _ in range(3):
+                    await announcements._birthday_check(now)
+            self.assertFalse(self.posts)
+            self.assertNotIn('Neuvillette',
+                             announcements._state['birthday_done'].get('2027-12-18', []))
+            self.assertEqual(
+                announcements._state['birthday_img_fail']['2027-12-18']['Neuvillette'], 3)
+            # real image later in the window: posts, named by sniffed type
+            async def fake_bytes_ok(url, cap):
+                return (b'\x89PNG\r\n\x1a\n' + b'x' * 64, 'text/html')  # wrong header, real bytes
+            with (patch.object(announcements, '_post', self.fake_post),
+                  patch.object(announcements, 'fetch_bytes', fake_bytes_ok),
+                  patch.object(announcements, 'save_state', lambda: None)):
+                await announcements._birthday_check(now)
+            self.assertEqual(len(self.posts), 1)
+            self.assertEqual(self.posts[0][3][1], 'png')  # sniffed, not header
+
+
+class FakeMessage:
+    def __init__(self, attachments):
+        self.attachments = attachments
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class FakeChannel:
+    def __init__(self, message):
+        self.message = message
+        self.sent = []
+
+    async def send(self, text, **kwargs):
+        self.sent.append((text, kwargs))
+        return self.message
+
+
+class PostImageVerifyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        announcements.DRY_RUN = False
+
+    async def test_post_with_attachment_confirmed(self):
+        channel = FakeChannel(FakeMessage(attachments=['attachment']))
+        async def fake_get_channel(channel_id, label):
+            return channel
+        png = b'\x89PNG\r\n\x1a\n' + b'x' * 64
+        with patch.object(announcements, '_get_channel', fake_get_channel):
+            ok = await announcements._post(1, 'text', 'birthday Test', image=(png, 'png'))
+        self.assertTrue(ok)
+        self.assertFalse(channel.message.deleted)
+        self.assertIn('file', channel.sent[0][1])
+
+    async def test_post_without_attachment_is_deleted_and_retried(self):
+        channel = FakeChannel(FakeMessage(attachments=[]))
+        async def fake_get_channel(channel_id, label):
+            return channel
+        png = b'\x89PNG\r\n\x1a\n' + b'x' * 64
+        with patch.object(announcements, '_get_channel', fake_get_channel):
+            ok = await announcements._post(1, 'text', 'birthday Test', image=(png, 'png'))
+        self.assertFalse(ok)  # caller retries on next tick
+        self.assertTrue(channel.message.deleted)
+
+    async def test_delete_failure_not_retried(self):
+        class Undeletable(FakeMessage):
+            async def delete(self):
+                raise RuntimeError('no perms')
+        channel = FakeChannel(Undeletable(attachments=[]))
+        async def fake_get_channel(channel_id, label):
+            return channel
+        png = b'\x89PNG\r\n\x1a\n' + b'x' * 64
+        with patch.object(announcements, '_get_channel', fake_get_channel):
+            ok = await announcements._post(1, 'text', 'birthday Test', image=(png, 'png'))
+        self.assertTrue(ok)  # a duplicate wish is worse than one missing photo
+
+    async def test_text_only_post_unaffected(self):
+        channel = FakeChannel(FakeMessage(attachments=[]))
+        async def fake_get_channel(channel_id, label):
+            return channel
+        with patch.object(announcements, '_get_channel', fake_get_channel):
+            ok = await announcements._post(1, 'text', 'morning')
+        self.assertTrue(ok)
+        self.assertFalse(channel.message.deleted)
 
 
 if __name__ == '__main__':
