@@ -517,10 +517,11 @@ async def _post(channel_id, text, label, image=None):
         return True
     except Exception as e:
         # The send may have completed server-side before the error (response
-        # lost on the wire). Retrying blind could double-post, so first look
-        # for the message we may have created. Only a confirmed-absent post
-        # may retry; any ambiguity is treated as posted (no duplicate risk),
-        # which can at worst skip one announcement for the day.
+        # lost on the wire). Retrying on any ambiguous outcome could
+        # double-post, so look for the message we may have created: keep a
+        # landed post, delete one missing its photo (only a confirmed
+        # deletion may retry), and treat everything else as posted - which
+        # can at worst skip one announcement for the day.
         log.warning("announcements: %s send errored (%s); checking whether it landed", label, e)
         try:
             me_id = getattr(getattr(client_ref, 'user', None), 'id', None)
@@ -550,8 +551,12 @@ async def _post(channel_id, text, label, image=None):
         except Exception:
             log.exception("announcements: could not verify whether %s posted after send error; not retrying", label)
             return True
-        log.info("announcements: %s confirmed not posted after send error; will retry", label)
-        return False
+        # No match in recent history does not prove absence: Discord may have
+        # created the message without it being visible to us yet. The send
+        # outcome stays ambiguous, so suppress the retry - the caller treats
+        # the announcement as done and at worst one post is skipped today.
+        log.warning("announcements: %s send outcome ambiguous after error; not retrying", label)
+        return True
 
 # --------------------------------------------------------------------------
 # Morning loop
