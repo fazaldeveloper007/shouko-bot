@@ -1,5 +1,6 @@
-"""One-shot and weekly timed messages, saved on request (no confirm step). Single process only; no send retries."""
+"""One-shot and recurring timed messages, saved on request (no confirm step). Single process only; no send retries."""
 import asyncio
+import calendar
 import datetime as dt
 import json
 import logging
@@ -65,23 +66,79 @@ def weekly_time(text, anchor):
         raise ValueError('Pehli weekly reminder kam se kam 1 minute aage honi chahiye.')
     return due.timestamp(), dict(kind='weekly', weekday=weekday, hour=hour, minute=minute, timezone='Asia/Kolkata')
 
-def recurrence_label(e):
-    r = e.get('recurrence')
-    if not r: return ''
-    return f"Every {WEEKDAYS[r['weekday']].title()} {r['hour']:02}:{r['minute']:02} IST"
+def next_occurrence(r, after):
+    """First local-calendar occurrence strictly after a timestamp, no backlog loop."""
+    local=dt.datetime.fromtimestamp(after,IST)
+    base=dt.datetime.combine(local.date(),dt.time(r['hour'],r['minute']),IST)
+    if r['kind']=='daily':
+        if base<=local:base+=dt.timedelta(days=1)
+        return base.timestamp()
+    if r['kind']=='weekly':
+        base+=dt.timedelta(days=(r['weekday']-local.weekday())%7)
+        if base<=local:base+=dt.timedelta(days=7)
+        return base.timestamp()
+    year,month=local.year,local.month
+    for _ in range(24):
+        last=calendar.monthrange(year,month)[1]
+        day=r['day']
+        if day<=last:
+            candidate=dt.datetime(year,month,day,r['hour'],r['minute'],tzinfo=IST)
+            if candidate>local:return candidate.timestamp()
+        year,month=(year+1,1) if month==12 else (year,month+1)
+    raise ValueError('Monthly next occurrence unavailable')
 
-def finish_occurrence(e, status, reason, now, late_seconds=120, **extra):
-    """Keep one stable series ID; skip backlog, never replay an uncertain occurrence."""
-    e.update(status=status, reason=reason, **extra)
-    if not e.get('recurrence') or status == 'failed': return
+_CLOCK_REC=r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)'
+_DAILY=re.compile(r'(?:daily|every day|har din)\s+(?:at\s+)?'+_CLOCK_REC,re.I)
+_MONTHLY=re.compile(r'(?:every month (?:on (?:the )?)?|monthly (?:on (?:the )?)?|har mahine )([1-9]|[12]\d|3[01])(?:st|nd|rd|th)?\s+(?:at\s+)?'+_CLOCK_REC,re.I)
+
+def recurrence_time(text,anchor):
+    if _WEEKLY.fullmatch(text.strip()):return weekly_time(text,anchor)
+    m=_DAILY.fullmatch(text.strip());day=None
+    if m:hour,minute,ap=int(m[1]),int(m[2] or 0),m[3]
+    else:
+        m=_MONTHLY.fullmatch(text.strip())
+        if not m:raise ValueError('Repeat time: every day at 9 PM / every Monday at 9 PM / every month on 15 at 9 PM.')
+        day,hour,minute,ap=int(m[1]),int(m[2]),int(m[3] or 0),m[4]
+    if not 1<=hour<=12 or not 0<=minute<60:raise ValueError('Valid hour/minute aur AM/PM do.')
+    r=dict(kind='monthly' if day else 'daily',hour=hour%12+(12 if ap.lower()=='pm' else 0),minute=minute,timezone='Asia/Kolkata')
+    if day and day>28:raise ValueError('Monthly dates 29-31 need a short-month policy. Abhi 1-28 ki date do; 1 aur 15 supported hain.')
+    if day:r.update(day=day,missing_day='skip')
+    due=next_occurrence(r,anchor.timestamp())
+    if due-anchor.timestamp()<60:raise ValueError('Pehli reminder kam se kam 1 minute aage honi chahiye.')
+    return due,r
+
+def valid_recurrence(r):
+    if not isinstance(r,dict) or r.get('timezone')!='Asia/Kolkata':return False
+    fields={'kind','hour','minute','timezone'}
+    if r.get('kind')=='weekly':fields.add('weekday')
+    elif r.get('kind')=='monthly':fields.update(('day','missing_day'))
+    elif r.get('kind')!='daily':return False
+    if set(r)!=fields:return False
+    if any(type(r.get(k)) is not int for k in ('hour','minute')) or not 0<=r['hour']<24 or not 0<=r['minute']<60:return False
+    if r['kind']=='weekly':return type(r['weekday']) is int and 0<=r['weekday']<7
+    if r['kind']=='monthly':return type(r['day']) is int and 1<=r['day']<=28 and r['missing_day']=='skip'
+    return True
+
+def recurrence_label(e):
+    r=e.get('recurrence')
+    if not r:return ''
+    clock=f"{r['hour']:02}:{r['minute']:02} IST"
+    if r['kind']=='weekly':return f"Every {WEEKDAYS[r['weekday']].title()} {clock}"
+    if r['kind']=='daily':return f"Every day {clock}"
+    return f"Every month on {r['day']} {clock}"
+
+def finish_occurrence(e,status,reason,now,late_seconds=120,**extra):
+    """One stable series ID; do not replay an uncertain occurrence."""
+    e.update(status=status,reason=reason,**extra)
+    r=e.get('recurrence')
+    if not r or status=='failed':return
     if e.get('cancel_after_send'):
-        e.update(status='cancelled', reason='creator_or_owner_cancelled')
-        return
-    previous = e['due']
-    steps = (max(1, math.ceil((now-late_seconds-previous)/(7*86400))) if status=='missed'
-             else max(1, math.floor((now-previous)/(7*86400))+1))
-    e.update(last_due=previous, last_status=status, last_reason=reason,
-             due=previous+steps*7*86400, status='scheduled')
+        e.update(status='cancelled',reason='creator_or_owner_cancelled');return
+    previous=e['due']
+    # Keep a current occurrence within grace after skipping older missed ones.
+    cutoff=now-late_seconds-0.001 if status=='missed' else now
+    due=next_occurrence(r,max(previous,cutoff))
+    e.update(last_due=previous,last_status=status,last_reason=reason,due=due,status='scheduled')
 
 
 def shown(timestamp):
@@ -107,14 +164,9 @@ class Store:
                 raise ValueError('Invalid schedule values')
             if 'recurrence' in e:
                 r=e['recurrence']
-                if (not isinstance(r,dict) or set(r)!={'kind','weekday','hour','minute','timezone'}
-                        or r.get('kind')!='weekly' or r.get('timezone')!='Asia/Kolkata'
-                        or any(type(r.get(k)) is not int for k in ('weekday','hour','minute'))
-                        or not 0<=r['weekday']<7 or not 0<=r['hour']<24 or not 0<=r['minute']<60):
-                    raise ValueError('Invalid weekly recurrence')
-                local=dt.datetime.fromtimestamp(e['due'],IST)
-                if (local.weekday(),local.hour,local.minute,local.second)!=(r['weekday'],r['hour'],r['minute'],0):
-                    raise ValueError('Weekly due/recurrence mismatch')
+                if not valid_recurrence(r):raise ValueError('Invalid recurrence')
+                expected=next_occurrence(r,e['due']-1)
+                if expected!=e['due']:raise ValueError('Due/recurrence mismatch')
         return data
     def save(self,data):
         # Never prune live jobs; bounded retained terminal history.
@@ -183,11 +235,13 @@ class Worker:
         self.client,self.store,self.late=client,store,late_seconds
         self.rewrite,self.rewrite_timeout=rewrite,rewrite_timeout
         self.task=None;self.halted=False;self.connected=connected
+        self.started_at=None;self.last_tick_at=None
     def start(self):
         if not self.halted and (self.task is None or self.task.done()):self.task=asyncio.create_task(self.run())
     async def close(self):
         if self.task:self.task.cancel();await asyncio.gather(self.task,return_exceptions=True)
     async def run(self):
+        self.started_at=time.time()
         try:
             # Never replay a pre-crash send with unknown delivery outcome.
             data=self.store.load()
@@ -207,7 +261,19 @@ class Worker:
         if not self.connected() or not self.client.is_ready(): return 'waiting_for_connection'
         return 'running'
 
+    def record_skip(self,e,clock,stage,previous_tick):
+        # Only operational timing/booleans. Never log reminder text or targets.
+        e['last_diagnostic']=dict(checked_at=clock,due=e['due'],
+            lateness_seconds=max(0,clock-e['due']),stage=stage,
+            worker_started_at=self.started_at,previous_tick_at=previous_tick,
+            tick_gap_seconds=None if previous_tick is None else max(0,clock-previous_tick),
+            connected=bool(self.connected()),ready=bool(self.client.is_ready()))
+        log.warning('Schedule skipped late: series=%s checked_at=%s due=%s lateness_seconds=%.1f stage=%s previous_tick_at=%s connected=%s ready=%s',
+            e['id'],clock,e['due'],clock-e['due'],stage,previous_tick,e['last_diagnostic']['connected'],e['last_diagnostic']['ready'])
+
     async def tick(self,now=None):
+        previous_tick=self.last_tick_at
+        self.last_tick_at=time.time() if now is None else now
         # Drain a bounded batch, rereading after each send to respect cancels.
         # discord.py handles rate limits; never retry a send here.
         for _ in range(10):
@@ -218,6 +284,7 @@ class Worker:
             if not due:return
             e=due[0]
             if clock-e['due']>self.late:
+                self.record_skip(e,clock,'before_send',previous_tick)
                 finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
             if not self.connected() or not self.client.is_ready():return
             try:dest,targets=access(self.client,e)
@@ -238,6 +305,7 @@ class Worker:
                 if cur is None or cur['status']!='scheduled':continue
                 e=cur
                 if clock-e['due']>self.late:
+                    self.record_skip(e,clock,'after_wording',previous_tick)
                     finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
                 if not self.connected() or not self.client.is_ready():return
                 try:dest,targets=access(self.client,e)
@@ -263,3 +331,25 @@ class Worker:
             try:self.store.save(fresh)
             except (OSError,ValueError,TypeError):self.halted=True;raise
             log.info('Schedule delivery status=%s reason=%s',e['status'],e['reason'])
+
+
+def diagnostic_summary(e):
+    d=e.get('last_diagnostic')
+    if not isinstance(d,dict):return 'Timing detail: not recorded for this occurrence.'
+    def number(key):
+        v=d.get(key)
+        return v if type(v) in (int,float) and math.isfinite(v) and 0<=v<=253402280000 else None
+    checked,due,late=number('checked_at'),number('due'),number('lateness_seconds')
+    if checked is None or due is None or late is None:return 'Timing detail: unavailable.'
+    def stamp(value):
+        return dt.datetime.fromtimestamp(value,IST).isoformat(timespec='seconds')
+    stage=d.get('stage') if d.get('stage') in ('before_send','after_wording') else 'unknown'
+    parts=[f'Last late skip: checked {stamp(checked)}; occurrence {stamp(due)}; late {late:.1f}s; stage={stage}']
+    for key,label in (('worker_started_at','worker started'),('previous_tick_at','previous tick')):
+        value=number(key)
+        if value is not None:parts.append(label+' '+stamp(value))
+    gap=number('tick_gap_seconds')
+    if gap is not None:parts.append(f'tick gap {gap:.1f}s')
+    for key in ('connected','ready'):
+        if type(d.get(key)) is bool:parts.append(f'{key}={d[key]}')
+    return '; '.join(parts)+'. These are observations, not a root-cause diagnosis.'
