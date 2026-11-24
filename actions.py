@@ -21,6 +21,7 @@ member/role mention syntax inside the model's draft is stripped before it is
 shown or posted - the only ping in the posted announcement is the code-added
 @everyone the preview declared.
 """
+import datetime as dt
 import logging
 import re
 import secrets
@@ -35,6 +36,8 @@ import timed_messages as tm
 log = logging.getLogger('kristy.actions')
 
 DO_RE = re.compile(r"^\s*\[\[\s*do\s*:\s*([a-z]+(?:\s+[a-z]+){0,3})(?:\s+#([a-z0-9_-]{1,32}))?\s*(?:\|\s*([^\]]{5,600}?))?\s*\]\]", re.I)
+SCHEDULE_RE = re.compile(r"^\s*\[\[do:announce (everyone|quiet)(?: #([a-z0-9_-]{1,32}))? \| ([^|\]]{3,80}) \| ([^\]]{5,600})\]\]\s*$", re.I)
+TIME_RE = re.compile(r'(?:aaj|today|kal|tomorrow|\d{4}-\d{2}-\d{2})\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d+\s*(?:minutes?|min|hours?|ghante|ghanta)\s+baad',re.I)
 CONFIRM_RE = re.compile(r"announce\s+(confirm|cancel)\s+([a-f0-9]{10})\s*$", re.I)
 PLAIN_RE = re.compile(r"(?:announce\s+)?(confirm|cancel)\s*$", re.I)
 
@@ -64,6 +67,12 @@ CAPABILITY = (
     "runtime preview IS the prepared draft they review. Reply with "
     "announcement text as plain chat (no marker) ONLY when they clearly want "
     "to copy the text and post it themselves.\n"
+    "For a selected-time announcement use [[do:announce everyone #events | tomorrow 9 PM | full text]] "
+    "or quiet instead of everyone. Copy the exact date/time phrase from the CURRENT request, "
+    "not an event time merely described in the announcement. Supported: today/tomorrow 9 PM, "
+    "YYYY-MM-DD HH:MM, or 10 minutes baad. Never turn a scheduled post into an immediate one. "
+    "If a requested posting time is incomplete, ask for it instead. The runtime previews the "
+    "exact IST time and saves only after requester confirm. No API text rewrite at send time. "
     "Rules: at most one marker per reply, only when the request is clear - "
     "ask a short question instead when it is not. NEVER claim you did one of "
     "these things in plain text; the marker is the only way, and the runtime "
@@ -97,6 +106,15 @@ class Actions:
         must not be hijacked.
         """
         t = (text or '').strip()
+        explicit=re.fullmatch(r'announce schedule ([^|]{3,80})\|\s*(everyone|quiet)\s*\|\s*#?([a-z0-9_-]{1,32})\s*\|\s*(.{5,600})',t,re.I|re.S)
+        if explicit:
+            when,scope,channel,draft=explicit.groups()
+            try:due=self._announcement_due(message,when.strip(),t)
+            except ValueError as exc:
+                await message.reply(str(exc),mention_author=False);return True
+            out=self._announce_preview(message,draft,scope.lower()=='everyone',channel,due)
+            await message.reply(out,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
+            return True
         m = CONFIRM_RE.fullmatch(t)
         if m:
             verb, ident = m.group(1).lower(), m.group(2).lower()
@@ -158,6 +176,20 @@ class Actions:
         if channel is None:
             await message.reply('Channel ab accessible nahi hai; announcement post nahi hua.', mention_author=False)
             return True
+        if entry.get('due') is not None:
+            try:
+                if not self.is_owner(message):raise ValueError('Owner authority changed.')
+                now=time.time()
+                if entry['due']-now<1:raise ValueError('Selected time nikal gaya; announcement save nahi hua. Naya preview banao.')
+                candidate=dict(guild=entry['guild'],author=entry['author'],source=entry['channel'],dest=entry['target'],
+                    targets=[],body=entry['text'],due=entry['due'],kind='announcement',ping=entry['ping'])
+                tm.access(self.client,candidate)
+                saved=self.store.create(**candidate,now=now,armed=True)
+            except (ValueError,OSError,TypeError):
+                await message.reply('Announcement schedule save nahi hua; time, permissions ya storage check karo. Kuch post nahi hua.',mention_author=False)
+                return True
+            await message.reply(f"Announcement scheduled: {tm.shown(saved['due'])}. ID: {saved['id']}. Cancel: Kristy schedule cancel {saved['id']}. 2 minute se zyada late hua toh skip hoga.",mention_author=False)
+            return True
         try:
             sent = await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=entry['ping'], users=False, roles=False))
         except Exception as exc:
@@ -171,6 +203,12 @@ class Actions:
 
     async def maybe_execute(self, message, reply):
         """Execute a leading [[do:...]] marker; return the final reply text."""
+        scheduled=SCHEDULE_RE.fullmatch(reply or '')
+        if scheduled:
+            scope,channel,when,draft=scheduled.groups()
+            try:due=self._announcement_due(message,when,getattr(message,'content',''))
+            except ValueError as exc:return str(exc)
+            return self._announce_preview(message,draft,scope.lower()=='everyone',channel,due)
         m = DO_RE.match(reply or '')
         if not m:
             return reply
@@ -193,19 +231,24 @@ class Actions:
             if cmd == 'reminder list':
                 return self._reminder_list(message)
             if cmd.startswith('announce'):
+                if not self.is_owner(message):return 'announcement sirf server owner kara sakta hai.'
+                # An AI marker may not silently drop a requested posting time.
+                if re.search(r'\b(?:schedule|scheduled|at|baje|baad|tomorrow|kal|today|aaj)\b|\d{1,2}\s*(?:am|pm)\b',getattr(message,'content',''),re.I):
+                    return 'Posting time clear karo: Kristy announce schedule tomorrow 9 PM | quiet | #channel | announcement text. Event time aur posting time alag hain; abhi kuch save/post nahi hua.'
                 key = (message.author.id, message.channel.id)
                 stash = self.clarify_stash.pop(key, None)
                 if stash and time.monotonic() > stash['expires']:
                     stash = None
+                saved_due=stash.get('due') if stash else None
                 if stash:
                     if not draft:
                         draft = stash.get('draft', '')
                     if cmd == 'announce' and stash.get('ping') is not None:
                         cmd = 'announce everyone' if stash['ping'] else 'announce quiet'
                 if cmd == 'announce everyone':
-                    return self._announce_preview(message, draft, ping=True, chan_name=chan_name)
+                    return self._announce_preview(message, draft, ping=True, chan_name=chan_name, due=saved_due)
                 if cmd == 'announce quiet':
-                    return self._announce_preview(message, draft, ping=False, chan_name=chan_name)
+                    return self._announce_preview(message, draft, ping=False, chan_name=chan_name, due=saved_due)
                 if cmd == 'announce':
                     self.clarify_stash[key] = {'draft': draft, 'ping': None,
                                                'expires': time.monotonic() + self.PREVIEW_TTL}
@@ -346,7 +389,19 @@ class Actions:
                           'thoda specific bata do.')
         return named[0], None
 
-    def _announce_preview(self, message, draft, ping, chan_name=None):
+    def _announcement_due(self,message,when,human):
+        anchor=getattr(message,'created_at',None)
+        if not isinstance(anchor,dt.datetime) or anchor.tzinfo is None:
+            raise ValueError('Original request ka time verify nahi hua; kuch save nahi hua.')
+        normalize=lambda v:' '.join(v.lower().split())
+        phrases=[m.group(0) for m in TIME_RE.finditer(human)]
+        if normalize(when) not in [normalize(v) for v in phrases]:
+            raise ValueError('Posting date/time original request se verify nahi hua. Exact date aur AM/PM do; kuch save nahi hua.')
+        due=tm.parse_time(when,anchor)
+        if due<=time.time():raise ValueError('Posting time nikal gaya; kuch save nahi hua.')
+        return due
+
+    def _announce_preview(self, message, draft, ping, chan_name=None, due=None):
         if message.guild is None:
             return 'announcement server channel mein banti hai, DM mein nahi.'
         if not self.owner_id:
@@ -358,7 +413,7 @@ class Actions:
             # Keep the interrupted draft+scope: the owner's follow-up (e.g.
             # \"isi channel mein dedo\") continues the SAME announcement.
             self.clarify_stash[(message.author.id, message.channel.id)] = {
-                'draft': draft, 'ping': ping,
+                'draft': draft, 'ping': ping, 'due': due,
                 'expires': time.monotonic() + self.PREVIEW_TTL}
             return clarify
         if not draft:
@@ -383,12 +438,14 @@ class Actions:
             'ping': ping,
             'text': ('@everyone\n' if ping else '') + draft,
             'expires': time.monotonic() + self.PREVIEW_TTL,
+            'due': due,
         }
         self.last_preview = (message.channel.id, ident)
         channel_name = getattr(target, 'name', '?')
         return ('announcement preview (abhi post NAHI hua):\n'
                 f'channel: #{channel_name}\n'
                 f'ping: {"everyone" if ping else "none (quiet post)"}\n'
+                + (f'posting time: {tm.shown(due)}; more than 2 minutes late = skip\n' if due is not None else 'posting time: now, after confirm\n') +
                 f'---\n{draft}\n---\n'
                 'bhejne ke liye: confirm\n'
                 'cancel ke liye: cancel\n'
