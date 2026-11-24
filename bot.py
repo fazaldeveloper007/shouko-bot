@@ -2599,10 +2599,10 @@ async def reminder_intent(original, followup, anchor):
         "Reply with ONE JSON object, no prose:\n"
         '{"action":"remind"|"need_info"|"none","when":str,"task":str,"tag_names":[str],"tag_author":bool,"question":str}\n'
         "- remind: the user wants to be reminded (or to have named people tagged) at a time. "
-        "'when' MUST be exactly one of: '<N> minute baad', '<N> hour baad', 'aaj H:MM AM|PM', 'kal H:MM AM|PM', 'YYYY-MM-DD HH:MM', 'every WEEKDAY H:MM AM|PM' (full English weekday). "
+        "'when' MUST be exactly one of: '<N> minute baad', '<N> hour baad', 'aaj H:MM AM|PM', 'kal H:MM AM|PM', 'YYYY-MM-DD HH:MM', 'every WEEKDAY H:MM AM|PM' (full English weekday), 'every day H:MM AM|PM', 'every month on D H:MM AM|PM' (D is day 1-28). "
         "If an exact clock time and an approximate duration are both given, use the exact clock time. "
-        "For weekly recurrence, preserve every/har and the weekday in when; never reduce it to a one-time date. "
-        "Support one weekday each week, no end date; ask for missing weekday/time/AM-PM or unsupported recurrence. "
+        "For recurrence, preserve the daily, weekly or monthly rule in when; never reduce it to a one-time date. "
+        "Support daily at one time, weekly on one weekday, or monthly on one numeric date 1-28, no end date. Dates 29-31 require a short-month policy, so ask for a date 1-28 rather than guessing. Ask for missing monthly date, weekday, time, AM-PM or unsupported recurrence. "
         "Use only numbers the user actually wrote; do not calculate times. "
         "'task' is the short thing to remind about (no @, no #, no names of people). "
         "'tag_names' only lists OTHER people the user asked to tag (not the user: 'me', 'mujhe'). "
