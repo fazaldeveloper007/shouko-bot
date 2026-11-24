@@ -609,3 +609,31 @@ tick resets on restart. No extra Discord messages or AI calls are created.
 Native role-target requests are rejected without saving until actual role
 support exists. This prevents requester-only false successes for new requests;
 it does not migrate or change existing series or add role mention permissions.
+
+
+#### Announcements at a selected time
+
+Ask Kristy to prepare an announcement for a posting date/time and channel,
+with `everyone` or `quiet` scope. The AI understands the request; code verifies
+that its posting-time phrase is in the original request. The preview shows the
+exact IST date/time, channel, ping scope and text. Only the requester can
+`confirm` or `cancel` in the source channel, within five minutes. Confirmation
+saves a one-shot announcement. It does not post immediately.
+
+Deterministic alternative:
+`Kristy announce schedule tomorrow 9 PM | quiet | #events | Tournament starts soon!`
+
+Supported posting times: today/tomorrow with AM/PM, an exact `YYYY-MM-DD HH:MM`
+(24-hour), or `10 minutes baad`. Times must be at least one minute and at most
+30 days from the original request. IST is used. An event time inside draft
+text is not automatically a posting time. Incomplete requests ask rather than
+silently posting now. Existing immediate previews still work.
+
+Confirmed announcements survive restart in the existing schedule store.
+`Kristy schedule list`, `Kristy schedule status ID`, and
+`Kristy schedule cancel ID` also work for them. The worker rechecks channel
+access and, for everyone pings, the creator's and bot's mention permissions.
+Only the previewed everyone ping is allowed; member and role mentions are
+stripped. No AI rewrite runs at delivery. More than two minutes late is skipped,
+not sent as catch-up. An uncertain send is never replayed automatically.
+This feature does not itself schedule any real announcement.
