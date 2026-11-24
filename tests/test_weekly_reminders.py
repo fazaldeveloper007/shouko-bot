@@ -57,6 +57,23 @@ class WeeklyWorker(unittest.IsolatedAsyncioTestCase):
         await self.worker.tick(self.due+30*86400)
         e=self.store.load()[0];self.assertGreater(e['due'],self.due+30*86400)
         self.assertEqual(e['last_status'],'missed');self.dest.send.assert_not_awaited()
+    async def test_daily_api_quota_uses_saved_fallback_and_keeps_weekly_series(self):
+        import retrying
+        data=self.store.load();data[0]['core']='save resin for weekly bosses'
+        data[0]['body']='<@1>\nReminder: save resin for weekly bosses'
+        self.store.save(data)
+        async def quota(core):
+            raise retrying.RequestError('Gemini',429,reason='quota')
+        self.worker.rewrite=quota
+        await self.worker.tick(self.due)
+        await self.worker.tick(self.due+15)
+        self.dest.send.assert_awaited_once()
+        self.assertEqual(self.dest.send.call_args.args[0],data[0]['body'])
+        saved=self.store.load()[0]
+        self.assertEqual(saved['last_status'],'sent')
+        self.assertEqual(saved['due'],tm.next_occurrence(self.r,self.due))
+        self.assertFalse(self.worker.halted)
+
     async def test_timeout_advances_not_replayed(self):
         self.dest.send.side_effect=asyncio.TimeoutError
         await self.worker.tick(self.due);await self.worker.tick(self.due+20)
