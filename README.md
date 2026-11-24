@@ -426,7 +426,7 @@ answer/fallback is sent; screenshot timestamps alone cannot count attempts.
 
 ## Reminders and timed messages
 
-One-shot and weekly, for every human member. Examples (the `|` separators are
+One-shot, daily, weekly and monthly, for every human member. Examples (the `|` separators are
 required in this strict form; natural one-line requests below also work):
 
 ```text
@@ -506,34 +506,45 @@ caught up hours later. The normal 15-second check cadence is not exact-second
 delivery. Weekly confirmation explains the skip policy.
 
 
-### Weekly recurring reminders
+### Daily, weekly and monthly recurring reminders
 
 ```text
+Kristy remind me every day at 9 PM to study
+Kristy remind me every month on 15 at 8 AM to check bills
 Kristy remind me every Monday at 9 PM to study
 Kristy remind me har Friday at 8:30 AM pani peene
 Kristy remind every Monday 9 PM | here | Study
 ```
 
-The API reads the request; code independently checks the weekday and explicit
-AM/PM against the human's own words. One full English weekday per series is
-supported (Monday through Sunday), in **IST / Asia/Kolkata**, every week until
-cancelled. Missing time/weekday, conflicting times, non-IST timezones and
-unsupported recurrence need clarification, not a silently one-time reminder.
-The next occurrence is today if the chosen weekday/time is still ahead, otherwise
-next week; it must be at least one minute ahead. A series does not expire after
-30 days. No daily, alternate-week, multiple-day or custom start/end-date rules yet.
+The API reads the request; code independently checks the repeat rule, calendar
+date/weekday and explicit AM/PM against the human's own words. Supported rules
+in **IST / Asia/Kolkata**, until cancelled:
 
-The saved reply gives a series ID. `Kristy schedule list` shows the weekday/time,
+- Daily at one time: `every day at 9 PM`, `daily 9 PM`, `har din 9 PM`.
+- Weekly on one full English weekday: `every Monday at 9 PM`, `har Friday 8 AM`.
+- Monthly on one numeric calendar date (1-28): `every month on 15 at 9 PM`,
+  `monthly on the 15th at 9 PM`, `har mahine 15 at 9 PM`.
+
+Missing date/time/weekday, conflicting times, non-IST timezones and unsupported
+recurrence need clarification, not a silently one-time reminder. Monthly is a
+calendar date, **not every 30 days**. The next occurrence is today if its time
+is still ahead, otherwise the next matching day/week/month; it must be at least
+one minute ahead. Series do not expire after 30 days. Custom intervals, multiple
+days/dates, weekday-of-month rules and custom start/end dates are not supported.
+Dates 29-31 are not accepted yet, because missing-date months need a skip-versus-
+last-day choice. Dates 1 and 15 work every month without that ambiguity.
+
+The saved reply gives a series ID. `Kristy schedule list` shows the repeat rule/time,
 next occurrence and last result. `Kristy schedule cancel ID` stops the **entire
-series**, using that same ID each week. The existing creator/server and exact
+series**, using that same ID for daily, weekly or monthly reminders. The existing creator/server and exact
 owner controls still apply. An already in-flight Discord send cannot be recalled;
 cancelling then stops future occurrences and says the current send may finish.
 
 Series survive restarts in the same local schedule file. If the phone is offline
 more than two minutes after an occurrence, that occurrence is skipped and the
-next future week stays scheduled, with no backlog burst. An ambiguous send or
+next future occurrence stays scheduled, with no backlog burst. An ambiguous send or
 restart during send is recorded as uncertain and never retried for that occurrence;
-the next week remains scheduled. Access/member validation failure stops the series
+the next future occurrence remains scheduled. Access/member validation failure stops the series
 as failed, rather than resuming unwanted pings later. The single-process and
 Termux-running requirements still apply. This does not move hosting online or
 create any real reminder as part of the update.
@@ -579,3 +590,22 @@ an earlier conversational "okay" was scheduled. `failed` can reflect membership/
 permission checks; `uncertain` must never be blindly resent. Diagnostics show
 worker running/not started/stopped/halted/waiting for connection. Corrupt storage
 stays fail-closed. No job history is replayed by this repair.
+
+#### Late-reminder diagnostics (prepared update)
+
+The existing skip rule is unchanged: an occurrence more than two minutes late
+is not sent, and a repeating series advances to its next date. This does not
+prove the bot was offline or the AI provider caused the delay.
+
+New late skips retain a small operational record: due/check timestamps,
+lateness, whether the skip happened before sending or after optional wording,
+worker start time, previous tick time/gap, and connection/readiness booleans.
+`Kristy schedule status <ID>` shows this record to the same creator/owner who
+can already inspect that series. It includes no reminder text or target IDs.
+Historical skips without a record explicitly say the detail was not recorded.
+The record describes observations, not a root cause. The in-memory previous
+tick resets on restart. No extra Discord messages or AI calls are created.
+
+Native role-target requests are rejected without saving until actual role
+support exists. This prevents requester-only false successes for new requests;
+it does not migrate or change existing series or add role mention permissions.
