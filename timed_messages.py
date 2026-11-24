@@ -162,6 +162,10 @@ class Store:
                     or not isinstance(e['body'],str) or not 1<=len(e['body'])<=1200
                     or not all(type(e[k]) in (int,float) and math.isfinite(e[k]) for k in ('due','created','expires'))):
                 raise ValueError('Invalid schedule values')
+            if 'kind' in e:
+                if (e['kind']!='announcement' or type(e.get('ping')) is not bool or e['targets']
+                        or 'core' in e or 'recurrence' in e or ('@everyone' in e['body'])!=e['ping']
+                        or re.search(r'<@|@here',e['body'])):raise ValueError('Invalid announcement entry')
             if 'recurrence' in e:
                 r=e['recurrence']
                 if not valid_recurrence(r):raise ValueError('Invalid recurrence')
@@ -181,12 +185,13 @@ class Store:
     def expire(self,data,now):
         for e in data:
             if e['status']=='preview' and now>e['expires']:e.update(status='cancelled',reason='preview_expired')
-    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None,recurrence=None):
+    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None,recurrence=None,kind=None,ping=False):
         data=self.load();self.expire(data,now)
         active=[e for e in data if e['status'] in ACTIVE]
         if len(active)>=1000 or sum(e['guild']==guild for e in active)>=50 or sum(e['author']==author and e['guild']==guild for e in active)>=10:
             raise ValueError('Schedule limit: 10/member, 50/server, 1000 total active previews/jobs.')
         e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='scheduled' if armed else 'preview',reason='confirmed' if armed else 'awaiting_confirmation')
+        if kind is not None:e.update(kind=kind,ping=ping)
         if core:e['core']=core
         if recurrence is not None:e['recurrence']=recurrence
         data.append(e);self.save(data);return e
@@ -216,6 +221,9 @@ def access(client,e):
     for member in (author,me):
         p=dest.permissions_for(member)
         if not (p.view_channel and p.send_messages):raise ValueError('Destination view/send access nahi hai.')
+    if e.get('kind')=='announcement' and e.get('ping'):
+        if any(not getattr(dest.permissions_for(m),'mention_everyone',False) for m in (author,me)):
+            raise ValueError('Announcement everyone permission missing.')
     targets=[guild.get_member(mid) for mid in e['targets']]
     if any(m is None or m.bot for m in targets):raise ValueError('Koi target ab server mein verify nahi hua.')
     return dest,targets
@@ -316,7 +324,7 @@ class Worker:
                     e['body']=(prefix+'\n' if prefix else '')+text
             e.update(status='dispatching',reason='send_started');self.store.save(data)
             try:
-                sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=targets,roles=False,everyone=False,replied_user=False))
+                sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=False if e.get('kind')=='announcement' else targets,roles=False,everyone=e.get('kind')=='announcement' and e.get('ping',False),replied_user=False))
             except asyncio.CancelledError:raise
             except Exception:
                 finish_occurrence(e,'uncertain','send_outcome_unknown',time.time() if now is None else now)
