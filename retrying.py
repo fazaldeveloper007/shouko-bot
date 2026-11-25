@@ -78,6 +78,28 @@ def operation(func):
             _current.reset(token)
     return wrapped
 
+FALLBACK_MIN_SECONDS = 15
+
+@asynccontextmanager
+async def fallback_budget():
+    """Own three-call budget for a provider failover.
+
+    A failed primary provider may have used all three calls of the operation's
+    budget; the fallback provider must still get a real try, or the fallback
+    can never run after a transient primary outage (HTTP 503). The deadline is
+    the operation's, extended to leave the fallback at least
+    FALLBACK_MIN_SECONDS. Calls per provider stay bounded at three.
+    """
+    parent = _current.get()
+    budget = Budget()
+    if parent is not None:
+        budget.deadline = max(parent.deadline, time.monotonic() + FALLBACK_MIN_SECONDS)
+    token = _current.set(budget)
+    try:
+        yield budget
+    finally:
+        _current.reset(token)
+
 def retry_delay(value, fallback):
     if not value:
         return fallback
