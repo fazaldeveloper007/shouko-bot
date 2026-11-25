@@ -2570,7 +2570,7 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     Groq is used when no GEMINI_API_KEY is set, or when the Gemini call itself
     fails (429/503/network) and a GROQ_API_KEY is available. Explicit safety
     blocks stop without provider fallback. Empty/malformed responses retry
-    within the same three-call budget. image_parts are ignored by the Groq
+    within the same three-call budget; a Groq fallback gets its own three calls. image_parts are ignored by the Groq
     fallback, which replies text-only.
     """
     if GEMINI_API_KEY:
@@ -2580,6 +2580,10 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
             if not GROQ_API_KEY or (isinstance(e, retrying.RequestError) and e.reason == "blocked"):
                 raise
             log.warning("Gemini brain failed, falling back to Groq: %s", type(e).__name__)
+            # Gemini may have spent all three calls on 503s; Groq gets its own
+            # three-call budget instead of failing instantly on the shared one.
+            async with retrying.fallback_budget():
+                return await think_groq(channel_id, diary_block, extra_system)
     return await think_groq(channel_id, diary_block, extra_system)
 
 _schedule_store = timed_messages.Store(self_diary.PATH.parent / 'scheduled-messages.json')
