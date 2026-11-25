@@ -95,7 +95,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await step(),{'ok':1})
             self.assertEqual(retrying._current.get().deadline,deadline)
         self.assertEqual(len(session.calls),4)
-    async def test_same_generation_failover_stays_three(self):
+    async def test_same_generation_failover_shares_budget_without_fallback_scope(self):
         session=Session([Response(401),Response(503),Response(503),Response(200,{'never':1})])
         @retrying.operation
         async def generation():
@@ -106,6 +106,30 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         with patch('retrying.asyncio.sleep',new=AsyncMock()):
             async with retrying.request_scope():
                 with self.assertRaises(retrying.RequestError): await generation()
+        self.assertEqual(len(session.calls),3)
+
+    async def test_fallback_gets_own_three_calls_after_primary_exhausts(self):
+        session=Session([Response(503),Response(503),Response(503),Response(200,{'ok':'groq'})])
+        @retrying.operation
+        async def generation():
+            try:
+                await retrying.post_json(session,'gemini',label='Gemini',headers={},payload={})
+            except retrying.RequestError:
+                async with retrying.fallback_budget():
+                    return await retrying.post_json(session,'groq',label='Groq',headers={},payload={})
+        with patch('retrying.asyncio.sleep',new=AsyncMock()):
+            async with retrying.request_scope():
+                self.assertEqual(await generation(),{'ok':'groq'})
+        self.assertEqual(session.calls,['gemini']*3+['groq'])
+    async def test_fallback_still_bounded_at_three_and_deadline_floor(self):
+        session=Session([Response(503)]*6+[Response(200,{'never':1})])
+        async with retrying.request_scope():
+            retrying._current.get().deadline=0   # primary scope already out of time
+            async with retrying.fallback_budget() as b:
+                self.assertGreater(b.seconds(),10)
+                with patch('retrying.asyncio.sleep',new=AsyncMock()):
+                    with self.assertRaises(retrying.RequestError):
+                        await retrying.post_json(session,'groq',label='Groq',headers={},payload={})
         self.assertEqual(len(session.calls),3)
 
 class OutputValidationTests(unittest.IsolatedAsyncioTestCase):
