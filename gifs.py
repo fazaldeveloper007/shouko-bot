@@ -11,7 +11,6 @@ GIFS = {
     "hello": [
         "https://media.tenor.com/3g3D1mECft0AAAAM/anime-hi.gif",
         "https://media.tenor.com/9JMmuyam6KcAAAAM/hello-anime.gif",
-        "https://media.tenor.com/FBojqU_OBfIAAAAM/anime-hello.gif",
         "https://media.tenor.com/Gp2MsdoLIv4AAAAM/waving-gif.gif",
         "https://media.tenor.com/6K9ZBPOyQ8IAAAAM/anime-hi.gif",
         "https://media.tenor.com/-ZDjEu483FkAAAAM/neuv-neuvillette.gif",  # Neuvillette
@@ -21,6 +20,7 @@ GIFS = {
         "https://media.tenor.com/9W0cdGlncQMAAAAM/il-dottore-dottore.gif",  # Il Dottore
         "https://media.tenor.com/WO18h5KYWE8AAAAM/nahida-happy.gif",  # Nahida
         "https://media.tenor.com/mmCgTIKi6OwAAAAM/kaedehara-kazuha-genshin-impact.gif",  # Kaedehara Kazuha
+        "https://media.tenor.com/ufVk0BDFujwAAAAM/klee-klee-genshin-impact.gif",  # Klee WELCOME (added by Fazal 2026-11-25, tenor.com/bV6R0.gif)
     ],
     "good_morning": [
         "https://media.tenor.com/0xZPQX-922MAAAAM/spike-gm-good-morning.gif",
