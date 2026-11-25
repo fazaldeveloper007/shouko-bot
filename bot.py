@@ -2390,7 +2390,7 @@ def maybe_schedule_extraction(user_id, display_name, text, channel=None):
 
 async def think_groq(channel_id, diary_block="", extra_system=""):
     """Fallback brain: ask Groq for Kristy's next line from the channel history."""
-    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
+    messages = [{"role": "system", "content": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + _actions.layout_note(channel_id) + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]
     for author, _author_id, content in history[channel_id]:
         if author == BOT_NAME:
             messages.append({"role": "assistant", "content": content})
@@ -2436,7 +2436,7 @@ async def think_gemini(channel_id, diary_block="", image_parts=None, extra_syste
         contents[-1]["parts"].extend(image_parts)
 
     payload = {
-        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
+        "system_instruction": {"parts": [{"text": with_diary(SYSTEM_PROMPT, diary_block) + current_context() + SEARCH_CAPABILITY + MODEL_SEARCH_CAPABILITY + actions.CAPABILITY + _actions.layout_note(channel_id) + extra_system + PING_GUIDANCE + CHAT_CONTEXT_NOTE + channel_context_note(channel_id)}]},
         "contents": contents,
         # thinkingLevel "low" is valid on gemini-3.8-flash, 3.6-flash and the
         # 3.5 flash-lite models; "minimal" errors on 3.8-flash, and
@@ -2758,6 +2758,7 @@ async def on_message(message):
     # and the normal addressing gates below decide as usual.
     if await _actions.handle(message, _addressed_text(content)):
         return
+    _actions.prime_layout(message, content)  # owner-only read-only layout block; no API call
 
     roster_followup = (action_text(message, content, question=True) is not None
                        and _roster_clarifications.matches(message))
