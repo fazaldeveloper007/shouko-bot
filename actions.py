@@ -32,6 +32,8 @@ import discord
 from music.player import MusicError
 from music.ui import clean
 import timed_messages as tm
+import os
+import server_builder
 
 log = logging.getLogger('kristy.actions')
 
@@ -79,6 +81,8 @@ CAPABILITY = (
     "reports the true outcome. For everything else (chat, questions, jokes) "
     "answer normally with no marker."
 )
+if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0':
+    CAPABILITY += server_builder.CAPABILITY
 
 
 class Actions:
@@ -91,6 +95,14 @@ class Actions:
         self.pending = {}
         self.clarify_stash = {}  # (author, channel) -> interrupted draft+scope
         self.last_preview = None  # (channel, ident) awaiting its sent-message id
+        self.builder = server_builder.Builder(client) if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0' else None
+
+    def layout_note(self, channel_id):
+        return self.builder.layout_note(channel_id) if self.builder else ''
+
+    def prime_layout(self, message, content):
+        if self.builder:
+            self.builder.prime_layout(message, content)
 
     def is_owner(self, message):
         return bool(self.owner_id) and str(message.author.id) == self.owner_id
@@ -106,6 +118,8 @@ class Actions:
         must not be hijacked.
         """
         t = (text or '').strip()
+        if self.builder and await self.builder.handle(message, t):
+            return True
         explicit=re.fullmatch(r'announce schedule ([^|]{3,80})\|\s*(everyone|quiet)\s*\|\s*#?([a-z0-9_-]{1,32})\s*\|\s*(.{5,600})',t,re.I|re.S)
         if explicit:
             when,scope,channel,draft=explicit.groups()
@@ -203,6 +217,10 @@ class Actions:
 
     async def maybe_execute(self, message, reply):
         """Execute a leading [[do:...]] marker; return the final reply text."""
+        if self.builder:
+            plan = self.builder.plan(message, reply)
+            if plan is not None:
+                return plan
         scheduled=SCHEDULE_RE.fullmatch(reply or '')
         if scheduled:
             scope,channel,when,draft=scheduled.groups()
