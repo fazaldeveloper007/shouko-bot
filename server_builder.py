@@ -192,6 +192,9 @@ class Builder:
         """Return preview text for a plan marker, or None if not a plan."""
         m = PLAN_RE.match(reply or '')
         if not m:
+            if re.match(r"\s*\[\[\s*do\s*:\s*server\b", reply or '', re.I):
+                # cut-off or malformed output: never show raw JSON, never apply
+                return 'plan poora nahi aaya ya galat format mein tha. Kuch change nahi hua; chhota plan phir se bolo.'
             return None
         guild = getattr(message, 'guild', None)
         if guild is None:
