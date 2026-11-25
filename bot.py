@@ -1888,7 +1888,35 @@ def usable_generation(text):
     return bool(sanitize_mentions(clean).strip())
 
 
+# Opt-in model adjustments, selected only by GEMINI_MODEL (default untouched).
+# Per Google's migration notes for these models: no temperature/top_p/top_k,
+# thinking level "minimal" is rejected, and maxOutputTokens also counts
+# thinking tokens, so tiny caps would truncate answers.
+MODEL_COMPAT_MIN_OUTPUT = {"gemini-3.8-flash": 1024, "gemini-4-neon": 8192}
+
+
+def gemini_payload_for_model(payload, url):
+    """Return a payload adapted for gemini-3.8-flash / gemini-4-neon; others untouched."""
+    text = str(url)
+    floor = next((v for k, v in MODEL_COMPAT_MIN_OUTPUT.items()
+                  if f"/models/{k}:" in text or text.endswith(f"/models/{k}")), None)
+    if floor is None:
+        return payload
+    out = dict(payload)
+    cfg = dict(out.get("generationConfig") or {})
+    for k in ("temperature", "topP", "topK"):
+        cfg.pop(k, None)
+    think = dict(cfg.get("thinkingConfig") or {})
+    if think.get("thinkingLevel") in (None, "minimal"):
+        think["thinkingLevel"] = "low"
+    cfg["thinkingConfig"] = think
+    cfg["maxOutputTokens"] = max(int(cfg.get("maxOutputTokens") or 0), floor)
+    out["generationConfig"] = cfg
+    return out
+
+
 async def gemini_generate(payload, url=GEMINI_URL, validate=None):
+    payload = gemini_payload_for_model(payload, url)
     session = await groq_session()
     data = await retrying.post_json(session, url, label="Gemini",
         headers={"x-goog-api-key": GEMINI_API_KEY}, payload=payload, validate=validate)
