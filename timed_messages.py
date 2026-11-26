@@ -159,12 +159,14 @@ class Store:
                     or not all(type(e[k]) is int and e[k]>0 for k in ('guild','author','source','dest'))
                     or not isinstance(e['targets'],list) or len(e['targets'])>5
                     or not all(type(mid) is int and mid>0 for mid in e['targets'])
+                    or ('roles' in e and (not isinstance(e['roles'],list) or len(e['roles'])>3
+                        or not all(type(rid) is int and rid>0 for rid in e['roles'])))
                     or not isinstance(e['body'],str) or not 1<=len(e['body'])<=1200
                     or not all(type(e[k]) in (int,float) and math.isfinite(e[k]) for k in ('due','created','expires'))):
                 raise ValueError('Invalid schedule values')
             if 'kind' in e:
                 if (e['kind']!='announcement' or type(e.get('ping')) is not bool or e['targets']
-                        or 'core' in e or 'recurrence' in e or ('@everyone' in e['body'])!=e['ping']
+                        or e.get('roles') or 'core' in e or 'recurrence' in e or ('@everyone' in e['body'])!=e['ping']
                         or re.search(r'<@|@here',e['body'])):raise ValueError('Invalid announcement entry')
             if 'recurrence' in e:
                 r=e['recurrence']
@@ -185,7 +187,7 @@ class Store:
     def expire(self,data,now):
         for e in data:
             if e['status']=='preview' and now>e['expires']:e.update(status='cancelled',reason='preview_expired')
-    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None,recurrence=None,kind=None,ping=False):
+    def create(self, *, guild,author,source,dest,targets,body,due,now,armed=False,core=None,recurrence=None,kind=None,ping=False,roles=None):
         data=self.load();self.expire(data,now)
         active=[e for e in data if e['status'] in ACTIVE]
         if len(active)>=1000 or sum(e['guild']==guild for e in active)>=50 or sum(e['author']==author and e['guild']==guild for e in active)>=10:
@@ -193,6 +195,7 @@ class Store:
         e=dict(id=uuid.uuid4().hex[:10],guild=guild,author=author,source=source,dest=dest,targets=targets,body=body,due=due,created=now,expires=now+120,status='scheduled' if armed else 'preview',reason='confirmed' if armed else 'awaiting_confirmation')
         if kind is not None:e.update(kind=kind,ping=ping)
         if core:e['core']=core
+        if roles:e['roles']=list(roles)
         if recurrence is not None:e['recurrence']=recurrence
         data.append(e);self.save(data);return e
     def control(self,ident,guild,author,action,now,owner=False):
@@ -226,7 +229,16 @@ def access(client,e):
             raise ValueError('Announcement everyone permission missing.')
     targets=[guild.get_member(mid) for mid in e['targets']]
     if any(m is None or m.bot for m in targets):raise ValueError('Koi target ab server mein verify nahi hua.')
-    return dest,targets
+    roles=[]
+    for rid in e.get('roles') or []:
+        role=guild.get_role(rid) if hasattr(guild,'get_role') else None
+        if role is None or role.is_default():raise ValueError('Koi role ab server mein verify nahi hua.')
+        roles.append(role)
+    if roles:
+        # A role ping that cannot notify is a silent failure; refuse instead.
+        mention_all=getattr(dest.permissions_for(me),'mention_everyone',False)
+        if any(not r.mentionable and not mention_all for r in roles):raise ValueError('Role ping permission missing.')
+    return dest,targets,roles
 
 
 def clean_wording(text):
@@ -295,7 +307,7 @@ class Worker:
                 self.record_skip(e,clock,'before_send',previous_tick)
                 finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
             if not self.connected() or not self.client.is_ready():return
-            try:dest,targets=access(self.client,e)
+            try:dest,targets,roles=access(self.client,e)
             except ValueError:
                 e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
             # AI wording is optional polish with an 8s cap. Any failure keeps
@@ -316,15 +328,15 @@ class Worker:
                     self.record_skip(e,clock,'after_wording',previous_tick)
                     finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
                 if not self.connected() or not self.client.is_ready():return
-                try:dest,targets=access(self.client,e)
+                try:dest,targets,roles=access(self.client,e)
                 except ValueError:
                     e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
                 if text:
-                    prefix=' '.join(f'<@{t}>' for t in e['targets'])
+                    prefix=' '.join([f'<@{t}>' for t in e['targets']]+[f'<@&{r}>' for r in e.get('roles') or []])
                     e['body']=(prefix+'\n' if prefix else '')+text
             e.update(status='dispatching',reason='send_started');self.store.save(data)
             try:
-                sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=False if e.get('kind')=='announcement' else targets,roles=False,everyone=e.get('kind')=='announcement' and e.get('ping',False),replied_user=False))
+                sent=await dest.send(e['body'],allowed_mentions=discord.AllowedMentions(users=False if e.get('kind')=='announcement' else targets,roles=False if e.get('kind')=='announcement' else (roles or False),everyone=e.get('kind')=='announcement' and e.get('ping',False),replied_user=False))
             except asyncio.CancelledError:raise
             except Exception:
                 finish_occurrence(e,'uncertain','send_outcome_unknown',time.time() if now is None else now)
