@@ -38,6 +38,8 @@ import time
 
 import discord
 
+import agent_core
+
 log = logging.getLogger('kristy.server_builder')
 
 PLAN_RE = re.compile(r"^\s*\[\[\s*do\s*:\s*server\s+plan\s*\]\]\s*(?:```(?:json)?)?\s*(\{.*\})\s*(?:```)?\s*$", re.I | re.S)
@@ -159,10 +161,46 @@ def layout_text(guild, limit=3500):
 
 
 class Builder:
-    def __init__(self, client):
+    def __init__(self, client, ledger=None):
         self.client = client
         self.pending = {}
         self.layout_notes = {}   # channel_id -> (expires, text)
+        self.ledger = ledger
+
+    def _ledger_stash_plan(self, ident, entry):
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.create('server_plan', agent_core.PENDING, ident=ident,
+                               guild=entry['guild'], channel=entry['channel'], author=entry['author'],
+                               payload={'entry': {k: v for k, v in entry.items() if k != 'expires'}},
+                               expires=agent_core.wall_from_monotonic(entry['expires']))
+        except Exception:
+            log.warning('ledger plan stash failed', exc_info=True)
+
+    def _ledger_settle_plan(self, ident, status):
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.update(ident, status=status)
+        except Exception:
+            log.warning('ledger plan settle failed', exc_info=True)
+
+    def restore_pending(self):
+        """Reload unexpired server plans after a restart so confirm/cancel
+        still resolves against the preview the owner saw."""
+        if self.ledger is None:
+            return 0
+        restored = 0
+        for row in self.ledger.pending('server_plan'):
+            try:
+                entry = dict(row['payload'].get('entry') or {})
+                entry['expires'] = time.monotonic() + max(0.0, row['expires'] - time.time())
+                self.pending[row['id']] = entry
+                restored += 1
+            except Exception:
+                log.warning('ledger plan restore skipped a row', exc_info=True)
+        return restored
 
     # ---- prompt support -------------------------------------------------
     def prime_layout(self, message, content):
@@ -215,11 +253,13 @@ class Builder:
             return f'plan valid nahi hai: {exc}. Kuch change nahi hua.'
         for k in [k for k, e in self.pending.items() if time.monotonic() > e['expires']]:
             self.pending.pop(k, None)
+            self._ledger_settle_plan(k, agent_core.EXPIRED)
         ident = secrets.token_hex(5)
         self.pending[ident] = {
             'author': message.author.id, 'channel': message.channel.id, 'guild': guild.id,
             'steps': steps, 'expires': time.monotonic() + TTL,
         }
+        self._ledger_stash_plan(ident, self.pending[ident])
         deletes = [i + 1 for i, s in enumerate(steps) if s['destructive']]
         lines = [f'server plan preview (abhi kuch change NAHI hua): {_clean(data.get("summary"), 100)}']
         for i, s in enumerate(steps, 1):
@@ -440,6 +480,7 @@ class Builder:
         reply = lambda s: message.reply(s, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         if entry is None or time.monotonic() > entry['expires']:
             self.pending.pop(ident, None)
+            self._ledger_settle_plan(ident, agent_core.EXPIRED)
             await reply('Ye server plan nahi mila ya expire ho gaya; naya plan banao. Kuch change nahi hua.')
             return True
         if message.author.id != entry['author'] or message.channel.id != entry['channel']:
@@ -451,6 +492,7 @@ class Builder:
             return True
         self.pending.pop(ident, None)   # single use
         if verb == 'cancel':
+            self._ledger_settle_plan(ident, agent_core.CANCELLED)
             await reply('Server plan cancel; kuch change nahi hua.')
             return True
         steps = entry['steps']
@@ -470,6 +512,8 @@ class Builder:
                 run.append((i, s, 'run'))
         await reply('Owner confirm mil gaya, apply kar rahi hoon...')
         lines = await self.apply(guild, message.author.id, run)
+        failed = [ln for ln in lines if ln.startswith(('fail', 'error'))]
+        self._ledger_settle_plan(ident, agent_core.FAILED if failed else agent_core.DONE)
         await reply('\n'.join(lines)[:1900])
         return True
 
