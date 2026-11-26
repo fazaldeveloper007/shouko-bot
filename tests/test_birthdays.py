@@ -1,10 +1,26 @@
 import datetime
 import os
+import struct
 import unittest
+import zlib
 from unittest.mock import patch
 
 import announcements
 from birthdays import BIRTHDAYS, BIRTHDAY_EMOJI, BIRTHDAY_LINES, BIRTHDAY_LOCAL_ART
+
+
+def make_png(w=160, h=200):
+    """Smallest honest PNG at the given size (solid colour, valid IEND)."""
+    def chunk(tag, payload):
+        return (struct.pack('>I', len(payload)) + tag + payload
+                + struct.pack('>I', zlib.crc32(tag + payload) & 0xffffffff))
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+    raw = b''.join(b'\x00' + b'\xff' * (3 * w) for _ in range(h))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
+VALID_PNG = make_png()
 
 
 class DataTests(unittest.TestCase):
@@ -41,8 +57,31 @@ class DataTests(unittest.TestCase):
         for name, path in BIRTHDAY_LOCAL_ART.items():
             self.assertIn(name, names)
             repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            self.assertTrue(os.path.isfile(os.path.join(repo_root, path)), path)
-            self.assertGreater(os.path.getsize(os.path.join(repo_root, path)), 1000)
+            full = os.path.join(repo_root, path)
+            self.assertTrue(os.path.isfile(full), path)
+            self.assertGreater(os.path.getsize(full), 1000)
+            with open(full, 'rb') as fh:
+                self.assertTrue(announcements.valid_image(fh.read()), path)
+
+
+class ImageValidationTests(unittest.TestCase):
+    def test_real_png_and_jpeg_pass(self):
+        self.assertTrue(announcements.valid_image(VALID_PNG))
+        jpg = (b'\xff\xd8' + b'\xff\xc0\x00\x11\x08'
+               + struct.pack('>HH', 200, 160) + b'\x03\x01\x11\x00\x02\x11\x00\x03\x11\x00'
+               + b'\x00' * 32 + b'\xff\xd9')
+        self.assertTrue(announcements.valid_image(jpg))
+
+    def test_magic_only_or_truncated_fails(self):
+        self.assertFalse(announcements.valid_image(b'\x89PNG\r\n\x1a\n-fake'))
+        self.assertFalse(announcements.valid_image(VALID_PNG[:-12]))  # no IEND
+        self.assertFalse(announcements.valid_image(b'<html>challenge</html>'))
+        self.assertFalse(announcements.valid_image(None))
+
+    def test_tiny_placeholder_fails(self):
+        self.assertFalse(announcements.valid_image(make_png(1, 1)))
+        self.assertFalse(announcements.valid_image(make_png(127, 400)))
+        self.assertTrue(announcements.valid_image(make_png(128, 128)))
 
     def test_neuvillette_owner_supplied_content(self):
         # Owner-supplied sample: heading + scales emoji + this line.
@@ -71,7 +110,16 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(announcements, 'save_state', lambda: None))
 
     async def fake_bytes_ok(self, url, cap):
-        return (b'\x89PNG\r\n\x1a\n-fake', 'image/png')
+        return (VALID_PNG, 'image/png')
+
+    async def fake_bytes_invalid(self, url, cap):
+        # 200 with magic bytes but a truncated body: sniff passes, the image
+        # is not complete; Discord would render it blank.
+        return (VALID_PNG[:-12], 'image/png')
+
+    async def fake_bytes_placeholder(self, url, cap):
+        # A complete but tiny placeholder image.
+        return (make_png(1, 1), 'image/png')
 
     async def fake_bytes_fail(self, url, cap):
         return (None, None)
@@ -142,6 +190,51 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
                 await announcements._birthday_check(now)
             self.assertEqual(len(self.posts), 1)
             self.assertIsNotNone(self.posts[0][3])
+
+    async def test_invalid_or_placeholder_image_never_posts_then_recovers(self):
+        now = datetime.datetime(2027, 12, 18, 9, 30)
+        with patch.dict(announcements.BIRTHDAY_LOCAL_ART, {}, clear=True):
+            for fetch in (self.fake_bytes_invalid, self.fake_bytes_placeholder):
+                p = self.patched(fetch)
+                with p[0], p[1], p[2]:
+                    await announcements._birthday_check(now)
+            self.assertFalse(self.posts)  # truncated/placeholder art never posts
+            self.assertNotIn('Neuvillette',
+                             announcements._state['birthday_done'].get('2027-12-18', []))
+            self.assertEqual(
+                announcements._state['birthday_img_fail']['2027-12-18']['Neuvillette'], 2)
+            q = self.patched(self.fake_bytes_ok)
+            with q[0], q[1], q[2]:
+                await announcements._birthday_check(now)
+            self.assertEqual(len(self.posts), 1)
+            self.assertEqual(self.posts[0][3], (VALID_PNG, 'png'))
+
+    async def test_missing_local_art_falls_back_to_cdn(self):
+        now = datetime.datetime(2027, 12, 18, 9, 30)
+        p = self.patched(self.fake_bytes_ok)
+        with patch.dict(announcements.BIRTHDAY_LOCAL_ART,
+                        {'Neuvillette': 'assets/birthdays/does-not-exist.jpg'}, clear=True):
+            with p[0], p[1], p[2]:
+                await announcements._birthday_check(now)
+        self.assertEqual(len(self.posts), 1)  # CDN art used instead of giving up
+        self.assertEqual(self.posts[0][3], (VALID_PNG, 'png'))
+
+    async def test_corrupt_local_art_falls_back_to_cdn(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bad = os.path.join(repo_root, 'assets', 'birthdays', 'test-corrupt.jpg')
+        with open(bad, 'wb') as fh:
+            fh.write(b'not an image at all')
+        try:
+            now = datetime.datetime(2027, 12, 18, 9, 30)
+            p = self.patched(self.fake_bytes_ok)
+            with patch.dict(announcements.BIRTHDAY_LOCAL_ART,
+                            {'Neuvillette': 'assets/birthdays/test-corrupt.jpg'}, clear=True):
+                with p[0], p[1], p[2]:
+                    await announcements._birthday_check(now)
+            self.assertEqual(len(self.posts), 1)
+            self.assertEqual(self.posts[0][3], (VALID_PNG, 'png'))
+        finally:
+            os.unlink(bad)
 
     async def test_ping_prefix_when_enabled(self):
         announcements.BIRTHDAY_PING = True
@@ -215,7 +308,7 @@ class NonImageBytesTests(unittest.IsolatedAsyncioTestCase):
                 announcements._state['birthday_img_fail']['2027-12-18']['Neuvillette'], 3)
             # real image later in the window: posts, named by sniffed type
             async def fake_bytes_ok(url, cap):
-                return (b'\x89PNG\r\n\x1a\n' + b'x' * 64, 'text/html')  # wrong header, real bytes
+                return (VALID_PNG, 'text/html')  # wrong header, real bytes
             with (patch.object(announcements, '_post', self.fake_post),
                   patch.object(announcements, 'fetch_bytes', fake_bytes_ok),
                   patch.object(announcements, 'save_state', lambda: None)):
