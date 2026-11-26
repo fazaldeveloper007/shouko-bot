@@ -251,11 +251,18 @@ def clean_wording(text):
 
 
 class Worker:
-    def __init__(self,client,store,late_seconds=120,connected=lambda:True,rewrite=None,rewrite_timeout=8):
+    def __init__(self,client,store,late_seconds=120,connected=lambda:True,rewrite=None,rewrite_timeout=8,recorder=None):
         self.client,self.store,self.late=client,store,late_seconds
         self.rewrite,self.rewrite_timeout=rewrite,rewrite_timeout
+        self.recorder=recorder
         self.task=None;self.halted=False;self.connected=connected
         self.started_at=None;self.last_tick_at=None
+    def _record(self,e):
+        """Record a delivery outcome into the shared ledger (if wired): the
+        durable execution-truth trail for fired reminders/announcements."""
+        if self.recorder is None:return
+        try:self.recorder(dict(e))
+        except Exception:log.warning('delivery recorder failed',exc_info=True)
     def start(self):
         if not self.halted and (self.task is None or self.task.done()):self.task=asyncio.create_task(self.run())
     async def close(self):
@@ -305,11 +312,13 @@ class Worker:
             e=due[0]
             if clock-e['due']>self.late:
                 self.record_skip(e,clock,'before_send',previous_tick)
-                finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
+                finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data)
+                self._record(e);continue
             if not self.connected() or not self.client.is_ready():return
             try:dest,targets,roles=access(self.client,e)
             except ValueError:
-                e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
+                e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data)
+                self._record(e);continue
             # AI wording is optional polish with an 8s cap. Any failure keeps
             # the saved text, so delivery never depends on the API. After the
             # wait, state is reread and deadline, cancel and access are all
@@ -326,11 +335,13 @@ class Worker:
                 e=cur
                 if clock-e['due']>self.late:
                     self.record_skip(e,clock,'after_wording',previous_tick)
-                    finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data);continue
+                    finish_occurrence(e,'missed','late_over_2min',clock,late_seconds=self.late);self.store.save(data)
+                    self._record(e);continue
                 if not self.connected() or not self.client.is_ready():return
                 try:dest,targets,roles=access(self.client,e)
                 except ValueError:
-                    e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data);continue
+                    e.update(status='failed',reason='access_or_member_check_failed');self.store.save(data)
+                    self._record(e);continue
                 if text:
                     prefix=' '.join([f'<@{t}>' for t in e['targets']]+[f'<@&{r}>' for r in e.get('roles') or []])
                     e['body']=(prefix+'\n' if prefix else '')+text
@@ -350,6 +361,7 @@ class Worker:
                     fresh[ix]=e;break
             try:self.store.save(fresh)
             except (OSError,ValueError,TypeError):self.halted=True;raise
+            self._record(e)
             log.info('Schedule delivery status=%s reason=%s',e['status'],e['reason'])
 
 
