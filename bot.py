@@ -61,6 +61,7 @@ import schedule_commands
 import delete_own
 import actions
 import announcements
+import agent_core
 
 # Local dev convenience: load a .env file if one exists
 try:
@@ -568,7 +569,15 @@ class KristyClient(discord.Client):
             await _schedule_worker.close()
         if getattr(self, 'music', None):
             await self.music.close()
-        await super().close()
+        try:
+            await super().close()
+        finally:
+            ledger = globals().get('_ledger')
+            if ledger is not None:
+                try:
+                    ledger.close()
+                except Exception:
+                    pass
 
 client = KristyClient(intents=intents)
 # Disabled by default until separately approved deployment/setup.
@@ -2629,6 +2638,45 @@ async def think(channel_id, diary_block="", image_parts=None, extra_system=""):
     return await think_groq(channel_id, diary_block, extra_system)
 
 _schedule_store = timed_messages.Store(self_diary.PATH.parent / 'scheduled-messages.json')
+# One persistent action ledger shared by reminders, announcements and server
+# tools: pending confirmations survive restarts, and every finished step
+# records the status it actually ended in.
+_ledger = agent_core.TaskLedger(self_diary.PATH.parent / 'action-ledger.sqlite3')
+_pending_restored = False
+
+def _restore_pending_once():
+    """Reload unexpired pending confirmations after a boot so a confirm or
+    'haan' still resolves against the preview the user saw. Once per process."""
+    global _pending_restored
+    if _pending_restored:
+        return
+    _pending_restored = True
+    try:
+        _ledger.purge_expired(time.time() - 48 * 3600)
+    except Exception:
+        log.warning('action ledger purge failed', exc_info=True)
+    try:
+        restored = _schedule_commands.restore_pending() + _actions.restore_pending()
+        if restored:
+            log.info('action ledger: restored %d pending confirmation(s)', restored)
+    except Exception:
+        log.warning('pending restore failed', exc_info=True)
+
+def _record_delivery(e):
+    """Ledger trail for a fired reminder/announcement: the status delivery
+    actually ended in (sent / missed / failed / uncertain), never assumed."""
+    try:
+        status = e.get('status')
+        _ledger.create(
+            'delivery', agent_core.DONE if status == 'sent' else agent_core.FAILED,
+            ident=f"deliv-{e.get('id', 'x')}-{int(e.get('due') or 0)}",
+            guild=e.get('guild') or '', channel=e.get('channel') or '', author=e.get('author') or '',
+            payload={'entry': {k: e.get(k) for k in ('type', 'kind', 'status', 'reason', 'series')}},
+            due=e.get('due'), result=status, last_error=e.get('reason'),
+            expires=time.time() + 7 * 86400,
+        )
+    except Exception:
+        log.warning('delivery ledger record failed', exc_info=True)
 async def reminder_wording(core):
     """Optional AI polish for a reminder line. Raises on any problem; the
     scheduler then sends its saved text instead."""
@@ -2652,10 +2700,10 @@ async def reminder_wording(core):
     raise RuntimeError("no AI key")
 
 _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected,
-                                         rewrite=reminder_wording)
-_schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+                                         rewrite=reminder_wording, recorder=_record_delivery)
+_schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID, ledger=_ledger)
 _schedule_commands.role_resolver = find_role_target
-_actions = actions.Actions(client, OWNER_ID, _schedule_store)
+_actions = actions.Actions(client, OWNER_ID, _schedule_store, ledger=_ledger)
 _schedule_commands.bot_id = lambda: client.user.id if client.user else None
 _own_deleter = delete_own.Deleter(OWNER_ID, lambda: client.user.id if client.user else None)
 _schedule_commands.health = _schedule_worker.health
@@ -2720,6 +2768,7 @@ async def on_ready():
         announcements.start(client, welcome_text_fn=call_text)
         _schedule_worker.start()
         _proactive_start()
+    _restore_pending_once()
     if client.music:
         await client.music.ready()
 
