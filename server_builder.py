@@ -166,6 +166,7 @@ class Builder:
         self.pending = {}
         self.layout_notes = {}   # channel_id -> (expires, text)
         self.ledger = ledger
+        self.executor = agent_core.Executor(ledger) if ledger is not None else None
 
     def _ledger_stash_plan(self, ident, entry):
         if self.ledger is None:
@@ -511,9 +512,18 @@ class Builder:
             else:
                 run.append((i, s, 'run'))
         await reply('Owner confirm mil gaya, apply kar rahi hoon...')
-        lines = await self.apply(guild, message.author.id, run)
-        failed = [ln for ln in lines if ln.startswith(('fail', 'error'))]
-        self._ledger_settle_plan(ident, agent_core.FAILED if failed else agent_core.DONE)
+        if self.executor is not None:
+            outcome = await self.executor.run_pending(ident,
+                handler=lambda: self.apply(guild, message.author.id, run),
+                verify=lambda lines: not any(ln.startswith(('fail', 'error')) for ln in lines))
+            if outcome.result is None:
+                await reply(f"Server plan apply nahi hua ({type(outcome.error).__name__ if outcome.error else 'verify failed'}); partial changes ho sakte hain, server khud check karo.")
+                return True
+            lines = outcome.result
+        else:
+            lines = await self.apply(guild, message.author.id, run)
+            failed = [ln for ln in lines if ln.startswith(('fail', 'error'))]
+            self._ledger_settle_plan(ident, agent_core.FAILED if failed else agent_core.DONE)
         await reply('\n'.join(lines)[:1900])
         return True
 
