@@ -253,6 +253,79 @@ def sniff_image(data):
         return 'webp'
     return None
 
+def image_dimensions(data):
+    """Return (width, height) for png/jpg/gif/webp data, else None."""
+    fmt = sniff_image(data)
+    try:
+        if fmt == 'png' and len(data) >= 24:
+            return (int.from_bytes(data[16:20], 'big'), int.from_bytes(data[20:24], 'big'))
+        if fmt == 'gif' and len(data) >= 10:
+            return (int.from_bytes(data[6:8], 'little'), int.from_bytes(data[8:10], 'little'))
+        if fmt == 'webp' and len(data) >= 30:
+            chunk = data[12:16]
+            if chunk == b'VP8X':
+                return (int.from_bytes(data[24:27], 'little') + 1,
+                        int.from_bytes(data[27:30], 'little') + 1)
+            if chunk == b'VP8 ':
+                return (int.from_bytes(data[26:28], 'little') & 0x3fff,
+                        int.from_bytes(data[28:30], 'little') & 0x3fff)
+            if chunk == b'VP8L' and len(data) >= 25:
+                b0, b1, b2, b3 = data[21], data[22], data[23], data[24]
+                w = 1 + (((b1 & 0x3f) << 8) | b0)
+                h = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+                return (w, h)
+            return None
+        if fmt == 'jpg':
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xff or data[i + 1] == 0xff:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xc0, 0xc1, 0xc2):
+                    return (int.from_bytes(data[i + 7:i + 9], 'big'),
+                            int.from_bytes(data[i + 5:i + 7], 'big'))
+                if marker == 0x01 or 0xd0 <= marker <= 0xd9:
+                    i += 2
+                    continue
+                size = int.from_bytes(data[i + 2:i + 4], 'big')
+                if size < 2:
+                    return None
+                i += 2 + size
+    except Exception:
+        return None
+    return None
+
+def image_complete(data):
+    """True when data carries its format's end marker (not a truncated body)."""
+    fmt = sniff_image(data)
+    if not data:
+        return False
+    if fmt == 'png':
+        return data[-12:] == b'\x00\x00\x00\x00IEND\xaeB\x60\x82'
+    if fmt == 'jpg':
+        return data[-2:] == b'\xff\xd9'
+    if fmt == 'gif':
+        return data[-1:] == b';'
+    if fmt == 'webp':
+        return len(data) >= 12 and int.from_bytes(data[4:8], 'little') + 8 == len(data)
+    return False
+
+# Real splash/icon art is far above this on both axes; a placeholder or stub
+# image is not.
+MIN_ART_DIM = 128
+
+def valid_image(data):
+    """Full proof the bytes are a real, complete image: known format, sane
+    dimensions, intact stream. Magic bytes alone can pass on a truncated or
+    placeholder body, which Discord then renders as a blank image."""
+    if not data:
+        return False
+    dims = image_dimensions(data)
+    if not dims or dims[0] < MIN_ART_DIM or dims[1] < MIN_ART_DIM:
+        return False
+    return image_complete(data)
+
 # --------------------------------------------------------------------------
 # game8 codes page parsing
 # --------------------------------------------------------------------------
@@ -673,9 +746,13 @@ async def _birthday_check(now):
             done.append(name)
             save_state()
             continue
-        # The photo is the point of the wish: never post without it. A failed
-        # art load retries on the next tick inside the window; if the window
-        # ends first, today's wish is skipped (logged), like the morning post.
+        # The photo is the point of the wish: never post without it, and never
+        # post bytes that only claim to be an image (an error/challenge page or
+        # a truncated/placeholder body renders as a blank image in Discord).
+        # A failed or invalid load retries on the next tick inside the window;
+        # if the window ends first, today's wish is skipped (logged), like the
+        # morning post. Local art is preferred; a missing or invalid local file
+        # falls back to the CDN instead of blocking the wish.
         local = BIRTHDAY_LOCAL_ART.get(name)
         data, ctype = (None, None)
         if local:
@@ -685,15 +762,18 @@ async def _birthday_check(now):
                 if not data:
                     raise OSError("empty file")
                 ctype = 'image/jpeg' if local.lower().endswith(('.jpg', '.jpeg')) else 'image/png'
+                if not valid_image(data):
+                    log.warning("announcements: local birthday art for %s is not a "
+                                "complete image (%s); falling back to CDN", name, local)
+                    data, ctype = (None, None)
             except OSError:
-                log.warning("announcements: birthday art file unreadable for %s (%s)", name, local)
-        else:
+                log.warning("announcements: birthday art file unreadable for %s (%s); "
+                            "falling back to CDN", name, local)
+                data = None
+        if data is None:
             data, ctype = await fetch_bytes(url, BIRTHDAY_IMAGE_CAP)
-            if data and sniff_image(data) is None:
-                # 200 but not an image (error/challenge page, truncated body):
-                # posting it would show the wish with no photo. Count it as a
-                # failed load and retry on the next tick inside the window.
-                log.warning("announcements: birthday art for %s is not an image "
+            if data and not valid_image(data):
+                log.warning("announcements: birthday art for %s failed image validation "
                             "(ctype=%r, %d bytes); treating as failed load",
                             name, ctype, len(data))
                 data = None
