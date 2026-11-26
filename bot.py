@@ -2689,6 +2689,9 @@ async def reminder_intent(original, followup, anchor):
     raw = re.sub(r"^```(?:json)?|```$", "", raw).strip()
     return json.loads(raw)
 _schedule_commands.intent = reminder_intent
+# Recent channel lines for reminder continuity: the model may read them, but
+# only the requester's own lines ever validate time/tag wording.
+_schedule_commands.history_provider = lambda message: list(history.get(message.channel.id, ()))
 
 _voice_cache_connected = False
 _roster_clarifications = voice_roster.Clarifications()
