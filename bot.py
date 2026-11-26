@@ -1891,21 +1891,29 @@ def should_respond(message):
         return True
     return False
 
-def _public_source(guild):
-    """can_view(guild_id, channel_id): the source channel still exists in this
-    guild and @everyone can read it right now. Fails closed on any doubt."""
-    def can_view(gid, cid):
-        try:
-            if guild is None or getattr(guild, 'id', None) != gid:
-                return False
-            ch = guild.get_channel(cid)
-            if ch is None:
-                return False
-            perms = ch.permissions_for(guild.default_role)
-            return bool(getattr(perms, 'view_channel', False))
-        except Exception:
-            return False
-    return can_view
+def shared_memory_block(message, user_id, load=diary.load):
+    """Prompt block with other mentioned members' remembered facts.
+
+    Safe first version: only facts recorded in this EXACT channel (threads have
+    their own ids) of this guild, so nothing crosses channel, thread, voice or
+    guild boundaries. Never raises; any doubt means no shared facts.
+    """
+    try:
+        gid = getattr(getattr(message, 'guild', None), 'id', None)
+        cid = getattr(getattr(message, 'channel', None), 'id', None)
+        if not isinstance(gid, int) or not isinstance(cid, int):
+            return ""
+        blocks = []
+        for m in list(getattr(message, 'mentions', None) or [])[:5]:
+            mid = getattr(m, 'id', None)
+            if not isinstance(mid, int) or mid == user_id or getattr(m, 'bot', False):
+                continue
+            blk = diary.shared_block(load(mid), getattr(m, 'display_name', ''), gid, cid)
+            if blk:
+                blocks.append(blk)
+        return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
+    except Exception:
+        return ""
 
 
 def with_diary(prompt, diary_block):
@@ -2929,20 +2937,9 @@ async def on_message(message):
     try:
         diary_block = diary.prompt_block(diary.load(user_id), speaker)
         diary_block += self_diary.prompt(message.guild.id)
-        # Shared server memory: a mentioned member's facts, but only ones said
-        # in channels @everyone can still read - unknown provenance and
-        # restricted/deleted channels stay speaker-only.
-        can_view = _public_source(message.guild)
-        shared = []
-        for m in list(getattr(message, 'mentions', None) or [])[:5]:
-            mid = getattr(m, 'id', None)
-            if not isinstance(mid, int) or mid == user_id or getattr(m, 'bot', False):
-                continue
-            blk = diary.shared_block(diary.load(mid), getattr(m, 'display_name', ''), can_view)
-            if blk:
-                shared.append(blk)
-        if shared:
-            diary_block += "\n\n" + "\n\n".join(shared)
+        # Shared server memory (same-channel only): facts remembered about a
+        # mentioned member from THIS channel, never from other channels or guilds.
+        diary_block += shared_memory_block(message, user_id)
     except Exception as e:
         log.warning("Diary load failed for %s: %s", user_id, e)
         diary_block = ""
