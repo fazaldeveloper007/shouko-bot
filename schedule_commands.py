@@ -9,6 +9,7 @@ import timed_messages as tm
 HELP = ('Kristy remind me 10 min baad pani peene\n'
         'Kristy remind me tagging Mayank 10 min baad to watch anime\n'
         'Kristy schedule kal 8 PM | #text-channel | Mayank, Naiyo | message\n'
+        'Role ping bhi chalta hai: "tag @Role Name" ya native @role mention; role mentionable hona chahiye\n'
         'Kisi message ko reply karke: 5 min baad same message dena\n'
         'Repeats: every day 9 PM / every Monday 9 PM / every month on 15 at 9 PM\n'
         'schedule list / schedule cancel ID (repeat ID cancels entire series)')
@@ -47,21 +48,39 @@ def _strip_lead(text):
 
 
 
-_CLOCK=re.compile(r"\b(?:(aaj|today|kal|tomorrow)\s+)?(?:at\s+|@\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",re.I)
+_CLOCK=re.compile(r"\b(?:(aaj|today|kal|tomorrow)\s+)?(?:at\s+|@\s*)?(\d{1,2})(?::|\.)?(\d{2})?\s*(am|pm)\b",re.I)
 _CLOCK24=re.compile(r"(?<![\d:-])(?:(\d{4}-\d{2}-\d{2})\s+|(?:at\s+)?)([01]?\d|2[0-3]):([0-5]\d)\b(?!\s*(?:am|pm))",re.I)
 _REL=re.compile(r"\b(?:after|in)\s+(\d+)\s*(min(?:ute)?s?|hours?|hrs?)\b|\b(\d+)\s*(min(?:ute)?s?|hours?|hrs?|ghant[ae])\s+baad\b",re.I)
 _APPROX=re.compile(r"(?:almost|around|approx\w*|about|nearly|lagbhag|takriban|roughly|~)\W*$",re.I)
 
-def _tagged_in(text):
-    """Names the user wrote after a tag/ping word ('tag Mayank, Naiyo')."""
-    out=[]
-    for m in _TAG_NAME.finditer(text):
-        out.append(m[1].strip('.,!'));end=m.end()
-        while True:
-            n=_NAME_LIST.match(text,end)
-            if not n:break
-            out.append(n[1].strip('.,!'));end=n.end()
-    return out
+def _tag_requested(text, name):
+    """The named target appears next to the user's own tag/ping wording:
+    after it ('tag Mayank', 'ping: VC Member', 'tag A, B'), or in Hindi
+    post-position ('VC Member ko tag karna', '@role yeh wala tag use karke').
+    Multi-word names are matched whole; the model cannot invent a target the
+    user never named with a tag/ping marker."""
+    words = r'\s+'.join(re.escape(w) for w in (name or '').split())
+    if not words:
+        return False
+    after = rf'\b(?:tag(?:ging|ged)?|ping(?:ing|ed)?)\b\s*[:,.\-]?\s*(?:@?[\w.\-]+\s*(?:,|\band\b|\baur\b)\s*)*@?{words}(?![\w.])'
+    before = rf'(?<![\w.])@?{words}\s+(?:(?:ko|yeh|ye|wala|wali|use|karke|kar|karna|please|plz)\s+)*(?:tag|ping)\b'
+    return bool(re.search(after, text, re.I) or re.search(before, text, re.I))
+
+
+def _native_role_tagged(text, role_id):
+    """A native <@&id> role mention the user clearly meant as a ping target:
+    tag/ping word before it, or Hindi tag phrasing right after it."""
+    after = rf'\b(?:tag(?:ging|ged)?|ping(?:ing|ed)?)\b\s*[:,.\-]?\s*(?:@?[\w.\-]+\s*(?:,|\band\b|\baur\b)\s*)*<@&{role_id}>'
+    before = rf'<@&{role_id}>\s+(?:(?:ko|yeh|ye|wala|wali|use|karke|kar|karna|please|plz)\s+)*(?:tag|ping)\b'
+    return bool(re.search(after, text, re.I) or re.search(before, text, re.I))
+
+
+# Conditional follow-ups ('if I don't reply in 5 mins then message ...') are a
+# capability the scheduler does not have; never silently save only part of one.
+_CONDITIONAL = re.compile(
+    r"\b(?:if|agar)\b[^.\n]{0,50}\b(?:don'?t|do not|dont|nahi|nhi|no|na)\b[^.\n]{0,25}\b(?:reply|respond|answer|jawab|message|aaye?|aata|mile)\b"
+    r"|\bwarna\b[^.\n]{0,30}\b(?:message|reply|tag|ping|bhej|bol|bata)\b"
+    r"|\botherwise\b[^.\n]{0,30}\b(?:message|reply|tag|ping|text)\b", re.I)
 
 def time_candidates(text,anchor):
     """Time expressions the USER wrote, as (due, when_string, anchor, kind, approximate)."""
@@ -173,10 +192,20 @@ def pick_time(ai_when,sources):
         return (when,a),None
     return None,'Kab? Time likho, jaise: aaj 3:30 PM ya 10 minute baad'
 
+def _guild_role(guild,role_id):
+    getter=getattr(guild,'get_role',None)
+    role=getter(role_id) if getter else None
+    if role is None:return None
+    is_default=getattr(role,'is_default',None)
+    if callable(is_default) and is_default():return None
+    return role
+
+
 class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
         self.pending={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
+        self.role_resolver=None
     def key(self,message):return message.guild.id,message.channel.id,message.author.id
     def pending_item(self,message):
         now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
@@ -334,12 +363,16 @@ class Commands:
         request=(orig+'\n'+text) if orig else text
         if anchor is None:
             await self.reply(message,'Original message ka time verify nahi hua; kuch save nahi hua.');return True
-        # Role targets must never disappear into an author-only success.
-        # Existing reminder storage/dispatch supports human members, not roles.
-        if re.search(r'<@&\d+>',request):
-            self.pending.pop(self.key(message),None)
-            await self.reply(message,'Role ping abhi reminder scheduler mein supported nahi hai; reminder save nahi hua. Individual members do, ya role support fix ka wait karo.')
-            return True
+        # Conditional follow-ups ('if I don't reply in 5 mins then ...') are not
+        # a scheduler capability. Ask once on the first turn instead of silently
+        # saving only part of the request; the kept text drops the condition so a
+        # consenting follow-up is not confused by its extra time words.
+        if orig is None:
+            cond=_CONDITIONAL.search(request)
+            if cond:
+                kept=request[:cond.start()].strip(' .,!?') or request
+                await self.clarify(message,'Conditional reminder (jaise "agar reply na aaye toh message karna") abhi supported nahi hai. Bina condition ka plain reminder set kar doon? Time aur kaam wahi rakhti hoon.',kept,anchor)
+                return True
         intent=None
         if self.intent is not None:
             try:intent=await self.intent(orig,text,anchor)
@@ -372,6 +405,10 @@ class Commands:
             when=' '.join(when.split());task=' '.join(task.split()).strip(' .,!')
             if not task or not when or len(when)>40 or len(task)>300:
                 await self.clarify(message,'Kab aur kya? Time aur reminder ka kaam ek line mein likho.',request,anchor);return True
+            # A condition inside the task is an unsupported capability, stated
+            # plainly instead of saving it as flat reminder text.
+            if _CONDITIONAL.search(task):
+                await self.clarify(message,'Reminder ke kaam mein condition (if/agar/warna) save nahi kar sakti. Bina condition ka kaam ek line mein likho.',request,anchor);return True
             # The task must be the user's own words, not a model invention.
             words=[w for w in re.findall(r"[\w']+",task.casefold()) if len(w)>=3]
             low=request.casefold()
@@ -396,22 +433,32 @@ class Commands:
                 if not re.search(rf'\b(?:tag(?:ging)?|ping(?:ing)?)\s+(?:[\w.\-]+\s*(?:,|and|aur)\s*)*<@!?{m_id}>',request,re.I):
                     await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor);return True
             targets+=mentioned
+            roles=[]
+            for r_id in re.findall(r'<@&(\d+)>',request):
+                # A native role mention must be the user's own ping choice.
+                if not _native_role_tagged(request,r_id):
+                    await self.clarify(message,'Kis role ko tag karna hai? "tag @role" likho.',request,anchor);return True
+                roles.append(r_id)
             for name in names:
                 if not isinstance(name,str) or not name.strip() or len(name)>40:raise TypeError
                 clean=name.strip().lstrip('@')
-                # a tagged person must be named after a tag/ping word in the user's text
-                if not any(clean.casefold()==n.casefold() for n in _tagged_in(request)):
+                # a tagged target must be named with tag/ping wording in the user's text
+                if not _tag_requested(request,clean):
                     await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor);return True
                 member=self.resolver(message.guild,clean)[0]
-                if member is None or member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
-                targets.append(str(member.id))
-            targets=list(dict.fromkeys(targets))
+                if member is not None:
+                    if member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
+                    targets.append(str(member.id));continue
+                role=self.find_role(message.guild,clean)
+                if role is None:raise ValueError(f'"{name}" member ya role nahi mila; exact name ya native @mention do.')
+                roles.append(str(role.id))
+            targets=list(dict.fromkeys(targets));roles=list(dict.fromkeys(roles))
             # the model cannot drop the author's tag unless the user said so
             tag_author=not (intent.get('tag_author') is False and re.search(r"(?:don't|do not|dont|mat|without|no)\s+tag|tag\s+(?:mat|nahi|nhi)",request,re.I))
-            if len(targets)==1 and tag_author:
+            if len(targets)==1 and tag_author and not roles:
                 parts=[when,dest,task];kind='remind'
             else:
-                parts=[when,dest,', '.join(f'<@{t}>' for t in targets),task];kind='schedule'
+                parts=[when,dest,', '.join([f'<@{t}>' for t in targets]+[f'<@&{r}>' for r in roles]),task];kind='schedule'
             await self._commit(message,client,kind,parts,time.time(),when_anchor)
             self.pending.pop(self.key(message),None)
         except (ValueError,TypeError) as exc:
@@ -420,6 +467,17 @@ class Commands:
         except OSError:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
         return True
+
+    def find_role(self,guild,name):
+        """Resolve a role by the exact name the user gave; never a guess.
+        Single exact non-default match only; anything else stays unclear."""
+        want=(name or '').strip().lstrip('@').casefold()
+        if not want or guild is None:return None
+        if self.role_resolver is not None:
+            return self.role_resolver(guild,name)[0]
+        matches=[r for r in (getattr(guild,'roles',None) or [])
+                 if not getattr(r,'is_default',lambda:False)() and getattr(r,'name','').casefold()==want]
+        return matches[0] if len(matches)==1 else None
 
     async def _commit(self,message,client,kind,parts,now,anchor):
         guild=message.guild
@@ -435,7 +493,9 @@ class Commands:
         elif re.fullmatch(r'<#\d+>',destination):dest=guild.get_channel(int(destination[2:-1]))
         else:raise ValueError('Destination here ya ek native #text-channel mention hona chahiye.')
         if dest is None:raise ValueError('Destination is server mein verify nahi hua.')
-        targets=[]
+        if getattr(dest,'type',discord.ChannelType.text)!=discord.ChannelType.text:
+            raise ValueError('Reminder ping sirf text channel mein ja sakta hai; voice channel mein nahi. Text channel do ya bina channel ke yahin bhejo.')
+        targets=[];roles=[]
         if kind=='remind':targets=[message.author];body=parts[2]
         else:
             raw_targets=parts[2]
@@ -443,17 +503,31 @@ class Commands:
             if raw_targets.casefold() not in ('none','koi nahi'):
                 for raw in re.split(r'\s*,\s*|\s+aur\s+|\s+and\s+',raw_targets):
                     native=re.fullmatch(r'<@!?(\d+)>',raw)
+                    native_role=re.fullmatch(r'<@&(\d+)>',raw)
+                    if native_role:
+                        role=_guild_role(guild,int(native_role[1]))
+                        if role is None:raise ValueError('Role ab server mein verify nahi hua; native @role mention dobara do.')
+                        if role.id not in [r.id for r in roles]:roles.append(role)
+                        continue
                     member=guild.get_member(int(native[1])) if native else self.resolver(guild,raw)[0]
                     if member is None or member.bot:raise ValueError('Target unclear/bot/left: exact username ya native member mention do.')
                     if member.id not in [t.id for t in targets]:targets.append(member)
         if len(targets)>5:raise ValueError('Maximum 5 targets, ek hi scheduled ping per job.')
+        if len(roles)>3:raise ValueError('Maximum 3 role pings, ek hi scheduled ping per job.')
+        if roles:
+            # A role ping that cannot notify would be a silent failure: refuse now.
+            me=getattr(guild,'me',None)
+            mention_all=bool(me is not None and getattr(dest.permissions_for(me),'mention_everyone',False))
+            if any(not getattr(r,'mentionable',False) and not mention_all for r in roles):
+                raise ValueError('Is role ka ping silent ho jayega: role mentionable nahi hai aur mere paas Mention Roles permission nahi. Role settings mein "Allow anyone to @mention this role" on karo ya mujhe permission do, phir dobara set karo.')
         if not body or len(body)>1000:raise ValueError('Exact message 1-1000 characters ka do.')
         if re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
             raise ValueError('Payload mein mention/command markers nahi; tags sirf target field se do.')
         core=None
         if reminder:core=body;body=f'Reminder: {body}'
-        full=(' '.join(f'<@{t.id}>' for t in targets)+'\n' if targets else '')+body
-        draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],body=full,due=due,core=core,recurrence=recurrence)
+        prefix=' '.join([f'<@{t.id}>' for t in targets]+[f'<@&{r.id}>' for r in roles])
+        full=(prefix+'\n' if prefix else '')+body
+        draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],roles=[r.id for r in roles],body=full,due=due,core=core,recurrence=recurrence)
         tm.access(client,draft)
         entry=self.store.create(**draft,now=now,armed=True)
         self.pending.pop(self.key(message),None)
@@ -466,8 +540,6 @@ class Commands:
         # message are data). No AI or quoted old messages can call this handler.
         header=text.split('|',1)[0]
         if guard(message,header,question=True) is None:return False
-        if re.search(r'<@&\d+>',header) and (INTENT.search(header) or re.match(r'^(?:remind|schedule|summon)\b',header,re.I)):
-            await self.reply(message,'Role ping abhi reminder scheduler mein supported nahi hai; reminder save nahi hua. Role target ko silently requester se replace nahi karungi.');return True
         m=re.match(r'^(?:(?:ok+|okay|hey|please|plz|bhai|toh|abhi|kristy)[\s,]+)*(schedule|remind(?:er)?|summon)\b\s*(.*)$',text,re.I|re.S)
         if not m and getattr(message,'reference',None) is not None and REPEAT.search(text):
             return await self.repeat(message,text)
