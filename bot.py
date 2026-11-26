@@ -1407,6 +1407,20 @@ def find_tag_target(guild, name):
     return None, True
 
 
+def find_role_target(guild, name):
+    """Resolve a role by the exact name the user gave. Returns (role, unclear):
+    role only on one exact non-default match; never a fuzzy guess."""
+    if guild is None:
+        return None, True
+    n = (name or "").strip().lstrip("@").casefold()
+    if not n:
+        return None, True
+    matches = [r for r in guild.roles if not r.is_default() and r.name.casefold() == n]
+    if len(matches) == 1:
+        return matches[0], False
+    return None, True
+
+
 def resolve_tag_requests(message, text):
     """Swap the model's [[tag:name]] markers for real mentions of verified
     members. Ambiguous or unknown names become plain @name text (no ping) and
@@ -2612,6 +2626,7 @@ async def reminder_wording(core):
 _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lambda: _voice_cache_connected,
                                          rewrite=reminder_wording)
 _schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID)
+_schedule_commands.role_resolver = find_role_target
 _actions = actions.Actions(client, OWNER_ID, _schedule_store)
 _schedule_commands.bot_id = lambda: client.user.id if client.user else None
 _own_deleter = delete_own.Deleter(OWNER_ID, lambda: client.user.id if client.user else None)
@@ -2637,7 +2652,8 @@ async def reminder_intent(original, followup, anchor):
         "Support daily at one time, weekly on one weekday, or monthly on one numeric date 1-28, no end date. Dates 29-31 require a short-month policy, so ask for a date 1-28 rather than guessing. Ask for missing monthly date, weekday, time, AM-PM or unsupported recurrence. "
         "Use only numbers the user actually wrote; do not calculate times. "
         "'task' is the short thing to remind about (no @, no #, no names of people). "
-        "'tag_names' only lists OTHER people the user asked to tag (not the user: 'me', 'mujhe'). "
+        "'tag_names' only lists OTHER people or roles the user asked to tag (not the user: 'me', 'mujhe'); copy the exact written name, which can be multi-word like 'VC Member'. "
+        "If the request attaches a CONDITION (e.g. 'if I don't reply in 5 mins then message X'), Kristy cannot do conditional follow-ups: reply need_info with a short Hinglish question saying the conditional part is not supported and asking whether to set the plain reminder without it. Only when the user then agrees, return remind without the condition. "
         "'tag_author' is true unless the user clearly does not want to be tagged.\n"
         "- need_info: a reminder request but time or task is missing/unclear; put a short Hinglish question in 'question'.\n"
         "- none: not a reminder request, or the followup is unrelated.\n" + data)
