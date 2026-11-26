@@ -204,6 +204,67 @@ class BuilderLedgerTests(unittest.TestCase):
         self.assertGreater(builder2.pending['plan2']['expires'], time.monotonic())
 
 
+class ExecutorTests(unittest.IsolatedAsyncioTestCase):
+    """The shared execution boundary: one path that creates the task row,
+    runs the feature handler (adapter), verifies the actual result and
+    records the outcome. Never claims done on an unverified result and
+    never retries an uncertain outcome."""
+    def make(self):
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        return led, agent_core.Executor(led)
+
+    async def test_run_success_records_done(self):
+        led, ex = self.make()
+        outcome = await ex.run('reminder', handler=lambda: {'id': 'x'},
+                               verify=lambda r: agent_core.verify_saved(types.SimpleNamespace(load=lambda: [{'id': 'x'}]), r['id']),
+                               guild=1, channel=2, author=3, result_of=lambda r: 'saved')
+        self.assertTrue(outcome.ok)
+        row = led.get(outcome.ident)
+        self.assertEqual(row['status'], agent_core.DONE)
+        self.assertEqual(row['result'], 'saved')
+
+    async def test_handler_failure_records_failed_and_never_retries(self):
+        led, ex = self.make()
+        calls = []
+        def boom():
+            calls.append(1)
+            raise OSError('disk')
+        outcome = await ex.run('reminder', handler=boom, guild=1, channel=2, author=3)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(len(calls), 1)
+        row = led.get(outcome.ident)
+        self.assertEqual(row['status'], agent_core.FAILED)
+        self.assertEqual(row['last_error'], 'OSError')
+
+    async def test_verify_failure_records_failed(self):
+        led, ex = self.make()
+        outcome = await ex.run('reminder', handler=lambda: {'id': 'x'}, verify=lambda r: None,
+                               guild=1, channel=2, author=3)
+        self.assertFalse(outcome.ok)
+        self.assertEqual(led.get(outcome.ident)['last_error'], 'verify_failed')
+
+    async def test_run_pending_updates_the_same_row(self):
+        led, ex = self.make()
+        ident = led.create('announce_preview', agent_core.PENDING, guild=1, channel=2, author=3, payload={})
+        async def send():
+            return 'msg-1'
+        outcome = await ex.run_pending(ident, send, result_of=lambda r: 'posted')
+        self.assertTrue(outcome.ok)
+        row = led.get(ident)
+        self.assertEqual(row['status'], agent_core.DONE)
+        self.assertEqual(row['result'], 'posted')
+
+    async def test_async_handler_and_verify(self):
+        led, ex = self.make()
+        async def handler():
+            return {'id': 'y'}
+        async def verify(r):
+            return True
+        outcome = await ex.run('reminder', handler=handler, verify=verify, guild=1, channel=2, author=3)
+        self.assertTrue(outcome.ok)
+
+
 class RestartContinuationTests(unittest.TestCase):
     """Conversational continuation reads the restored shared state: a
     clarification staged before a restart resolves from the same pending
@@ -265,6 +326,89 @@ class ActionsRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         self.assertEqual(act2.pending, {})
         self.assertEqual(act2.ledger.get('abc123')['status'], agent_core.CANCELLED)
+
+
+    async def test_restored_preview_confirms_through_executor(self):
+        """Normal-language continuation after restart: the owner answers the
+        restored preview and the action executes through the shared executor,
+        recording the verified outcome on the same task row."""
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        sent_msg = types.SimpleNamespace(jump_url='https://discord.com/channels/10/20/42')
+        channel_obj = types.SimpleNamespace(id=20, send=AsyncMock(return_value=sent_msg))
+        client = types.SimpleNamespace(music=None, get_channel=lambda cid: channel_obj)
+        store = types.SimpleNamespace(load=lambda: [], save=lambda data: None)
+        os.environ['KRISTY_SERVER_BUILDER'] = '0'
+        self.addCleanup(lambda: os.environ.pop('KRISTY_SERVER_BUILDER', None))
+        act = actions.Actions(client, '111', store, ledger=led)
+        entry = {'author': 30, 'channel': 20, 'guild': 10, 'scope': 'here',
+                 'text': 'hello', 'ping': False, 'when': None, 'expires': time.monotonic() + 300}
+        act.pending['abc123'] = entry
+        act._ledger_stash_preview('abc123', entry)
+        led.close()
+        act2 = actions.Actions(client, '111', store, ledger=agent_core.TaskLedger(path))
+        self.assertEqual(act2.restore_pending(), 1)
+        msg = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=30),
+            channel=types.SimpleNamespace(id=20),
+            guild=types.SimpleNamespace(id=10),
+            reply=AsyncMock())
+        handled = await act2._finish(msg, 'confirm', 'abc123', act2.pending['abc123'])
+        self.assertTrue(handled)
+        row = act2.ledger.get('abc123')
+        self.assertEqual(row['status'], agent_core.DONE)
+        self.assertEqual(row['result'], 'posted')
+
+    async def test_send_failure_after_restart_never_retries_and_records(self):
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        channel_obj = types.SimpleNamespace(id=20, send=AsyncMock(side_effect=RuntimeError('gateway')))
+        client = types.SimpleNamespace(music=None, get_channel=lambda cid: channel_obj)
+        store = types.SimpleNamespace(load=lambda: [], save=lambda data: None)
+        os.environ['KRISTY_SERVER_BUILDER'] = '0'
+        self.addCleanup(lambda: os.environ.pop('KRISTY_SERVER_BUILDER', None))
+        act = actions.Actions(client, '111', store, ledger=led)
+        entry = {'author': 30, 'channel': 20, 'guild': 10, 'scope': 'here',
+                 'text': 'hello', 'ping': False, 'when': None, 'expires': time.monotonic() + 300}
+        act.pending['abc123'] = entry
+        act._ledger_stash_preview('abc123', entry)
+        led.close()
+        act2 = actions.Actions(client, '111', store, ledger=agent_core.TaskLedger(path))
+        act2.restore_pending()
+        msg = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=30),
+            channel=types.SimpleNamespace(id=20),
+            guild=types.SimpleNamespace(id=10),
+            reply=AsyncMock())
+        handled = await act2._finish(msg, 'confirm', 'abc123', act2.pending['abc123'])
+        self.assertTrue(handled)
+        self.assertEqual(channel_obj.send.await_count, 1)  # no auto-retry
+        row = act2.ledger.get('abc123')
+        self.assertEqual(row['status'], agent_core.FAILED)
+        self.assertEqual(row['result'], 'send_outcome_unknown')
+
+    async def test_other_author_cannot_confirm(self):
+        """Confirmation isolation: only the preview's author can settle it."""
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        client = types.SimpleNamespace(music=None, get_channel=lambda cid: None)
+        store = types.SimpleNamespace(load=lambda: [], save=lambda data: None)
+        os.environ['KRISTY_SERVER_BUILDER'] = '0'
+        self.addCleanup(lambda: os.environ.pop('KRISTY_SERVER_BUILDER', None))
+        act = actions.Actions(client, '111', store, ledger=led)
+        entry = {'author': 30, 'channel': 20, 'guild': 10, 'scope': 'here',
+                 'text': 'hello', 'ping': False, 'when': None, 'expires': time.monotonic() + 300}
+        act.pending['abc123'] = entry
+        act._ledger_stash_preview('abc123', entry)
+        msg = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=99),
+            channel=types.SimpleNamespace(id=20),
+            guild=types.SimpleNamespace(id=10),
+            reply=AsyncMock())
+        handled = await act._finish(msg, 'confirm', 'abc123', act.pending['abc123'])
+        self.assertTrue(handled)
+        self.assertIn('abc123', act.pending)  # untouched
+        self.assertEqual(led.get('abc123')['status'], agent_core.PENDING)
 
 
 class WorkerRecorderTests(unittest.TestCase):
