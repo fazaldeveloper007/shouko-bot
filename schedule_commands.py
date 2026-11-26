@@ -218,6 +218,7 @@ class Commands:
         self.history_provider=None
         self.role_resolver=None
         self.ledger=ledger
+        self.executor=agent_core.Executor(ledger) if ledger is not None else None
     PENDING_KINDS=('reminder_clarify','reminder_confirm')
     def _ledger_stash(self,kind,key,item):
         if self.ledger is None:return
@@ -680,27 +681,29 @@ class Commands:
         full=(prefix+'\n' if prefix else '')+body
         draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],roles=[r.id for r in roles],body=full,due=due,core=core,recurrence=recurrence)
         tm.access(client,draft)
-        entry=self.store.create(**draft,now=now,armed=True)
-        # Execution truth: claim "saved" only after a read-back confirms the
-        # job is actually on disk.
-        saved=agent_core.verify_saved(self.store,entry['id'])
-        if saved is None:
-            self._ledger_record('reminder',agent_core.FAILED,message,due=due,
-                                payload={'schedule_id':entry.get('id')},last_error='read-back verify failed')
-            self._pending_pop(self.key(message),agent_core.FAILED)
-            raise OSError('schedule save verify nahi hua')
-        self._ledger_record('reminder',agent_core.DONE,message,due=due,
-                            payload={'schedule_id':entry['id'],'recurrence':recurrence},result='saved')
-        self._pending_pop(self.key(message),agent_core.DONE)
+        if self.executor is not None:
+            # Execution boundary: the save runs through the shared executor;
+            # DONE is recorded only when the read-back verifies the job exists.
+            outcome=await self.executor.run('reminder',
+                handler=lambda:self.store.create(**draft,now=now,armed=True),
+                verify=lambda e:agent_core.verify_saved(self.store,e['id']),
+                guild=message.guild.id,channel=message.channel.id,author=message.author.id,
+                payload={'recurrence':recurrence},due=due,result_of=lambda e:'saved')
+            entry=outcome.result
+            if not outcome.ok:
+                self._pending_pop(self.key(message),agent_core.FAILED)
+                raise OSError('schedule save verify nahi hua')
+            self._pending_pop(self.key(message),agent_core.DONE)
+        else:
+            entry=self.store.create(**draft,now=now,armed=True)
+            # Execution truth: claim "saved" only after a read-back confirms the
+            # job is actually on disk.
+            saved=agent_core.verify_saved(self.store,entry['id'])
+            if saved is None:
+                self._pending_pop(self.key(message),agent_core.FAILED)
+                raise OSError('schedule save verify nahi hua')
+            self._pending_pop(self.key(message),agent_core.DONE)
         await self.reply(message,('Repeating reminder saved: '+tm.recurrence_label(entry)+'; next: '+tm.shown(due)+f". Series ID: {entry['id']}. Cancel: Kristy schedule cancel {entry['id']}. Bot time par running chahiye; missed occurrence skip hogi, series chalegi.") if recurrence else 'OK')
-    def _ledger_record(self,kind,status,message,due=None,payload=None,result=None,last_error=None):
-        if self.ledger is None:return
-        try:
-            self.ledger.create(kind,status,guild=message.guild.id,channel=message.channel.id,
-                               author=message.author.id,payload=payload,due=due,result=result,last_error=last_error)
-        except Exception:
-            log.warning('ledger record failed',exc_info=True)
-
 
     async def handle(self,message,text,client,guard):
         self.client_for_access=client
