@@ -29,6 +29,7 @@ import time
 
 import discord
 
+import agent_core
 from music.player import MusicError
 from music.ui import clean
 import timed_messages as tm
@@ -88,14 +89,52 @@ if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0':
 class Actions:
     PREVIEW_TTL = 300  # seconds
 
-    def __init__(self, client, owner_id, schedule_store):
+    def __init__(self, client, owner_id, schedule_store, ledger=None):
         self.client = client
         self.owner_id = (owner_id or '').strip()
         self.store = schedule_store
         self.pending = {}
         self.clarify_stash = {}  # (author, channel) -> interrupted draft+scope
         self.last_preview = None  # (channel, ident) awaiting its sent-message id
-        self.builder = server_builder.Builder(client) if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0' else None
+        self.ledger = ledger
+        self.builder = server_builder.Builder(client, ledger=ledger) if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0' else None
+
+    def _ledger_stash_preview(self, ident, entry):
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.create('announce_preview', agent_core.PENDING, ident=ident,
+                               guild=entry['guild'], channel=entry['channel'], author=entry['author'],
+                               payload={'entry': {k: v for k, v in entry.items() if k != 'expires'}},
+                               expires=agent_core.wall_from_monotonic(entry['expires']))
+        except Exception:
+            log.warning('ledger preview stash failed', exc_info=True)
+
+    def _ledger_settle_preview(self, ident, status, result=None):
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.update(ident, status=status, result=result)
+        except Exception:
+            log.warning('ledger preview settle failed', exc_info=True)
+
+    def restore_pending(self):
+        """Reload unexpired announcement previews (and server plans) after a
+        restart, so a pending confirm/cancel still resolves."""
+        if self.ledger is None:
+            return 0
+        restored = 0
+        for row in self.ledger.pending('announce_preview'):
+            try:
+                entry = dict(row['payload'].get('entry') or {})
+                entry['expires'] = time.monotonic() + max(0.0, row['expires'] - time.time())
+                self.pending[row['id']] = entry
+                restored += 1
+            except Exception:
+                log.warning('ledger preview restore skipped a row', exc_info=True)
+        if self.builder is not None:
+            restored += self.builder.restore_pending()
+        return restored
 
     def layout_note(self, channel_id):
         return self.builder.layout_note(channel_id) if self.builder else ''
@@ -143,6 +182,7 @@ class Actions:
         now = time.monotonic()
         for stale in [k for k, e in self.pending.items() if now > e['expires']]:
             self.pending.pop(stale, None)
+            self._ledger_settle_preview(stale, agent_core.EXPIRED)
         mine = [(k, e) for k, e in self.pending.items()
                 if e['author'] == message.author.id and e['channel'] == message.channel.id]
         if not mine:
@@ -180,14 +220,17 @@ class Actions:
             return True
         if time.monotonic() > entry['expires']:
             self.pending.pop(ident, None)
+            self._ledger_settle_preview(ident, agent_core.EXPIRED)
             await message.reply('Ye preview expire ho gaya; naya preview banao.', mention_author=False)
             return True
         self.pending.pop(ident, None)  # single-use for both verbs
         if verb == 'cancel':
+            self._ledger_settle_preview(ident, agent_core.CANCELLED)
             await message.reply('Announcement cancel kar diya; kuch post nahi hua.', mention_author=False)
             return True
         channel = self.client.get_channel(entry.get('target', entry['channel']))
         if channel is None:
+            self._ledger_settle_preview(ident, agent_core.FAILED, result='channel_inaccessible')
             await message.reply('Channel ab accessible nahi hai; announcement post nahi hua.', mention_author=False)
             return True
         if entry.get('due') is not None:
@@ -199,7 +242,12 @@ class Actions:
                     targets=[],body=entry['text'],due=entry['due'],kind='announcement',ping=entry['ping'])
                 tm.access(self.client,candidate)
                 saved=self.store.create(**candidate,now=now,armed=True)
+                # Execution truth: claim "scheduled" only after read-back.
+                if agent_core.verify_saved(self.store,saved['id']) is None:
+                    raise OSError('announcement save verify nahi hua')
+                self._ledger_settle_preview(ident,agent_core.DONE,result=f"scheduled:{saved['id']}")
             except (ValueError,OSError,TypeError):
+                self._ledger_settle_preview(ident,agent_core.FAILED)
                 await message.reply('Announcement schedule save nahi hua; time, permissions ya storage check karo. Kuch post nahi hua.',mention_author=False)
                 return True
             await message.reply(f"Announcement scheduled: {tm.shown(saved['due'])}. ID: {saved['id']}. Cancel: Kristy schedule cancel {saved['id']}. 2 minute se zyada late hua toh skip hoga.",mention_author=False)
@@ -210,8 +258,10 @@ class Actions:
             # The error may have happened after Discord accepted the message.
             # Never claim a definite failure and never auto-retry a duplicate.
             log.warning('announce send outcome unknown: %s', type(exc).__name__)
+            self._ledger_settle_preview(ident,agent_core.FAILED,result='send_outcome_unknown')
             await message.reply('Send ka result confirm nahi hua - ho sakta hai post ho gaya ho. Channel khud check karo; main apne aap dobara NAHI bhejungi. Naya preview chahiye toh phir se bolo.', mention_author=False)
             return True
+        self._ledger_settle_preview(ident,agent_core.DONE,result='posted')
         await message.reply(f'Announcement post ho gaya ✅ {sent.jump_url}', mention_author=False)
         return True
 
@@ -458,6 +508,7 @@ class Actions:
             'expires': time.monotonic() + self.PREVIEW_TTL,
             'due': due,
         }
+        self._ledger_stash_preview(ident, self.pending[ident])
         self.last_preview = (message.channel.id, ident)
         channel_name = getattr(target, 'name', '?')
         return ('announcement preview (abhi post NAHI hua):\n'
