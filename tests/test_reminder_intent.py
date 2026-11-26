@@ -93,10 +93,16 @@ class Intent(Base):
         self.ai({'action':'need_info','question':'Kab?'},{'action':'none'},{'action':'none'})
         await self.run_msg(self.msg(t0),'remind me to drink water')
         other=S(id=3,bot=False,display_name='O')
-        mo=self.msg(t0,author=other);self.assertFalse(self.cmd.followup(mo,'10 minute baad',True))
+        # A helper's addressed message MAY complete another member's open
+        # clarification (the original requester still confirms before save).
+        mo=self.msg(t0,author=other);self.assertTrue(self.cmd.followup(mo,'10 minute baad',True))
+        # An unaddressed one never hijacks it, and neither does another channel.
+        self.assertFalse(self.cmd.followup(self.msg(t0,author=other),'10 minute baad',False))
         ch2=S(id=21,guild=self.guild);mc=self.msg(t0,channel=ch2);self.assertFalse(self.cmd.followup(mc,'10 minute baad',True))
         self.assertFalse(await self.run_msg(mo,'hello there'))
-        self.assertEqual(len(self.calls),1)
+        # The helper-eligible message goes through the intent step; the model
+        # says 'none' and nothing is saved or hijacked.
+        self.assertEqual(len(self.calls),2);self.assertEqual(self.store.load(),[])
     async def test_followup_replying_to_other_message_not_matched(self):
         t0=dt.datetime.now(dt.timezone.utc);self.ai({'action':'need_info','question':'Kab?'})
         await self.run_msg(self.msg(t0),'remind me to drink water')
@@ -113,7 +119,7 @@ class Intent(Base):
         self.assertEqual(self.store.load()[0]['targets'],[1,2])
         self.ai({'action':'remind','when':'5 minute baad','task':'standup','tag_names':['Nobody']})
         m=self.msg(t0);await self.run_msg(m,'remind me and tag Nobody in 5 minute for standup')
-        self.assertEqual(len(self.store.load()),1);self.assertIn('member nahi mila',m.reply.call_args.args[0])
+        self.assertEqual(len(self.store.load()),1);self.assertIn('member ya role nahi mila',m.reply.call_args.args[0])
     async def test_model_cannot_choose_channel_or_inject_mentions(self):
         t0=dt.datetime.now(dt.timezone.utc)
         self.ai({'action':'remind','when':'5 minute baad','task':'hi @everyone <@2>','tag_names':[],'dest':'<#99>'})
@@ -206,3 +212,97 @@ class Outage(Base):
         self.ai(RuntimeError('down'));m=self.msg(dt.datetime.now(dt.timezone.utc))
         await self.run_msg(m,'remind me at 11:00 pm (almost after 19 minute) for lunch, also tag me')
         self.assertEqual(len(self.store.load()),1);self.assertIn('save nahi hua',m.reply.call_args.args[0])
+
+class HelperFlow(Base):
+    def setUp(self):
+        super().setUp()
+        self.helper=S(id=3,bot=False,display_name='Junaid')
+        self.guild.get_member=lambda i:{1:self.author,2:self.mayank,3:self.helper}.get(i)
+    def _open_pending(self,t0):
+        # Requester asks with no usable time; Kristy clarifies (reply id 700).
+        self.ai({'action':'need_info','question':'Kab bhejna hai?'})
+        m=self.msg(t0)
+        return m
+    async def test_helper_reply_stages_confirm_nothing_saved(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        target=t0.astimezone(IST)+dt.timedelta(minutes=30)
+        hh=target.strftime('%I').lstrip('0');mm=target.strftime('%M');ap=target.strftime('%p')
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        self.assertEqual(self.store.load(),[])
+        self.ai({'action':'remind','when':f'aaj {hh}:{mm} {ap}','task':'VC invite','tag_names':[],'tag_author':True})
+        m2=self.msg(t0+dt.timedelta(seconds=30),author=self.helper,ref=S(message_id=700))
+        await self.run_msg(m2,f'{hh}:{mm} {ap.lower()}')
+        self.assertEqual(self.store.load(),[])  # helper alone never saves
+        txt=m2.reply.call_args.args[0]
+        self.assertIn('<@1>',txt);self.assertIn("'haan'",txt)
+        key=self.cmd.key(m1)
+        self.assertEqual(self.cmd.pending[key][2],'__confirm__')
+    async def test_original_confirms_helper_completed_reminder(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        target=t0.astimezone(IST)+dt.timedelta(minutes=30)
+        hh=target.strftime('%I').lstrip('0');mm=target.strftime('%M');ap=target.strftime('%p')
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        self.ai({'action':'remind','when':f'aaj {hh}:{mm} {ap}','task':'VC invite','tag_names':[],'tag_author':True})
+        m2=self.msg(t0+dt.timedelta(seconds=30),author=self.helper,ref=S(message_id=700))
+        await self.run_msg(m2,f'{hh}:{mm} {ap.lower()}')
+        m3=self.msg(t0+dt.timedelta(seconds=60),ref=S(message_id=700))
+        await self.run_msg(m3,'haan')
+        rows=self.store.load()
+        self.assertEqual(len(rows),1)
+        e=rows[0]
+        self.assertEqual((e['status'],e['targets'],e['author'],e['core']),('scheduled',[1],1,'VC invite'))
+        self.assertEqual(self.cmd.pending,{})
+    async def test_original_declines_helper_completed_reminder(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        target=t0.astimezone(IST)+dt.timedelta(minutes=30)
+        hh=target.strftime('%I').lstrip('0');mm=target.strftime('%M');ap=target.strftime('%p')
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        self.ai({'action':'remind','when':f'aaj {hh}:{mm} {ap}','task':'VC invite','tag_names':[],'tag_author':True})
+        m2=self.msg(t0+dt.timedelta(seconds=30),author=self.helper,ref=S(message_id=700))
+        await self.run_msg(m2,f'{hh}:{mm} {ap.lower()}')
+        m3=self.msg(t0+dt.timedelta(seconds=60),ref=S(message_id=700))
+        await self.run_msg(m3,'nahi')
+        self.assertEqual(self.store.load(),[])
+        self.assertEqual(self.cmd.pending,{})
+        self.assertIn('save nahi hua',m3.reply.call_args.args[0])
+    async def test_helper_cannot_confirm_for_original(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        target=t0.astimezone(IST)+dt.timedelta(minutes=30)
+        hh=target.strftime('%I').lstrip('0');mm=target.strftime('%M');ap=target.strftime('%p')
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        self.ai({'action':'remind','when':f'aaj {hh}:{mm} {ap}','task':'VC invite','tag_names':[],'tag_author':True})
+        m2=self.msg(t0+dt.timedelta(seconds=30),author=self.helper,ref=S(message_id=700))
+        await self.run_msg(m2,f'{hh}:{mm} {ap.lower()}')
+        m3=self.msg(t0+dt.timedelta(seconds=60),author=self.helper,ref=S(message_id=700))
+        await self.run_msg(m3,'haan')
+        self.assertEqual(self.store.load(),[])
+        self.assertIn('unke haan/nahi',m3.reply.call_args.args[0])
+        self.assertIn(self.cmd.key(m1),self.cmd.pending)
+    async def test_unaddressed_helper_message_does_not_hijack(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        # Helper's bare in-channel message: no reply ref, not addressed.
+        m2=self.msg(t0+dt.timedelta(seconds=30),author=self.helper)
+        handled=await self.run_msg(m2,'5:05 pm')
+        self.assertFalse(handled)
+        self.assertEqual(self.store.load(),[])
+        self.assertEqual(self.cmd.pending[self.cmd.key(m1)][2],'Set a reminder for VC invite, tag me')
+    async def test_ambiguous_two_pendings_no_hijack(self):
+        t0=dt.datetime.now(dt.timezone.utc)
+        m1=self._open_pending(t0)
+        await self.run_msg(m1,'Set a reminder for VC invite, tag me')
+        # Second pending from another member in the same channel.
+        m2=self.msg(t0,author=self.helper)
+        await self.run_msg(m2,'Set a reminder for standup, tag me')
+        self.assertEqual(self.store.load(),[])
+        third=S(id=4,bot=False,display_name='Shubham')
+        self.guild.get_member=lambda i:{1:self.author,2:self.mayank,3:self.helper,4:third}.get(i)
+        m3=self.msg(t0+dt.timedelta(seconds=30),author=third,ref=S(message_id=700))
+        handled=await self.run_msg(m3,'5:05 pm')
+        self.assertFalse(handled)
+        self.assertEqual(self.store.load(),[])
