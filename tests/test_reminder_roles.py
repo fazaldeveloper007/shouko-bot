@@ -225,3 +225,95 @@ class RoleDispatch(RoleBase):
                            body='@everyone hi', due=100, now=0, kind='announcement', ping=True)
         with self.assertRaises(ValueError):
             self.wstore.load()
+
+class TagConsent(RoleBase):
+    async def test_walo_ko_phrasing_saves_first_turn(self):
+        # Live phrasing: 'VC member role walo ko' - no clarify needed.
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m = self.msg(dt.datetime.now(dt.timezone.utc))
+        await self.run_msg(m, 'Set daily reminder at 9 PM for VC invite, VC member role walo ko')
+        rows = self.store.load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get('roles'), [501])
+
+    async def test_affirmative_answer_to_tag_question_saves(self):
+        # The live loop: Kristy asks '"VC member" ko tag karna hai?', user says 'Haa'.
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']),
+                dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m1 = self.msg(t0)
+        await self.run_msg(m1, 'Set daily reminder at 9 PM for VC invite')
+        self.assertEqual(self.store.load(), [])
+        self.assertIn('tag karna hai', m1.reply.call_args.args[0])
+        m2 = self.msg(t0 + dt.timedelta(seconds=30), ref=S(message_id=700))
+        await self.run_msg(m2, 'Haa')
+        rows = self.store.load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get('roles'), [501])
+
+    async def test_bare_role_name_echo_saves(self):
+        # Answering the tag question with just the role name also counts.
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']),
+                dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m1 = self.msg(t0)
+        await self.run_msg(m1, 'Set daily reminder at 9 PM for VC invite')
+        m2 = self.msg(t0 + dt.timedelta(seconds=30), ref=S(message_id=700))
+        await self.run_msg(m2, 'VC member')
+        rows = self.store.load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get('roles'), [501])
+
+    async def test_declining_tag_saves_plain_reminder_without_role(self):
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']),
+                dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=[]))
+        m1 = self.msg(t0)
+        await self.run_msg(m1, 'Set daily reminder at 9 PM for VC invite')
+        m2 = self.msg(t0 + dt.timedelta(seconds=30), ref=S(message_id=700))
+        await self.run_msg(m2, 'nahi, sirf mujhe yaad dilana')
+        rows = self.store.load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get('roles') or [], [])
+
+class ChatContinuity(RoleBase):
+    def _with_history(self, lines):
+        self.cmd.history_provider = lambda message: list(lines)
+
+    async def test_set_kardo_after_restatement_saves_with_role(self):
+        # The live gap: user stated the plan, Kristy restated it, user says
+        # 'Yoh fir set kardo reminder' - it must save, not re-ask everything.
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self._with_history([
+            ('Fazallette', 1, '9 PM daily, VC member role walo ko invite bhejna'),
+            ('Kristy', None, 'Roz raat 9 baje VC member role ko tag karke gaming ke liye invite karna hai na?'),
+        ])
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m = self.msg(t0)
+        await self.run_msg(m, 'Yoh fir set kardo reminder')
+        rows = self.store.load()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].get('roles'), [501])
+        self.assertIn('Repeating reminder saved', m.reply.call_args.args[0])
+
+    async def test_bot_lines_never_validate_tag_wording(self):
+        # Kristy's own restatement must NOT authorize a role ping by itself.
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self._with_history([
+            ('Kristy', None, 'roz raat 9 baje tag VC Member karke invite karna hai na?'),
+        ])
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m = self.msg(t0)
+        await self.run_msg(m, 'haan set kardo reminder')
+        self.assertEqual(self.store.load(), [])
+
+    async def test_other_members_lines_never_validate(self):
+        # Another member's plan in chat is not THIS requester's wording.
+        t0 = dt.datetime.now(dt.timezone.utc)
+        self._with_history([
+            ('Junaid', 2, '9 PM daily, VC member role walo ko invite bhejna'),
+        ])
+        self.ai(dict(action='remind', when='every day 9:00 PM', task='VC invite', tag_names=['VC Member']))
+        m = self.msg(t0)
+        await self.run_msg(m, 'set kardo reminder')
+        self.assertEqual(self.store.load(), [])
