@@ -91,7 +91,7 @@ class MemberStore:
         with self._locked(owner):
             return self._generation(owner), self._read(owner)
 
-    def merge_reviewed(self, owner, *, expected_generation, facts, merge, name=None):
+    def merge_reviewed(self, owner, *, expected_generation, facts, merge, name=None, origin=None):
         """ONLY caller-reviewed facts, not raw extractor output.
 
         `merge` is canonical diary.merge, injected to preserve existing format and
@@ -111,7 +111,7 @@ class MemberStore:
             if self._generation(owner) != expected_generation:
                 raise MemoryErrorCode('MEMORY_SCOPE_CHANGED')
             data = self._read(owner)
-            merge(data, list(facts), name=name)
+            merge(data, list(facts), name=name, origin=origin)
             path = self.directory / (str(owner) + '.json')
             try:
                 self._atomic(path, data)
