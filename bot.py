@@ -1891,6 +1891,23 @@ def should_respond(message):
         return True
     return False
 
+def _public_source(guild):
+    """can_view(guild_id, channel_id): the source channel still exists in this
+    guild and @everyone can read it right now. Fails closed on any doubt."""
+    def can_view(gid, cid):
+        try:
+            if guild is None or getattr(guild, 'id', None) != gid:
+                return False
+            ch = guild.get_channel(cid)
+            if ch is None:
+                return False
+            perms = ch.permissions_for(guild.default_role)
+            return bool(getattr(perms, 'view_channel', False))
+        except Exception:
+            return False
+    return can_view
+
+
 def with_diary(prompt, diary_block):
     return f"{prompt}\n\n{diary_block}" if diary_block else prompt
 
@@ -2330,7 +2347,10 @@ async def extract_and_save(user_id, display_name, exchanges, epoch, channel=None
                 if facts or name:
                     mem = await asyncio.to_thread(store.merge_reviewed, user_id,
                         expected_generation=generation, facts=tuple(facts), name=name,
-                        merge=diary.merge)
+                        merge=diary.merge,
+                        origin=((channel.id, channel.guild.id)
+                                if channel is not None and getattr(channel, 'guild', None) is not None
+                                else None))
                     log.info("Diary updated for %s (+%d facts, %d total)", user_id, len(facts), len(mem["facts"]))
                 # An empty result is not a saved explicit request. Never give
                 # the saved confirmation if no facts/name reached disk.
@@ -2909,6 +2929,20 @@ async def on_message(message):
     try:
         diary_block = diary.prompt_block(diary.load(user_id), speaker)
         diary_block += self_diary.prompt(message.guild.id)
+        # Shared server memory: a mentioned member's facts, but only ones said
+        # in channels @everyone can still read - unknown provenance and
+        # restricted/deleted channels stay speaker-only.
+        can_view = _public_source(message.guild)
+        shared = []
+        for m in list(getattr(message, 'mentions', None) or [])[:5]:
+            mid = getattr(m, 'id', None)
+            if not isinstance(mid, int) or mid == user_id or getattr(m, 'bot', False):
+                continue
+            blk = diary.shared_block(diary.load(mid), getattr(m, 'display_name', ''), can_view)
+            if blk:
+                shared.append(blk)
+        if shared:
+            diary_block += "\n\n" + "\n\n".join(shared)
     except Exception as e:
         log.warning("Diary load failed for %s: %s", user_id, e)
         diary_block = ""
