@@ -204,6 +204,69 @@ class BuilderLedgerTests(unittest.TestCase):
         self.assertGreater(builder2.pending['plan2']['expires'], time.monotonic())
 
 
+class RestartContinuationTests(unittest.TestCase):
+    """Conversational continuation reads the restored shared state: a
+    clarification staged before a restart resolves from the same pending
+    item after restore, and settle writes the outcome to the ledger."""
+    def fake_message(self, guild=10, channel=20, author=30, ref_id=None):
+        return types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=guild),
+            channel=types.SimpleNamespace(id=channel),
+            author=types.SimpleNamespace(id=author),
+            reference=None if ref_id is None else types.SimpleNamespace(message_id=ref_id),
+            reply=AsyncMock())
+
+    def test_clarify_reply_resolves_after_restart(self):
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        store = types.SimpleNamespace(load=lambda: [], save=lambda data: None)
+        cmd = sc.Commands(store, lambda *a: (None, False), ledger=led)
+        anchor = dt.datetime(2026, 11, 28, 21, tzinfo=dt.timezone.utc)
+        msg = self.fake_message(ref_id=99)
+        key = cmd.key(msg)
+        item = (time.monotonic() + 600, 99, 'kal 9 baje study', anchor)
+        cmd.pending[key] = item
+        cmd._ledger_stash('reminder_clarify', key, item)
+        led.close()
+        # restart: fresh Commands over the same ledger, restore, then the
+        # user's reply must resolve against the restored pending item
+        cmd2 = sc.Commands(store, lambda *a: (None, False), ledger=agent_core.TaskLedger(path))
+        self.assertEqual(cmd2.pending, {})
+        self.assertEqual(cmd2.restore_pending(), 1)
+        self.assertEqual(cmd2.pending_item(msg), cmd2.pending[key])
+        cmd2._pending_pop(key, agent_core.DONE)
+        self.assertEqual(cmd2.pending, {})
+        self.assertEqual(cmd2.ledger.pending(), [])
+
+
+class ActionsRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restored_preview_settles_after_restart(self):
+        tmp, led, path = make_ledger()
+        self.addCleanup(tmp.cleanup)
+        client = types.SimpleNamespace(music=None, get_channel=lambda cid: None)
+        store = types.SimpleNamespace(load=lambda: [], save=lambda data: None)
+        os.environ['KRISTY_SERVER_BUILDER'] = '0'
+        self.addCleanup(lambda: os.environ.pop('KRISTY_SERVER_BUILDER', None))
+        act = actions.Actions(client, '111', store, ledger=led)
+        entry = {'author': 30, 'channel': 20, 'guild': 10, 'scope': 'here',
+                 'text': 'hello', 'when': None, 'expires': time.monotonic() + 300}
+        act.pending['abc123'] = entry
+        act._ledger_stash_preview('abc123', entry)
+        led.close()
+        # restart: restore, then the owner's cancel must settle the ledger row
+        act2 = actions.Actions(client, '111', store, ledger=agent_core.TaskLedger(path))
+        self.assertEqual(act2.restore_pending(), 1)
+        msg = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=30),
+            channel=types.SimpleNamespace(id=20),
+            guild=types.SimpleNamespace(id=10),
+            reply=AsyncMock())
+        handled = await act2._finish(msg, 'cancel', 'abc123', act2.pending['abc123'])
+        self.assertTrue(handled)
+        self.assertEqual(act2.pending, {})
+        self.assertEqual(act2.ledger.get('abc123')['status'], agent_core.CANCELLED)
+
+
 class WorkerRecorderTests(unittest.TestCase):
     def test_recorder_receives_delivery_entry(self):
         got = []
