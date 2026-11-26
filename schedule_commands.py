@@ -213,22 +213,44 @@ class Commands:
         ref=getattr(message,'reference',None)
         if item and ref is not None and getattr(ref,'message_id',None)!=item[1]:return None
         return item
+    def helper_item(self,message,addressed):
+        """Another member's open clarification in this channel that THIS message
+        can complete: exactly one pending from someone else, and the message
+        replies to that clarification or is addressed to Kristy. Ambiguous or
+        unaddressed chat is never hijacked into someone else's request."""
+        now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
+        found=None
+        for k,v in self.pending.items():
+            if k[0]==message.guild.id and k[1]==message.channel.id and k[2]!=message.author.id:
+                if found is not None:return None
+                found=(k,v)
+        if found is None:return None
+        ref=getattr(message,'reference',None)
+        if ref is not None and getattr(ref,'message_id',None)==found[1][1]:return found
+        if addressed:return found
+        return None
     def followup(self,message,text,addressed=True):
         """A reply to our own clarification (same guild/channel/author, within
-        2 minutes). Anything said then goes to the intent step with the original
-        request; the model may say it is unrelated and normal chat continues."""
+        2 minutes) - or a helper's addressed/reply completion of someone else's.
+        Anything said then goes to the intent step with the original request;
+        the model may say it is unrelated and normal chat continues."""
         item=self.pending_item(message)
-        if not item:return False
-        ref=getattr(message,'reference',None)
-        return ref is not None or bool(addressed)
+        if item:
+            ref=getattr(message,'reference',None)
+            return ref is not None or bool(addressed)
+        found=self.helper_item(message,addressed)
+        if found is not None:
+            # handle() re-derives addressed-ness; carry this gate's answer.
+            message._sched_helper_addressed=bool(addressed)
+        return found is not None
     async def reply(self,message,text):
         return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
-    async def clarify(self,message,text='Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene',request=None,anchor=None):
+    async def clarify(self,message,text='Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene',request=None,anchor=None,key=None):
         """Ask a short question and remember the ORIGINAL request text and its
         message time, so the user's answer completes that request."""
         sent=await self.reply(message,text)
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
-        self.pending[self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
+        self.pending[key or self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
 
     def tag_names(self,text,guild):
         """'tagging X' / 'tag X, Y' -> (<@id> strings, text without them).
@@ -350,14 +372,45 @@ class Commands:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
         return True
 
-    async def ai_request(self,message,text,client,fallback=None,kind='remind'):
+    async def ai_request(self,message,text,client,fallback=None,kind='remind',pkey=None,helper=None):
         """The model only UNDERSTANDS the request (structured intent). Every
         effect is decided here: time via tm.parse_time against the ORIGINAL
         message time, targets resolved to real members, same channel unless a
         native #channel mention is in the user's own text, and nothing is
-        confirmed to the user before the job is on disk."""
+        confirmed to the user before the job is on disk. A helper may complete
+        someone else's open clarification (pkey set): the original requester
+        still confirms before anything is saved."""
         self.client_for_access=client
-        item=self.pending_item(message)
+        key=pkey or self.key(message)
+        if pkey is not None:
+            now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
+            item=self.pending.get(key)
+        else:
+            item=self.pending_item(message)
+        if item and len(item)>=6 and item[2]=='__confirm__':
+            # The original requester answers a helper-filled preview; only
+            # THEIR haan/nahi settles it, never the helper's.
+            if key[2]!=message.author.id:
+                await self.reply(message,f'Yeh <@{key[2]}> ka reminder hai; unke haan/nahi ke bina save nahi hoga.')
+                return True
+            anchor=item[3];ckind,parts=item[4],item[5]
+            ans=' '.join(text.strip().lower().split())
+            if re.fullmatch(r'(?:haan|ha|han|yes|yeah|ok|okay|sahi|theek|done|bilkul|haan ji|kar do|set kar do)[\s!.]*',ans):
+                try:
+                    await self._commit(message,client,ckind,parts,time.time(),anchor)
+                    self.pending.pop(key,None)
+                except (ValueError,TypeError) as exc:
+                    self.pending.pop(key,None)
+                    await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
+                except OSError:
+                    await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
+                return True
+            if re.fullmatch(r'(?:nahi|nhi|no|mat|nope|cancel|rehne do)[\s!.]*',ans):
+                self.pending.pop(key,None)
+                await self.reply(message,'Theek hai, reminder save nahi hua.')
+                return True
+            await self.reply(message,"'haan' ya 'nahi' bolo; reminder abhi save nahi hua.")
+            return True
         orig,anchor=(item[2],item[3]) if item else (None,None)
         anchor=anchor or getattr(message,'created_at',None)
         request=(orig+'\n'+text) if orig else text
@@ -378,73 +431,75 @@ class Commands:
             try:intent=await self.intent(orig,text,anchor)
             except Exception:intent=None
         if self.intent is None:
-            await self.clarify(message,request=request,anchor=anchor);return True
+            await self.clarify(message,request=request,anchor=anchor,key=key);return True
         if not isinstance(intent,dict) or intent.get('action') not in ('remind','need_info','none'):
             parts=fallback() if fallback else None
             if parts:
                 try:
                     await self._commit(message,client,kind,parts,time.time(),getattr(message,'created_at',None))
-                    self.pending.pop(self.key(message),None)
+                    self.pending.pop(key,None)
                 except (ValueError,TypeError) as exc:
                     await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
                 except OSError:
                     await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
                 return True
-            await self.clarify(message,'Abhi samajh nahi paayi, reminder save nahi hua. Time aur kya yaad dilana hai ek line mein likho.',request,anchor);return True
+            await self.clarify(message,'Abhi samajh nahi paayi, reminder save nahi hua. Time aur kya yaad dilana hai ek line mein likho.',request,anchor,key=key);return True
         action=intent['action']
         if action=='none':return False
         if action=='need_info':
             q=intent.get('question')
             q=' '.join(q.split())[:150] if isinstance(q,str) and q.strip() else 'Kab aur kya?'
             q=re.sub(r'<[@#]|@(?:everyone|here)','',q)
-            await self.clarify(message,q,request,anchor);return True
+            await self.clarify(message,q,request,anchor,key=key);return True
         try:
             when,task=intent.get('when'),intent.get('task')
             names=intent.get('tag_names') or []
             if not isinstance(when,str) or not isinstance(task,str) or not isinstance(names,list) or len(names)>5:raise TypeError
             when=' '.join(when.split());task=' '.join(task.split()).strip(' .,!')
             if not task or not when or len(when)>40 or len(task)>300:
-                await self.clarify(message,'Kab aur kya? Time aur reminder ka kaam ek line mein likho.',request,anchor);return True
+                await self.clarify(message,'Kab aur kya? Time aur reminder ka kaam ek line mein likho.',request,anchor,key=key);return True
             # A condition inside the task is an unsupported capability, stated
             # plainly instead of saving it as flat reminder text.
             if _CONDITIONAL.search(task):
-                await self.clarify(message,'Reminder ke kaam mein condition (if/agar/warna) save nahi kar sakti. Bina condition ka kaam ek line mein likho.',request,anchor);return True
+                await self.clarify(message,'Reminder ke kaam mein condition (if/agar/warna) save nahi kar sakti. Bina condition ka kaam ek line mein likho.',request,anchor,key=key);return True
             # The task must be the user's own words, not a model invention.
             words=[w for w in re.findall(r"[\w']+",task.casefold()) if len(w)>=3]
             low=request.casefold()
             if not words or sum(w in low for w in words)*2<len(words):
-                await self.clarify(message,'Kya yaad dilana hai? Ek line mein likho.',request,anchor);return True
+                await self.clarify(message,'Kya yaad dilana hai? Ek line mein likho.',request,anchor,key=key);return True
             # The time comes from the user's words (clock or duration), computed
             # here; the model's `when` only has to AGREE with it.
             sources=[(orig,anchor)] if orig else []
             sources.append((text,getattr(message,'created_at',None) or anchor))
             chosen,problem=(pick_recurrence(when,sources) if _RECURRENCE.search(request) else pick_time(when,sources))
             if chosen is None:
-                await self.clarify(message,problem,request,anchor);return True
+                await self.clarify(message,problem,request,anchor,key=key);return True
             when,when_anchor=chosen
             dests=re.findall(r'<#(\d+)>',request)
             if len(dests)>1:raise ValueError('Ek hi destination channel do.')
             if dests and not re.search(rf'(?:\b(?:in|to|on|at)\s+<#{dests[0]}>|<#{dests[0]}>\s*(?:mein|me|pe|par|channel)\b|\bchannel\s+<#{dests[0]}>)',request,re.I):
-                await self.clarify(message,'Kis channel mein bhejna hai? "<#channel> mein" likho, ya bina channel ke yahin bhejti hoon.',request,anchor);return True
+                await self.clarify(message,'Kis channel mein bhejna hai? "<#channel> mein" likho, ya bina channel ke yahin bhejti hoon.',request,anchor,key=key);return True
             dest=f'<#{dests[0]}>' if dests else 'here'
-            targets=[str(message.author.id)]
+            # A helper only supplies details; the reminder always belongs to
+            # the member who asked for it, never to the helper.
+            targets=[str(key[2])]
             mentioned=re.findall(r'<@!?(\d+)>',request)
             for m_id in mentioned:
                 if not re.search(rf'\b(?:tag(?:ging)?|ping(?:ing)?)\s+(?:[\w.\-]+\s*(?:,|and|aur)\s*)*<@!?{m_id}>',request,re.I):
-                    await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor);return True
+                    await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor,key=key);return True
             targets+=mentioned
             roles=[]
             for r_id in re.findall(r'<@&(\d+)>',request):
                 # A native role mention must be the user's own ping choice.
                 if not _native_role_tagged(request,r_id):
-                    await self.clarify(message,'Kis role ko tag karna hai? "tag @role" likho.',request,anchor);return True
+                    await self.clarify(message,'Kis role ko tag karna hai? "tag @role" likho.',request,anchor,key=key);return True
                 roles.append(r_id)
             for name in names:
                 if not isinstance(name,str) or not name.strip() or len(name)>40:raise TypeError
                 clean=name.strip().lstrip('@')
                 # a tagged target must be named with tag/ping wording in the user's text
                 if not _tag_requested(request,clean):
-                    await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor);return True
+                    await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor,key=key);return True
                 member=self.resolver(message.guild,clean)[0]
                 if member is not None:
                     if member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
@@ -459,10 +514,23 @@ class Commands:
                 parts=[when,dest,task];kind='remind'
             else:
                 parts=[when,dest,', '.join([f'<@{t}>' for t in targets]+[f'<@&{r}>' for r in roles]),task];kind='schedule'
+            if helper is not None and key[2]!=message.author.id:
+                # A helper completed the details; the original requester
+                # confirms before anything is saved.
+                target_member=message.guild.get_member(key[2])
+                helper_name=getattr(message.author,'display_name','Kisi')
+                target_name=getattr(target_member,'display_name','requester')
+                sent=await message.reply(
+                    f'{helper_name} ne details diye hain. <@{key[2]}>, reminder: "{task}" - {when}. Sahi hai? '
+                    "'haan' bolo toh save karti hoon, 'nahi' toh cancel.",
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(users=[target_member] if target_member is not None else False))
+                self.pending[key]=(time.monotonic()+300,getattr(sent,'id',None),'__confirm__',when_anchor,kind,parts)
+                return True
             await self._commit(message,client,kind,parts,time.time(),when_anchor)
-            self.pending.pop(self.key(message),None)
+            self.pending.pop(key,None)
         except (ValueError,TypeError) as exc:
-            self.pending.pop(self.key(message),None)
+            self.pending.pop(key,None)
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
         except OSError:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
@@ -546,6 +614,9 @@ class Commands:
         if not m:
             if INTENT.search(text) or self.pending_item(message):
                 return await self.ai_request(message,text,client)
+            found=self.helper_item(message,bool(getattr(message,'reference',None)) or bool(getattr(message,'_sched_helper_addressed',False)))
+            if found is not None:
+                return await self.ai_request(message,text,client,pkey=found[0],helper=message.author)
             return False
         kind,rest=m[1].lower(),m[2].strip()
         if kind=='reminder':kind='remind'
