@@ -4,7 +4,11 @@ import time
 
 INTENT = re.compile(r"\b(remind(?:er)?|schedule|timer|yaad\s+dila(?:na|do|dena)?|reminder\s+laga)\b|\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b.*\b(?:bhej|bol|bula|tag|ping|message)|\b(?:bhej\w*|bol\w*|bula\w*|tag\w*|ping\w*|yaad\s+dila\w*|message)\b[^\n|]*\b\d+\s*(?:min(?:ute)?s?|hours?|ghant[ae])\s+baad\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b.*\b(?:bhej|bol|bula|tag|ping|message)", re.I)
 import discord
+
+import agent_core
 import timed_messages as tm
+import logging
+log = logging.getLogger('kristy.schedule_commands')
 
 HELP = ('Kristy remind me 10 min baad pani peene\n'
         'Kristy remind me tagging Mayank 10 min baad to watch anime\n'
@@ -205,7 +209,7 @@ def _guild_role(guild,role_id):
 
 
 class Commands:
-    def __init__(self,store,resolver,owner_id=''):
+    def __init__(self,store,resolver,owner_id='',ledger=None):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
         self.pending={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
         # Optional: recent same-channel lines [(author_name, author_id, text)].
@@ -213,6 +217,39 @@ class Commands:
         # re-asking everything; validation still uses only the user's own words.
         self.history_provider=None
         self.role_resolver=None
+        self.ledger=ledger
+    PENDING_KINDS=('reminder_clarify','reminder_confirm')
+    def _ledger_stash(self,kind,key,item):
+        if self.ledger is None:return
+        try:
+            self.ledger.settle_key(self.PENDING_KINDS,*key,agent_core.EXPIRED)
+            self.ledger.create(kind,agent_core.PENDING,guild=key[0],channel=key[1],author=key[2],
+                               payload=agent_core.pack_pending_item(item),
+                               expires=agent_core.wall_from_monotonic(item[0]))
+        except Exception:
+            log.warning('ledger stash failed',exc_info=True)
+    def _ledger_drop(self,key,status=agent_core.EXPIRED):
+        if self.ledger is None:return
+        try:self.ledger.settle_key(self.PENDING_KINDS,*key,status)
+        except Exception:
+            log.warning('ledger drop failed',exc_info=True)
+    def _pending_pop(self,key,status=agent_core.EXPIRED):
+        self.pending.pop(key,None)
+        self._ledger_drop(key,status)
+    def restore_pending(self):
+        """Reload unexpired pending clarifications/confirms after a restart,
+        so a 'haan'/'set kardo' still resolves against the original request."""
+        if self.ledger is None:return 0
+        restored=0
+        for kind in self.PENDING_KINDS:
+            for row in self.ledger.pending(kind):
+                try:
+                    key=(int(row['guild']),int(row['channel']),int(row['author']))
+                    self.pending[key]=agent_core.unpack_pending_item(row['payload'],row['expires'])
+                    restored+=1
+                except Exception:
+                    log.warning('ledger restore skipped a row',exc_info=True)
+        return restored
     def key(self,message):return message.guild.id,message.channel.id,message.author.id
     def pending_item(self,message):
         now=time.monotonic();self.pending={k:v for k,v in self.pending.items() if v[0]>now}
@@ -261,7 +298,9 @@ class Commands:
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
         pending=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
         if consent is not None:pending=pending+('__tags__',consent)
-        self.pending[key or self.key(message)]=pending
+        key=key or self.key(message)
+        self.pending[key]=pending
+        self._ledger_stash('reminder_clarify',key,pending)
 
     def tag_names(self,text,guild):
         """'tagging X' / 'tag X, Y' -> (<@id> strings, text without them).
@@ -409,15 +448,15 @@ class Commands:
             if re.fullmatch(r'(?:haan|ha|han|yes|yeah|ok|okay|sahi|theek|done|bilkul|haan ji|kar do|set kar do)[\s!.]*',ans):
                 try:
                     await self._commit(message,client,ckind,parts,time.time(),anchor)
-                    self.pending.pop(key,None)
+                    self._pending_pop(key)
                 except (ValueError,TypeError) as exc:
-                    self.pending.pop(key,None)
+                    self._pending_pop(key)
                     await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
                 except OSError:
                     await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
                 return True
             if re.fullmatch(r'(?:nahi|nhi|no|mat|nope|cancel|rehne do)[\s!.]*',ans):
-                self.pending.pop(key,None)
+                self._pending_pop(key,agent_core.CANCELLED)
                 await self.reply(message,'Theek hai, reminder save nahi hua.')
                 return True
             await self.reply(message,"'haan' ya 'nahi' bolo; reminder abhi save nahi hua.")
@@ -478,7 +517,7 @@ class Commands:
             if parts:
                 try:
                     await self._commit(message,client,kind,parts,time.time(),getattr(message,'created_at',None))
-                    self.pending.pop(key,None)
+                    self._pending_pop(key)
                 except (ValueError,TypeError) as exc:
                     await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Schedule data invalid hai; kuch save nahi hua.')
                 except OSError:
@@ -569,11 +608,12 @@ class Commands:
                     mention_author=False,
                     allowed_mentions=discord.AllowedMentions(users=[target_member] if target_member is not None else False))
                 self.pending[key]=(time.monotonic()+300,getattr(sent,'id',None),'__confirm__',when_anchor,kind,parts)
+                self._ledger_stash('reminder_confirm',key,self.pending[key])
                 return True
             await self._commit(message,client,kind,parts,time.time(),when_anchor)
-            self.pending.pop(key,None)
+            self._pending_pop(key)
         except (ValueError,TypeError) as exc:
-            self.pending.pop(key,None)
+            self._pending_pop(key)
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
         except OSError:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
@@ -641,8 +681,25 @@ class Commands:
         draft=dict(guild=guild.id,author=message.author.id,source=message.channel.id,dest=dest.id,targets=[t.id for t in targets],roles=[r.id for r in roles],body=full,due=due,core=core,recurrence=recurrence)
         tm.access(client,draft)
         entry=self.store.create(**draft,now=now,armed=True)
-        self.pending.pop(self.key(message),None)
+        # Execution truth: claim "saved" only after a read-back confirms the
+        # job is actually on disk.
+        saved=agent_core.verify_saved(self.store,entry['id'])
+        if saved is None:
+            self._ledger_record('reminder',agent_core.FAILED,message,due=due,
+                                payload={'schedule_id':entry.get('id')},last_error='read-back verify failed')
+            self._pending_pop(self.key(message),agent_core.FAILED)
+            raise OSError('schedule save verify nahi hua')
+        self._ledger_record('reminder',agent_core.DONE,message,due=due,
+                            payload={'schedule_id':entry['id'],'recurrence':recurrence},result='saved')
+        self._pending_pop(self.key(message),agent_core.DONE)
         await self.reply(message,('Repeating reminder saved: '+tm.recurrence_label(entry)+'; next: '+tm.shown(due)+f". Series ID: {entry['id']}. Cancel: Kristy schedule cancel {entry['id']}. Bot time par running chahiye; missed occurrence skip hogi, series chalegi.") if recurrence else 'OK')
+    def _ledger_record(self,kind,status,message,due=None,payload=None,result=None,last_error=None):
+        if self.ledger is None:return
+        try:
+            self.ledger.create(kind,status,guild=message.guild.id,channel=message.channel.id,
+                               author=message.author.id,payload=payload,due=due,result=result,last_error=last_error)
+        except Exception:
+            log.warning('ledger record failed',exc_info=True)
 
 
     async def handle(self,message,text,client,guard):
