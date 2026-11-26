@@ -64,7 +64,10 @@ def _tag_requested(text, name):
         return False
     after = rf'\b(?:tag(?:ging|ged)?|ping(?:ing|ed)?)\b\s*[:,.\-]?\s*(?:@?[\w.\-]+\s*(?:,|\band\b|\baur\b)\s*)*@?{words}(?![\w.])'
     before = rf'(?<![\w.])@?{words}\s+(?:(?:ko|yeh|ye|wala|wali|use|karke|kar|karna|please|plz)\s+)*(?:tag|ping)\b'
-    return bool(re.search(after, text, re.I) or re.search(before, text, re.I))
+    # Hindi group target: 'VC Member role walo ko', 'mods wale ko' - clearly a
+    # set of people to ping, not task content.
+    walo = rf'(?<![\w.])@?{words}\s+(?:role\s+)?wal[oe]\s+ko\b'
+    return bool(re.search(after, text, re.I) or re.search(before, text, re.I) or re.search(walo, text, re.I))
 
 
 def _native_role_tagged(text, role_id):
@@ -205,6 +208,10 @@ class Commands:
     def __init__(self,store,resolver,owner_id=''):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
         self.pending={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
+        # Optional: recent same-channel lines [(author_name, author_id, text)].
+        # Lets a 'set kardo' after Kristy's own restatement resolve instead of
+        # re-asking everything; validation still uses only the user's own words.
+        self.history_provider=None
         self.role_resolver=None
     def key(self,message):return message.guild.id,message.channel.id,message.author.id
     def pending_item(self,message):
@@ -245,12 +252,16 @@ class Commands:
         return found is not None
     async def reply(self,message,text):
         return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
-    async def clarify(self,message,text='Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene',request=None,anchor=None,key=None):
+    async def clarify(self,message,text='Kab aur kya? Jaise: Kristy remind me 10 min baad pani peene',request=None,anchor=None,key=None,consent=None):
         """Ask a short question and remember the ORIGINAL request text and its
-        message time, so the user's answer completes that request."""
+        message time, so the user's answer completes that request. When consent
+        is given, an affirmative answer ('haa', 'yes', ...) counts as the user's
+        own approval of the proposed tag wording."""
         sent=await self.reply(message,text)
         if len(self.pending)>=1000:self.pending.pop(next(iter(self.pending)))
-        self.pending[key or self.key(message)]=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
+        pending=(time.monotonic()+120,getattr(sent,'id',None),request,anchor or getattr(message,'created_at',None))
+        if consent is not None:pending=pending+('__tags__',consent)
+        self.pending[key or self.key(message)]=pending
 
     def tag_names(self,text,guild):
         """'tagging X' / 'tag X, Y' -> (<@id> strings, text without them).
@@ -412,8 +423,35 @@ class Commands:
             await self.reply(message,"'haan' ya 'nahi' bolo; reminder abhi save nahi hua.")
             return True
         orig,anchor=(item[2],item[3]) if item else (None,None)
+        # An affirmative answer to a tag-consent question IS the user's tag
+        # choice; substitute the proposed wording so the checks below see it.
+        if item and len(item)>=6 and item[4]=='__tags__':
+            ans=' '.join(text.strip().lower().split())
+            consent=item[5]
+            proposed=consent[4:].strip().lower() if consent.startswith('tag ') else ''
+            # 'haa'/'yes' - or simply repeating the proposed name - both answer
+            # the tag question with a yes and count as the user's own tag choice.
+            if (re.fullmatch(r'(?:ha+|haan|han|yes|yeah|yup|ok|okay|sahi|theek|bilkul|kar\s+do|haa?\s+ji|haan\s+ji)[\s!.]*',ans)
+                    or (proposed and ans==proposed)):
+                text=consent
         anchor=anchor or getattr(message,'created_at',None)
         request=(orig+'\n'+text) if orig else text
+        # Conversational-to-action continuity: the model sees the recent channel
+        # chat, so a follow-up like 'set kardo' after her own restatement is
+        # understood. VALIDATION below still uses only the user's own words:
+        # the pending original, this message, and the user's own recent lines.
+        user_hist=[]
+        if self.history_provider is not None:
+            try:hist=list(self.history_provider(message) or [])
+            except Exception:hist=[]
+            for a,aid,content in hist[-8:]:
+                if aid is not None and aid==message.author.id and isinstance(content,str) and content.strip():
+                    user_hist.append(content.strip())
+            chat_lines=[f'{a}: {content}' for a,aid,content in hist[-8:] if isinstance(content,str) and content.strip()]
+        else:
+            chat_lines=[]
+        if user_hist:
+            request=(orig+'\n' if orig else '')+'\n'.join(user_hist[-3:]+[text])
         if anchor is None:
             await self.reply(message,'Original message ka time verify nahi hua; kuch save nahi hua.');return True
         # Conditional follow-ups ('if I don't reply in 5 mins then ...') are not
@@ -428,7 +466,10 @@ class Commands:
                 return True
         intent=None
         if self.intent is not None:
-            try:intent=await self.intent(orig,text,anchor)
+            model_text=text
+            if chat_lines:
+                model_text='[recent channel chat]\n'+'\n'.join(chat_lines)+'\n[latest message]\n'+text
+            try:intent=await self.intent(orig,model_text,anchor)
             except Exception:intent=None
         if self.intent is None:
             await self.clarify(message,request=request,anchor=anchor,key=key);return True
@@ -471,6 +512,8 @@ class Commands:
             # here; the model's `when` only has to AGREE with it.
             sources=[(orig,anchor)] if orig else []
             sources.append((text,getattr(message,'created_at',None) or anchor))
+            for h in user_hist[-3:]:
+                sources.append((h,getattr(message,'created_at',None) or anchor))
             chosen,problem=(pick_recurrence(when,sources) if _RECURRENCE.search(request) else pick_time(when,sources))
             if chosen is None:
                 await self.clarify(message,problem,request,anchor,key=key);return True
@@ -486,20 +529,20 @@ class Commands:
             mentioned=re.findall(r'<@!?(\d+)>',request)
             for m_id in mentioned:
                 if not re.search(rf'\b(?:tag(?:ging)?|ping(?:ing)?)\s+(?:[\w.\-]+\s*(?:,|and|aur)\s*)*<@!?{m_id}>',request,re.I):
-                    await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor,key=key);return True
+                    await self.clarify(message,'Kisko tag karna hai? "tag @naam" likho.',request,anchor,key=key,consent=f'tag <@!{m_id}>');return True
             targets+=mentioned
             roles=[]
             for r_id in re.findall(r'<@&(\d+)>',request):
                 # A native role mention must be the user's own ping choice.
                 if not _native_role_tagged(request,r_id):
-                    await self.clarify(message,'Kis role ko tag karna hai? "tag @role" likho.',request,anchor,key=key);return True
+                    await self.clarify(message,'Kis role ko tag karna hai? "tag @role" likho.',request,anchor,key=key,consent=f'tag <@&{r_id}>');return True
                 roles.append(r_id)
             for name in names:
                 if not isinstance(name,str) or not name.strip() or len(name)>40:raise TypeError
                 clean=name.strip().lstrip('@')
                 # a tagged target must be named with tag/ping wording in the user's text
                 if not _tag_requested(request,clean):
-                    await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor,key=key);return True
+                    await self.clarify(message,f'"{clean}" ko tag karna hai? "tag {clean}" likho.',request,anchor,key=key,consent=f'tag {clean}');return True
                 member=self.resolver(message.guild,clean)[0]
                 if member is not None:
                     if member.bot:raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
