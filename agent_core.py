@@ -11,6 +11,7 @@ verified (store read-back or Discord accept); anything else stays
 failed/cancelled with its reason - never a fake "done".
 """
 import datetime as dt
+import inspect
 import json
 import os
 import secrets
@@ -153,6 +154,61 @@ def unpack_pending_item(payload, expires_wall, now=None):
             item.append(v)
     item[0] = time.monotonic() + max(0.0, expires_wall - (time.time() if now is None else now))
     return tuple(item)
+
+
+# ---- shared execution boundary -------------------------------------------
+# Every user-confirmed action (reminder/announcement save, announcement send,
+# server plan apply) runs through Executor: one place that creates the task
+# row, invokes the feature handler (adapter), verifies the actual result and
+# records the outcome. Outcomes are recorded, never assumed: DONE only when
+# the handler ran AND verify passed, FAILED with the real error otherwise.
+# An uncertain outcome is never silently retried.
+
+class Outcome:
+    __slots__ = ('ok', 'result', 'error', 'ident')
+
+    def __init__(self, ok, result=None, error=None, ident=None):
+        self.ok, self.result, self.error, self.ident = ok, result, error, ident
+
+
+class Executor:
+    def __init__(self, ledger):
+        self.ledger = ledger
+
+    async def run(self, kind, handler, *, verify=None, ident=None, guild=None,
+                  channel=None, author=None, payload=None, due=None,
+                  expires=None, result_of=None):
+        """Create a task row, execute, verify, record. Returns Outcome."""
+        ident = self.ledger.create(kind, PENDING, ident=ident, guild=guild,
+                                   channel=channel, author=author, payload=payload,
+                                   due=due, expires=expires)
+        return await self.run_pending(ident, handler, verify=verify, result_of=result_of)
+
+    async def run_pending(self, ident, handler, *, verify=None, result_of=None):
+        """Execute against an existing pending row (a confirmed clarification,
+        preview or plan): the same row carries the final state, so the state
+        conversational interpretation restores and the execution record are
+        one task, not two copies."""
+        try:
+            result = handler()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            self.ledger.update(ident, status=FAILED, last_error=type(exc).__name__)
+            return Outcome(False, None, exc, ident)
+        if verify is not None:
+            try:
+                ok = verify(result)
+                if inspect.isawaitable(ok):
+                    ok = await ok
+            except Exception as exc:
+                self.ledger.update(ident, status=FAILED, last_error='verify:' + type(exc).__name__)
+                return Outcome(False, result, exc, ident)
+            if not ok:
+                self.ledger.update(ident, status=FAILED, last_error='verify_failed')
+                return Outcome(False, result, None, ident)
+        self.ledger.update(ident, status=DONE, result=result_of(result) if result_of else None)
+        return Outcome(True, result, None, ident)
 
 
 def wall_from_monotonic(mono_expiry):
