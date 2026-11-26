@@ -197,9 +197,10 @@ class RepairTests(Schedules):
 class NaturalRepairTests(Schedules):
     def commands(self):
         return sc.Commands(self.store,lambda *a:(self.target,False))
-    def msg(self):
-        return S(guild=self.guild,author=self.author,channel=self.dest,
-                 created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
+    def msg(self,**kw):
+        d=dict(guild=self.guild,author=self.author,channel=self.dest,
+               created_at=dt.datetime.now(dt.timezone.utc),reply=AsyncMock(return_value=S(id=700)),reference=None)
+        d.update(kw);return S(**d)
     def add_channel(self,cid=21,name='gaming-chat'):
         ch=S(id=cid,guild=self.guild,type=discord.ChannelType.text,name=name,send=AsyncMock(return_value=S(id=78)))
         ch.permissions_for=lambda m:S(view_channel=True,send_messages=True)
@@ -261,7 +262,7 @@ class NaturalRepairTests(Schedules):
         await self.commands().handle(message,'remind me after 5 minutes @everyone uth ja',self.client,lambda *a,**kw:'ok')
         self.assertEqual(self.store.load(),[])
     async def test_natural_summon_with_mentions(self):
-        self.add_channel();message=self.msg()
+        self.add_channel();message=self.msg(created_at=dt.datetime(2026,11,27,12,0,tzinfo=dt.timezone.utc))
         await self.commands().handle(message,'summon kal 8 PM <@2> <#21>',self.client,lambda *a,**kw:'ok')
         e=self.store.load()[0]
         self.assertEqual(e['targets'],[2]);self.assertEqual(e['dest'],21)
