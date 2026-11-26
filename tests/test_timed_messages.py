@@ -165,8 +165,10 @@ class RepairTests(Schedules):
         msg=S(guild=self.guild,author=self.author,channel=self.dest,reply=AsyncMock(return_value=S(id=700)),reference=None)
         await commands.clarify(msg)
         self.assertTrue(commands.followup(msg,'okay'))
+        # Another member's UNADDRESSED message never arms on this pending;
+        # channel/guild mismatch never arms at all.
         for obj in (msg.author,msg.channel,msg.guild):
-            old=obj.id;obj.id=777;self.assertFalse(commands.followup(msg,'okay'));obj.id=old
+            old=obj.id;obj.id=777;self.assertFalse(commands.followup(msg,'okay',False));obj.id=old
         msg.reference=S(message_id=999);self.assertFalse(commands.followup(msg,'okay'))
         msg.reference=S(message_id=700);self.assertTrue(commands.followup(msg,'okay'))
         commands.pending[commands.key(msg)]=(0,700);self.assertFalse(commands.followup(msg,'okay'))
