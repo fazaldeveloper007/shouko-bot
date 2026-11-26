@@ -97,6 +97,7 @@ class Actions:
         self.clarify_stash = {}  # (author, channel) -> interrupted draft+scope
         self.last_preview = None  # (channel, ident) awaiting its sent-message id
         self.ledger = ledger
+        self.executor = agent_core.Executor(ledger) if ledger is not None else None
         self.builder = server_builder.Builder(client, ledger=ledger) if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0' else None
 
     def _ledger_stash_preview(self, ident, entry):
@@ -241,19 +242,45 @@ class Actions:
                 candidate=dict(guild=entry['guild'],author=entry['author'],source=entry['channel'],dest=entry['target'],
                     targets=[],body=entry['text'],due=entry['due'],kind='announcement',ping=entry['ping'])
                 tm.access(self.client,candidate)
-                saved=self.store.create(**candidate,now=now,armed=True)
-                # Execution truth: claim "scheduled" only after read-back.
-                if agent_core.verify_saved(self.store,saved['id']) is None:
-                    raise OSError('announcement save verify nahi hua')
-                self._ledger_settle_preview(ident,agent_core.DONE,result=f"scheduled:{saved['id']}")
+                if self.executor is not None:
+                    # Execution boundary: DONE only when the read-back verifies
+                    # the scheduled job actually exists.
+                    outcome = await self.executor.run_pending(ident,
+                        handler=lambda: self.store.create(**candidate, now=now, armed=True),
+                        verify=lambda s: agent_core.verify_saved(self.store, s['id']),
+                        result_of=lambda s: f"scheduled:{s['id']}")
+                    if not outcome.ok:
+                        raise OSError('announcement save verify nahi hua')
+                    saved = outcome.result
+                else:
+                    saved=self.store.create(**candidate,now=now,armed=True)
+                    # Execution truth: claim "scheduled" only after read-back.
+                    if agent_core.verify_saved(self.store,saved['id']) is None:
+                        raise OSError('announcement save verify nahi hua')
+                    self._ledger_settle_preview(ident,agent_core.DONE,result=f"scheduled:{saved['id']}")
             except (ValueError,OSError,TypeError):
                 self._ledger_settle_preview(ident,agent_core.FAILED)
                 await message.reply('Announcement schedule save nahi hua; time, permissions ya storage check karo. Kuch post nahi hua.',mention_author=False)
                 return True
             await message.reply(f"Announcement scheduled: {tm.shown(saved['due'])}. ID: {saved['id']}. Cancel: Kristy schedule cancel {saved['id']}. 2 minute se zyada late hua toh skip hoga.",mention_author=False)
             return True
+        async def _send():
+            return await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=entry['ping'], users=False, roles=False))
+        if self.executor is not None:
+            outcome = await self.executor.run_pending(ident, _send)
+            if not outcome.ok:
+                # The error may have happened after Discord accepted the message.
+                # Never claim a definite failure and never auto-retry a duplicate.
+                log.warning('announce send outcome unknown: %s', type(outcome.error).__name__ if outcome.error else 'verify_failed')
+                self._ledger_settle_preview(ident, agent_core.FAILED, result='send_outcome_unknown')
+                await message.reply('Send ka result confirm nahi hua - ho sakta hai post ho gaya ho. Channel khud check karo; main apne aap dobara NAHI bhejungi. Naya preview chahiye toh phir se bolo.', mention_author=False)
+                return True
+            sent = outcome.result
+            self._ledger_settle_preview(ident, agent_core.DONE, result='posted')
+            await message.reply(f'Announcement post ho gaya ✅ {sent.jump_url}', mention_author=False)
+            return True
         try:
-            sent = await channel.send(entry['text'], allowed_mentions=discord.AllowedMentions(everyone=entry['ping'], users=False, roles=False))
+            sent = await _send()
         except Exception as exc:
             # The error may have happened after Discord accepted the message.
             # Never claim a definite failure and never auto-retry a duplicate.
