@@ -1,7 +1,7 @@
 # Kristy persona restore point - combined reminder + shared-memory update
 
 Date: 2026-11-26 (IST)
-Source revision: main @ 03904c84c963c39f50be15348ca7c34611a0b752
+Source revision: main @ 1587bc806fc988b8be7cec8c12d3fa8457799ed6
 Repo: fazaldeveloper007/shouko-bot
 
 ## What this snapshot covers
@@ -19,15 +19,16 @@ persona.py content below):
 - No secrets or tokens (they live in env vars on the host, never in the repo).
 - No member private memories: memory/<user-id>.json diaries and
   kristy-lessons.json runtime data live in MEMORY_DIR on the bot host, not in
-  git. Back those up on the device separately if a full state restore is needed.
+  git. Back those up on the device separately if a full state restore is needed
+  (e.g. before the planned persona experiment).
 - After this update, new member facts also carry channel provenance (ch/g);
   restoring old code does not delete newer diary files.
 
 ## Restore
-    git checkout 03904c84c963c39f50be15348ca7c34611a0b752 -- persona.py self_diary.py gifs.py
-(or checkout the whole commit for the exact full tree)
+    git checkout 1587bc806fc988b8be7cec8c12d3fa8457799ed6 -- persona.py self_diary.py gifs.py bot.py diary.py recap.py continuity.py schedule_commands.py timed_messages.py
 
-## persona.py (verbatim at 03904c84c963c39f50be15348ca7c34611a0b752)
+## persona.py (verbatim at 1587bc806fc988b8be7cec8c12d3fa8457799ed6)
+
 ```python
 """
 Kristy's personality.
