@@ -1545,11 +1545,22 @@ def action_text(message, content, *, question=False):
         return None
     if getattr(message, "message_snapshots", None):
         return None
-    if re.search(r"[`\"“”]|(?:^|\n)\s*>|https?://", content or ""):
+    text = content or ""
+    if '```' in text:
         return None
-    if re.search(r"\b(example|quote|quoted|said|says|bola|bolta|kehta|forwarded|agar|if|don't|dont|not|mat|nahi|nhi)\b", content or "", re.I) or (not question and '?' in (content or '')):
+    # Inline `name` spans in the author's own direct request delimit a name,
+    # not a command: unwrap spans that are plainly just a name/mention, and
+    # keep every other check on the unwrapped text. Anything else in code
+    # formatting still refuses side effects below.
+    def _unwrap(m):
+        inner = m.group(1)
+        return inner if re.fullmatch(r"[@#]?[\w][\w .\-]{0,38}", inner) else m.group(0)
+    text = re.sub(r"`([^`\n]{1,40})`", _unwrap, text)
+    if re.search(r"[`\"“”]|(?:^|\n)\s*>|https?://", text):
         return None
-    return _addressed_text(content)
+    if re.search(r"\b(example|quote|quoted|said|says|bola|bolta|kehta|forwarded|agar|if|don't|dont|not|mat|nahi|nhi)\b", text, re.I) or (not question and '?' in text):
+        return None
+    return _addressed_text(text)
 
 
 def _addressed_text(content):
