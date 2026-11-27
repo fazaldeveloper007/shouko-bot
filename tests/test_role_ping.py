@@ -62,14 +62,37 @@ class RolePing(HarnessBase):
         self.assertNotIn('<@&', text)
         self.assertIn('@Ghost role', text)
 
-    async def test_marker_stripped_for_non_action_text(self):
-        # Backticked/quoted requests are deliberately not action-eligible:
-        # no ping may happen, and the marker must not leak through.
-        self.script('[[tag:Silly role]] ping kar diya!')
+    async def test_inline_backticked_name_still_pings(self):
+        # The screenshot wording: inline backticks delimit the role name in a
+        # direct request; the ping must still really happen.
+        self.script('lo ji, [[tag:Silly role]] ping kar diya hai!')
         m = self.msg(self.owner, 'Kristy `Silly role` ping karo')
         await self.bot.on_message(m)
         call = self.last_call(m)
+        self.assertIn('<@&777>', call.args[0])
+        self.assertIn(self.silly, call.kwargs['allowed_mentions'].roles)
+
+    async def test_fenced_code_block_still_refuses_action(self):
+        # Code blocks / quoted instructions stay non-action: no ping, and the
+        # marker must not leak through.
+        self.script('[[tag:Silly role]] ping kar diya!')
+        m = self.msg(self.owner, 'Kristy ```Silly role ping karo``` bhejo')
+        await self.bot.on_message(m)
+        call = self.last_call(m)
         self.assertNotIn('<@&777>', call.args[0])
+
+    async def test_ambiguous_role_name_asks_instead_of_guessing(self):
+        dupe = types.SimpleNamespace(id=778, name='Silly role', mentionable=True,
+                                     is_default=lambda: False)
+        self.guild.roles = [self.silly, dupe]
+        self.script('[[tag:Silly role]] ping kar diya!')
+        m = self.msg(self.owner, 'Kristy Silly role ping karo')
+        await self.bot.on_message(m)
+        call = self.last_call(m)
+        text = call.args[0]
+        self.assertNotIn('<@&', text)
+        self.assertIn('@Silly role', text)
+        self.assertFalse(call.kwargs['allowed_mentions'].roles)
 
 
 if __name__ == '__main__':
