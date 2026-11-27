@@ -132,12 +132,16 @@ or when they explicitly asked to be pinged. Do not add it just because you are
 replying to them, answering an ordinary question, or mentioning their name.
 When in doubt, omit it. Never write Discord mention syntax yourself.
 
-TAGGING ANOTHER MEMBER:
-Only when the user explicitly asks you to tag/mention ANOTHER server member,
-put [[tag:their name]] in your reply exactly where the mention belongs, using
-the name the user gave. One tag per person. Never tag anyone you were not
-asked to tag, never use it for @everyone or roles. If the request does not
-name a specific person, ask who they mean instead of guessing.
+TAGGING ANOTHER MEMBER OR A ROLE:
+Only when the user explicitly asks you to tag/mention ANOTHER server member
+or a role, put [[tag:the name]] in your reply exactly where the mention
+belongs, using the exact name the user gave. One tag per target. Never tag
+anyone you were not asked to tag, and never use it for @everyone. If the
+request does not name a specific person or role, ask who they mean instead
+of guessing. A [[tag:...]] is the ONLY way a real ping ever happens: the
+code turns the marker into the actual mention and reports when it could
+not. Never claim you pinged someone without the marker - that claim would
+be false.
 
 NICKNAMES & VC SUMMONS (handled by code, no marker needed):
 Members can teach you nicknames ("Mayank ka username mayank_123" or
@@ -1367,16 +1371,16 @@ def chunk_reply(text, limit=MAX_REPLY_CHARS):
     return chunks
 
 
-def reply_mentions(message, extra_users=()):
-    """Allow only the addressed member (plus explicitly tagged members) to be
-    pinged, never roles/everyone."""
+def reply_mentions(message, extra_users=(), extra_roles=()):
+    """Allow only the addressed member (plus explicitly tagged members/roles)
+    to be pinged, never @everyone/@here."""
     seen, users = set(), []
     for u in (message.author, *extra_users):
         if u.id not in seen:
             seen.add(u.id)
             users.append(u)
     return discord.AllowedMentions(
-        users=users, roles=False, everyone=False, replied_user=False
+        users=users, roles=list(extra_roles) if extra_roles else False, everyone=False, replied_user=False
     )
 
 
@@ -1432,28 +1436,46 @@ def find_role_target(guild, name):
 
 def resolve_tag_requests(message, text):
     """Swap the model's [[tag:name]] markers for real mentions of verified
-    members. Ambiguous or unknown names become plain @name text (no ping) and
-    are reported back so she can ask who was meant."""
+    members or roles. Members win on a shared name. Ambiguous or unknown
+    names become plain @name text (no ping) and are reported back so she
+    can ask who was meant; a role that exists but cannot actually notify
+    (not mentionable and no Mention Roles permission) is reported instead
+    of being faked as pinged."""
     text = text or ""
     if not TAG_MARKER_RE.search(text):
-        return text, [], []
-    resolved, unclear = [], []
+        return text, [], [], [], []
+    resolved, roles, unclear, blocked = [], [], [], []
 
     def _sub(match):
-        member, is_unclear = find_tag_target(message.guild, match.group(1))
+        name = match.group(1).strip()
+        member, _unused = find_tag_target(message.guild, name)
         if member is not None:
             resolved.append(member)
             return f"<@{member.id}>"
-        unclear.append(match.group(1).strip())
-        return "@" + match.group(1).strip()
+        role, _unused = find_role_target(message.guild, name)
+        if role is not None:
+            me = getattr(message.guild, 'me', None)
+            perms = message.channel.permissions_for(me) if me is not None and hasattr(message.channel, 'permissions_for') else None
+            if getattr(role, 'mentionable', False) or getattr(perms, 'mention_everyone', False):
+                roles.append(role)
+                return f"<@&{role.id}>"
+            blocked.append(role.name)
+            return "@" + role.name
+        unclear.append(name)
+        return "@" + name
 
     out = TAG_MARKER_RE.sub(_sub, text)
-    return out, resolved, unclear
+    return out, resolved, roles, unclear, blocked
 
 
 TAG_UNCLEAR_LINES = [
     "ek sec - {names} clear nahi ho paya, galat banda tag nahi karna 😅 poora username batao na?",
     "ruko, {names} se mujhe sure nahi hai kaun... exact username doge? wrong person ko ping nahi karna 🥺",
+]
+
+ROLE_BLOCKED_LINES = [
+    "{names} ka ping maine nahi kiya - woh role mentionable nahi hai aur mere paas Mention Roles permission nahi. Role settings mein \"Allow anyone to @mention this role\" on kar do, phir pakka ping karungi!",
+    "ruk, {names} ko abhi ping nahi kar paungi: role mentionable nahi hai aur mere paas Mention Roles permission nahi. Setting on karo toh kar dungi, jhootha ping nahi bolungi 😅",
 ]
 
 # ---------------------------------------------------------------------------
@@ -3175,10 +3197,13 @@ async def on_message(message):
         # clarification ask instead of a guessed ping
         if action_text(message, content) is None:
             reply = TAG_MARKER_RE.sub(lambda m: m.group(1), reply)
-        reply, tag_members, tag_unclear = resolve_tag_requests(message, reply)
+        reply, tag_members, tag_roles, tag_unclear, tag_blocked = resolve_tag_requests(message, reply)
         if tag_unclear:
             names = ", ".join(f'"{n}"' for n in tag_unclear)
             reply = (reply + "\n\n" + random.choice(TAG_UNCLEAR_LINES).format(names=names)).strip()
+        if tag_blocked:
+            names = ", ".join(f'@{n}' for n in tag_blocked)
+            reply = (reply + "\n\n" + random.choice(ROLE_BLOCKED_LINES).format(names=names)).strip()
         # history keeps her reply for context, bounded so long chunked answers
         # cannot eat the brain's input-token headroom; the full text already
         # lives in the channel for anyone to scroll back to
@@ -3196,7 +3221,7 @@ async def on_message(message):
         sent_first = await message.reply(
             first,
             mention_author=False,
-            allowed_mentions=reply_mentions(message, extra_users=tag_members),
+            allowed_mentions=reply_mentions(message, extra_users=tag_members, extra_roles=tag_roles),
         )
         # a just-sent announce preview gets its message id bound, so a plain
         # confirm/cancel replying to it can be told apart from other pendings
