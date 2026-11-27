@@ -1478,6 +1478,106 @@ ROLE_BLOCKED_LINES = [
     "ruk, {names} ko abhi ping nahi kar paungi: role mentionable nahi hai aur mere paas Mention Roles permission nahi. Setting on karo toh kar dungi, jhootha ping nahi bolungi 😅",
 ]
 
+# Deterministic direct tag/ping execution. An explicit request in the current
+# addressed message is parsed and executed in CODE (same trust rules as the
+# alias/summon handlers): the model is never asked, so a ping cannot depend
+# on marker cooperation and success prose can never outrun what was sent.
+TAG_VERB_RE = re.compile(r"\b(?:ping|tag|mention)\b", re.I)
+TAG_NAMED_RE = re.compile(r"(?P<name>[\w][\w .\-]{0,38}?)\s+naam\s+ka\s+(?:ek\s+)?(?:role|member|banda|user)\b", re.I)
+_TAG_FILLER = r"(?:(?:please|plz|bhai|abhi|jaldi|zara|ek\s+baar)\s+)*"
+_TAG_VERBS = r"(?:kar|karo|kardo|kar\s+do|kar\s+dena|kar\s+dijo)"
+TAG_PRE_RE = re.compile(r"^" + _TAG_FILLER + r"(?P<name>[@\w][\w .\-]{0,38}?)\s+(?:(?:usko|isko|unhe|ko)\s+)?(?:ping|tag|mention)\s*" + _TAG_VERBS + r"?\s*[.!]*$", re.I)
+TAG_POST_RE = re.compile(r"^" + _TAG_FILLER + r"(?:ping|tag|mention)\s+(?P<name>[@\w][\w .\-]{1,38}?)(?:\s+" + _TAG_VERBS + r")?\s*[.!]*$", re.I)
+TAG_BARE_RE = re.compile(r"^" + _TAG_FILLER + r"(?:(?P<everyone>sabko|sab\s+ko|everyone|sab)\s+|(?:(?:usko|isko|unhe)\s+))?(?:ping|tag|mention)\s*" + _TAG_VERBS + r"\s*[.!]*$", re.I)
+_TAG_STOPWORDS = {'kar', 'karo', 'kardo', 'do', 'dena', 'dijo', 'karna', ''}
+
+
+async def maybe_direct_tag(message, content):
+    """Execute an explicit direct ping/tag request in code, or say clearly
+    why not. Returns True when the message was a direct tag request (handled
+    either way); False when it is ordinary chat for the brain."""
+    if message.guild is None:
+        return False
+    text = action_text(message, content)
+    if text is None or not TAG_VERB_RE.search(text):
+        return False
+    reply = lambda s: message.reply(s, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    native_roles = list(getattr(message, 'role_mentions', None) or [])
+    native_members = [mm for mm in (getattr(message, 'mentions', None) or [])
+                      if not getattr(mm, 'bot', False) and mm.id != message.author.id]
+    name = None
+    m = TAG_NAMED_RE.search(text)
+    if m:
+        name = m.group('name')
+    if not name:
+        pre = TAG_PRE_RE.match(text)
+        if pre:
+            name = (pre.group('name') or '').strip(' @#.,!')
+    if not name:
+        post = TAG_POST_RE.match(text)
+        if post:
+            name = (post.group('name') or '').strip(' @#.,!')
+    if name and name.casefold() in _TAG_STOPWORDS:
+        name = None
+    if name and name.casefold() in ('sabko', 'sab ko', 'sab', 'everyone'):
+        await reply('@everyone wala ping nahi karti - exact member ya role ka naam do, sirf usi ko ping karungi.')
+        return True
+    if not name and not native_roles and not native_members:
+        bare = TAG_BARE_RE.match(text)
+        if not bare:
+            return False  # 'ping' inside ordinary chat, not a direct request
+        if bare.group('everyone') or re.search(r'@everyone|@here', text, re.I):
+            await reply('@everyone wala ping nahi karti - exact member ya role ka naam do, sirf usi ko ping karungi.')
+        else:
+            await reply('Kisko ping karna hai? exact member ya role ka naam likho, ya @mention karke bolo.')
+        return True
+    if re.search(r'@everyone|@here', text, re.I):
+        await reply('@everyone wala ping nahi karti - exact member ya role ka naam do, sirf usi ko ping karungi.')
+        return True
+    role = native_roles[0] if native_roles else None
+    member = native_members[0] if native_members else None
+    if role is None and member is None:
+        member, _unused = find_tag_target(message.guild, name)
+        if member is None:
+            role, _unused = find_role_target(message.guild, name)
+        if member is None and role is None:
+            await reply(f'"{name}" se koi ek exact member ya role nahi mila - galat tag nahi karna. Poora exact naam ya @mention do.')
+            return True
+    if role is not None:
+        me = getattr(message.guild, 'me', None)
+        perms = message.channel.permissions_for(me) if me is not None and hasattr(message.channel, 'permissions_for') else None
+        if not (getattr(role, 'mentionable', False) or getattr(perms, 'mention_everyone', False)):
+            await reply(f'@{role.name} ka ping nahi kar paungi - role mentionable nahi hai aur mere paas Mention Roles permission nahi. Role settings mein "Allow anyone to @mention this role" on kar do, phir pakka ping karungi!')
+            return True
+        text_out = f'lo ji, <@&{role.id}> ping! 📣'
+        allowed = discord.AllowedMentions(users=False, roles=[role], everyone=False, replied_user=False)
+        kind, payload = 'role_tag', {'role_id': role.id, 'role_name': role.name}
+    else:
+        text_out = f'lo ji, <@{member.id}> tag! 😄'
+        allowed = discord.AllowedMentions(users=[member], roles=False, everyone=False, replied_user=False)
+        kind, payload = 'member_tag', {'member_id': member.id}
+
+    async def _send():
+        return await message.channel.send(text_out, allowed_mentions=allowed)
+
+    if _executor is not None:
+        outcome = await _executor.run(kind, _send, guild=message.guild.id,
+                                      channel=message.channel.id, author=message.author.id,
+                                      payload=payload, result_of=lambda s: 'posted')
+        if not outcome.ok:
+            # The send may have reached Discord before the error: never claim
+            # failure, never resend the ping.
+            log.warning('direct tag send outcome unknown: %s', type(outcome.error).__name__ if outcome.error else '?')
+            await reply('Ping ka result confirm nahi hua - ho sakta hai chala gaya ho. Main dobara nahi bhejungi; channel mein check kar lena.')
+        return True
+    try:
+        await _send()
+    except Exception as exc:
+        log.warning('direct tag send outcome unknown: %s', type(exc).__name__)
+        await reply('Ping ka result confirm nahi hua - ho sakta hai chala gaya ho. Main dobara nahi bhejungi; channel mein check kar lena.')
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Nickname registry + VC summons.
 # Both are handled in CODE, parsed from the CURRENT addressed message only.
@@ -2675,6 +2775,7 @@ _schedule_store = timed_messages.Store(self_diary.PATH.parent / 'scheduled-messa
 # tools: pending confirmations survive restarts, and every finished step
 # records the status it actually ended in.
 _ledger = agent_core.TaskLedger(self_diary.PATH.parent / 'action-ledger.sqlite3')
+_executor = agent_core.Executor(_ledger)
 _pending_restored = False
 
 def _restore_pending_once():
@@ -3016,6 +3117,8 @@ async def on_message(message):
         return
     if action_text(message, content) is not None and re.search(r"\b(vc|voice)\b", content, re.I) and SUMMON_VERB_RE.search(content):
         await handle_summon(message, content)
+        return
+    if await maybe_direct_tag(message, content):
         return
 
     # load this member's diary (fail-open: any problem just means no diary block)
