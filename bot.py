@@ -2838,6 +2838,9 @@ _schedule_worker = timed_messages.Worker(client, _schedule_store, connected=lamb
 _schedule_commands = schedule_commands.Commands(_schedule_store, find_tag_target, OWNER_ID, ledger=_ledger)
 _schedule_commands.role_resolver = find_role_target
 _actions = actions.Actions(client, OWNER_ID, _schedule_store, ledger=_ledger)
+# An open reminder clarification blocks the announce path from hijacking the
+# conversation (the two routers share no state otherwise).
+_actions.reminder_pending = lambda message: _schedule_commands.pending_item(message) is not None
 _schedule_commands.bot_id = lambda: client.user.id if client.user else None
 _own_deleter = delete_own.Deleter(OWNER_ID, lambda: client.user.id if client.user else None)
 _schedule_commands.health = _schedule_worker.health
