@@ -35,6 +35,12 @@ _SELF_WORDS = {'me', 'mujhe', 'mujhko', 'mujko', 'humhe', 'humko'}
 _CONNECTORS = {'to', 'ki', 'ke', 'ko', 'ka', 'pe', 'par', 'per', 'that', 'mein', 'me', 'se', 'karke', 'please', 'plz', 'ok', 'okay', 'aur', 'ya'}
 _HERE_WORDS = re.compile(r'\b(?:here|yahan|yahi|isi\s+channel(?:\s+(?:mein|me|pe|par))?|is\s+channel(?:\s+(?:mein|me|pe|par))?)\b', re.I)
 _TAG_WORDS = re.compile(r'\b(?:by\s+)?tag(?:ging|ed)?\b|\bping(?:ing|ed)?\b', re.I)
+# A direct "current one / yahin" answer to the destination question: every
+# #mention in the original request is payload (e.g. a voice channel to join),
+# and the reminder posts in the channel the conversation is in.
+_HERE_ANSWER = re.compile(r'(?:current(?:\s+(?:one|channel))?|this\s+channel|isi\s+channel(?:\s+(?:mein|me|pe|par))?|is\s+channel(?:\s+(?:mein|me|pe|par))?|yahin|yahi|yahan|here|same\s+channel)[\s!.]*', re.I)
+# Explicit fielded request form: "- message : ... - time : ... - ping : ...".
+_STRUCTURED_FIELD = re.compile(r'(?:^|[-–—\n])\s*\b(message|msg|time|ping|tag|channel)\s*:\s*', re.I)
 # Scheduling-command filler: a body made only of these has no payload.
 _COMMAND_FILLER = _SELF_WORDS | _CONNECTORS | {'laga', 'lagana', 'lagao', 'set', 'karo', 'kar', 'karna', 'do', 'dena', 'dijiye', 'rakh', 'rakho', 'rakhna', 'chahiye', 'hai', 'hain', 'tha', 'thi', 'bhej', 'bhejna', 'bhejo', 'bol', 'bolna', 'bolo', 'bula', 'bulana', 'bulao', 'message', 'remind', 'reminder', 'yaad', 'dila', 'dilana', 'ek', 'mera', 'meri', 'mere', 'liye', 'na'}
 
@@ -366,6 +372,73 @@ class Commands:
         if not body:return None
         return [when,dest,', '.join(f'<@{t}>' for t in targets) or 'none',body]
 
+    def structured_parts(self,kind,text,message,anchor):
+        """Explicit '- message : ... - time : ... - ping : ...' form, parsed in
+        code only. Every field is literal data from the user's own request, so
+        no model call and no clarify loop: the recurrence rule, channel
+        mentions inside the payload and the role audience survive exactly as
+        written. Returns (kind, parts) or None when the complete form is
+        absent; raises ValueError with the honest reason on a bad field."""
+        marks=list(_STRUCTURED_FIELD.finditer(text))
+        if not marks:return None
+        fields={}
+        for i,mk in enumerate(marks):
+            name={'msg':'message','tag':'ping'}.get(mk[1].casefold(),mk[1].casefold())
+            end=marks[i+1].start() if i+1<len(marks) else len(text)
+            value=text[mk.end():end].strip(' \t\r\n-–—')
+            if name in fields:
+                # the same request re-seen via pending/history repeats fields
+                # verbatim; a genuinely conflicting repeat stays ambiguous
+                if fields[name]==value:continue
+                return None
+            fields[name]=value
+        body=fields.get('message') or ''
+        when=fields.get('time') or ''
+        if not body or not when:return None
+        when=' '.join(when.split())
+        if re.fullmatch(r'(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)',when,re.I):
+            when=f'aaj {when}'  # bare clock: same today-rule as natural time
+        dest='here'
+        chan=fields.get('channel') or ''
+        if chan:
+            cm=re.fullmatch(r'<#(\d+)>',chan.strip())
+            if not cm:raise ValueError('Channel field native #channel mention hona chahiye.')
+            dest=f'<#{cm[1]}>'
+        targets=[];roles=[]
+        ping=fields.get('ping') or ''
+        if ping:
+            for raw in re.split(r'\s*,\s*|\s+and\s+|\s+aur\s+',ping):
+                raw=raw.strip()
+                if not raw:continue
+                mm=re.fullmatch(r'<@!?(\d+)>',raw);rr=re.fullmatch(r'<@&(\d+)>',raw)
+                if mm:
+                    member=message.guild.get_member(int(mm[1]))
+                    if member is None or getattr(member,'bot',False):raise ValueError('Ping field ka member verify nahi hua.')
+                    targets.append(member);continue
+                if rr:
+                    role=_guild_role(message.guild,int(rr[1]))
+                    if role is None:raise ValueError('Ping field ka role verify nahi hua.')
+                    roles.append(role);continue
+                name=raw.lstrip('@').strip()
+                member=self.resolver(message.guild,name)[0]
+                if member is not None:
+                    if getattr(member,'bot',False):raise ValueError(f'"{name}" member nahi mila; exact username ya @mention do.')
+                    targets.append(member);continue
+                role=self.find_role(message.guild,name)
+                if role is None:raise ValueError(f'"{name}" member ya role nahi mila; exact name ya native @mention do.')
+                roles.append(role)
+        if not targets and not roles:
+            return 'remind',[when,dest,body]
+        seen={message.author.id};tt=[f'<@{message.author.id}>']
+        for t in targets:
+            if t.id in seen:continue
+            seen.add(t.id);tt.append(f'<@{t.id}>')
+        rseen=set()
+        for r in roles:
+            if r.id in rseen:continue
+            rseen.add(r.id);tt.append(f'<@&{r.id}>')
+        return 'schedule',[when,dest,', '.join(tt),body]
+
     async def referenced(self,message):
         ref=message.reference
         target=getattr(ref,'resolved',None)
@@ -484,8 +557,12 @@ class Commands:
         if self.history_provider is not None:
             try:hist=list(self.history_provider(message) or [])
             except Exception:hist=[]
+            seen={' '.join((orig or '').casefold().split()),' '.join(text.casefold().split())}
             for a,aid,content in hist[-8:]:
                 if aid is not None and aid==message.author.id and isinstance(content,str) and content.strip():
+                    norm=' '.join(content.casefold().split())
+                    if norm in seen:continue  # the pending original and the current line never count twice
+                    seen.add(norm)
                     user_hist.append(content.strip())
             chat_lines=[f'{a}: {content}' for a,aid,content in hist[-8:] if isinstance(content,str) and content.strip()]
         else:
@@ -494,6 +571,29 @@ class Commands:
             request=(orig+'\n' if orig else '')+'\n'.join(user_hist[-3:]+[text])
         if anchor is None:
             await self.reply(message,'Original message ka time verify nahi hua; kuch save nahi hua.');return True
+        # An explicit '- message : ... - time : ... - ping : ...' request is
+        # complete and literal: code parses and saves it directly, no model
+        # call, no clarify loop, and recurrence/role/payload survive intact.
+        # Parsed from the current line (or the pending original) only: the
+        # history-augmented request can carry a second copy whose fields would
+        # run into the first copy's last field.
+        try:
+            formed=self.structured_parts(kind,text,message,anchor)
+            if formed is None and orig:
+                formed=self.structured_parts(kind,orig,message,anchor)
+        except (ValueError,TypeError) as exc:
+            await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
+            return True
+        if formed is not None:
+            fkind,fparts=formed
+            try:
+                await self._commit(message,client,fkind,fparts,time.time(),anchor)
+                self._pending_pop(key)
+            except (ValueError,TypeError) as exc:
+                await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
+            except OSError:
+                await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
+            return True
         # Conditional follow-ups ('if I don't reply in 5 mins then ...') are not
         # a scheduler capability. Ask once on the first turn instead of silently
         # saving only part of the request; the kept text drops the condition so a
@@ -558,11 +658,15 @@ class Commands:
             if chosen is None:
                 await self.clarify(message,problem,request,anchor,key=key);return True
             when,when_anchor=chosen
-            dests=re.findall(r'<#(\d+)>',request)
-            if len(dests)>1:raise ValueError('Ek hi destination channel do.')
-            if dests and not re.search(rf'(?:\b(?:in|to|on|at)\s+<#{dests[0]}>|<#{dests[0]}>\s*(?:mein|me|pe|par|channel)\b|\bchannel\s+<#{dests[0]}>)',request,re.I):
+            dests=list(dict.fromkeys(re.findall(r'<#(\d+)>',request)))
+            # An explicit "current one / yahin" answer to the destination
+            # question: every #mention in the request stays message payload
+            # (e.g. a voice channel to join), the reminder posts here.
+            here_answer=bool(orig) and bool(_HERE_ANSWER.fullmatch(text.strip()))
+            if len(dests)>1 and not here_answer:raise ValueError('Ek hi destination channel do.')
+            if dests and not here_answer and not re.search(rf'(?:\b(?:in|to|on|at)\s+<#{dests[0]}>|<#{dests[0]}>\s*(?:mein|me|pe|par|channel)\b|\bchannel\s+<#{dests[0]}>)',request,re.I):
                 await self.clarify(message,'Kis channel mein bhejna hai? "<#channel> mein" likho, ya bina channel ke yahin bhejti hoon.',request,anchor,key=key);return True
-            dest=f'<#{dests[0]}>' if dests else 'here'
+            dest='here' if here_answer or not dests else f'<#{dests[0]}>'
             # A helper only supplies details; the reminder always belongs to
             # the member who asked for it, never to the helper.
             targets=[str(key[2])]
@@ -614,7 +718,10 @@ class Commands:
             await self._commit(message,client,kind,parts,time.time(),when_anchor)
             self._pending_pop(key)
         except (ValueError,TypeError) as exc:
-            self._pending_pop(key)
+            # A user-fixable input problem (unknown name, passed time, channel
+            # ambiguity) keeps the open clarification so the follow-up answer
+            # completes the SAME request; only invalid model data drops it.
+            if isinstance(exc,TypeError):self._pending_pop(key)
             await self.reply(message,str(exc) if isinstance(exc,ValueError) else 'Request data invalid hai; kuch save nahi hua.')
         except OSError:
             await self.reply(message,'Schedule storage read/write nahi hua; success confirm nahi karungi.')
@@ -673,8 +780,11 @@ class Commands:
             if any(not getattr(r,'mentionable',False) and not mention_all for r in roles):
                 raise ValueError('Is role ka ping silent ho jayega: role mentionable nahi hai aur mere paas Mention Roles permission nahi. Role settings mein "Allow anyone to @mention this role" on karo ya mujhe permission do, phir dobara set karo.')
         if not body or len(body)>1000:raise ValueError('Exact message 1-1000 characters ka do.')
-        if re.search(r'@everyone|@here|<@|<#|\[\[(?:tag|search):',body,re.I):
-            raise ValueError('Payload mein mention/command markers nahi; tags sirf target field se do.')
+        # Channel mentions are inert payload (they notify nobody), so "join
+        # this <#voice>" stays in the reminder text; only pinging mentions and
+        # command markers are refused.
+        if re.search(r'@everyone|@here|<@|\[\[(?:tag|search):',body,re.I):
+            raise ValueError('Payload mein member/role/everyone mention ya command markers nahi; tags sirf target field se do.')
         core=None
         if reminder:core=body;body=f'Reminder: {body}'
         prefix=' '.join([f'<@{t.id}>' for t in targets]+[f'<@&{r.id}>' for r in roles])
