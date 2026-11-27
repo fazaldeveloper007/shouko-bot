@@ -98,6 +98,7 @@ class Actions:
         self.last_preview = None  # (channel, ident) awaiting its sent-message id
         self.ledger = ledger
         self.executor = agent_core.Executor(ledger) if ledger is not None else None
+        self.reminder_pending = None  # bot.py wires: open reminder clarification probe
         self.builder = server_builder.Builder(client, ledger=ledger) if os.getenv('KRISTY_SERVER_BUILDER', '1') != '0' else None
 
     def _ledger_stash_preview(self, ident, entry):
@@ -160,8 +161,13 @@ class Actions:
         t = (text or '').strip()
         if self.builder and await self.builder.handle(message, t):
             return True
+        if await self._maybe_correct_preview(message, t):
+            return True
         explicit=re.fullmatch(r'announce schedule ([^|]{3,80})\|\s*(everyone|quiet)\s*\|\s*#?([a-z0-9_-]{1,32})\s*\|\s*(.{5,600})',t,re.I|re.S)
         if explicit:
+            blocked=self._announce_blocked(message)
+            if blocked:
+                await message.reply(blocked,mention_author=False);return True
             when,scope,channel,draft=explicit.groups()
             try:due=self._announcement_due(message,when.strip(),t)
             except ValueError as exc:
@@ -200,6 +206,142 @@ class Actions:
         else:
             ident = mine[0][0]
         return await self._finish(message, verb, ident, self.pending[ident])
+
+    _DATE_TODAY = re.compile(r'\b(?:today|aaj)\b', re.I)
+    _DATE_TOMORROW = re.compile(r'\b(?:tomorrow|tommorow|tomorow|kal)\b', re.I)
+    _NEG_TODAY = re.compile(r'\b(?:not|nahi|nhi|mat|no)\s+(?:for\s+)?(?:today|aaj)\b', re.I)
+    _NEG_TOMORROW = re.compile(r'\b(?:not|nahi|nhi|mat|no)\s+(?:for\s+)?(?:tomorrow|tommorow|tomorow|kal)\b', re.I)
+    _CLOCK = re.compile(r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b', re.I)
+
+    def _correction_date(self, t):
+        """Which date the owner means in a correction like 'not tomorrow, from
+        today': the negated date word loses, the surviving one wins."""
+        neg_today = bool(self._NEG_TODAY.search(t)); neg_tom = bool(self._NEG_TOMORROW.search(t))
+        want_today = bool(self._DATE_TODAY.search(t)) and not neg_today
+        want_tom = bool(self._DATE_TOMORROW.search(t)) and not neg_tom
+        if neg_tom and want_today:return 'aaj'
+        if neg_today and want_tom:return 'kal'
+        if want_today != want_tom:return 'aaj' if want_today else 'kal'
+        return None
+
+    def _preview_text(self, entry, channel_name):
+        due = entry.get('due')
+        draft = entry['text']
+        if entry['ping'] and draft.startswith('@everyone\n'):
+            draft = draft[len('@everyone\n'):]
+        return ('announcement preview (abhi post NAHI hua):\n'
+                f'channel: #{channel_name}\n'
+                f'ping: {"everyone" if entry["ping"] else "none (quiet post)"}\n'
+                + (f'posting time: {tm.shown(due)}; more than 2 minutes late = skip\n' if due is not None else 'posting time: now, after confirm\n') +
+                f'---\n{draft}\n---\n'
+                'bhejne ke liye: confirm\n'
+                'cancel ke liye: cancel\n'
+                'preview 5 minute mein expire ho jayega.')
+
+    async def _maybe_correct_preview(self, message, t):
+        """A date/time correction to the owner's own open preview edits THAT
+        preview in place ('not tomorrow, from today' moves the same draft to
+        today) instead of falling through to chat, where the model would
+        start an unrelated new flow. Not consumed when no correction is
+        meant; the pending preview itself is never lost."""
+        if not re.search(r'\b(?:today|aaj|tomorrow|tommorow|tomorow|kal)\b', t or '', re.I):
+            return False
+        now = time.monotonic()
+        mine = [(k, e) for k, e in self.pending.items()
+                if e['author'] == message.author.id and e['channel'] == message.channel.id]
+        if len(mine) != 1:
+            return False
+        ident, entry = mine[0]
+        if now > entry['expires']:
+            return False
+        anchor = getattr(message, 'created_at', None)
+        if not isinstance(anchor, dt.datetime) or anchor.tzinfo is None:
+            return False
+        date_word = self._correction_date(t)
+        clock = None
+        m = self._CLOCK.search(t)
+        if m:
+            clock = (int(m[1]), int(m[2] or 0), m[3].lower())
+        if date_word is None and clock is None:
+            return False
+        old_due = entry.get('due')
+        if clock is None:
+            m2 = self._CLOCK.search(entry.get('text', '') or '')
+            if m2:
+                clock = (int(m2[1]), int(m2[2] or 0), m2[3].lower())
+        local_anchor = anchor.astimezone(tm.IST)
+        if date_word in ('aaj', 'today'):
+            date = local_anchor.date()
+        elif date_word in ('kal', 'tomorrow'):
+            date = local_anchor.date() + dt.timedelta(days=1)
+        elif old_due is not None:
+            date = dt.datetime.fromtimestamp(old_due, tm.IST).date()
+        else:
+            date = local_anchor.date()
+        if clock is not None:
+            hour = clock[0] % 12 + (12 if clock[2] == 'pm' else 0); minute = clock[1]
+        elif old_due is not None:
+            old_local = dt.datetime.fromtimestamp(old_due, tm.IST)
+            hour, minute = old_local.hour, old_local.minute
+        else:
+            await message.reply('Naya posting time samajh nahi aaya (AM/PM ke saath likho); preview wahi pending hai, kuch change nahi hua.', mention_author=False)
+            return True
+        new_due = dt.datetime.combine(date, dt.time(hour, minute), tm.IST).timestamp()
+        if new_due <= time.time():
+            await message.reply('Woh time nikal gaya; preview wahi pending hai, kuch change nahi hua.', mention_author=False)
+            return True
+        entry['due'] = new_due
+        entry['expires'] = time.monotonic() + self.PREVIEW_TTL
+        # keep the announcement text's own date word honest with the new date
+        if date_word in ('aaj', 'today'):
+            updated, n = self._DATE_TOMORROW.subn('today', entry['text'], count=1)
+        else:
+            updated, n = self._DATE_TODAY.subn('tomorrow', entry['text'], count=1)
+        if n:
+            entry['text'] = updated
+        self._ledger_stash_preview(ident, entry)
+        self.last_preview = (message.channel.id, ident)
+        target = self.client.get_channel(entry.get('target', entry['channel']))
+        await message.reply('Theek hai, posting time update kiya:\n' +
+                            self._preview_text(entry, getattr(target, 'name', '?')),
+                            mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        return True
+
+    def _announce_blocked(self, message):
+        """An announcement must not take over a reminder request: the announce
+        path has no series and no role audience, so a daily or role-ping
+        request landing here would silently lose both. Returns the refusal
+        line, or None when the request is a plain announcement."""
+        content = getattr(message, 'content', '') or ''
+        if self.reminder_pending is not None:
+            try:
+                if self.reminder_pending(message):
+                    return ('Tumhara reminder ka clarification abhi khula hai; pehle wahi poora karo. '
+                            'Announcement preview nahi banaya.')
+            except Exception:
+                log.warning('reminder_pending probe failed', exc_info=True)
+        if re.search(r'\b(?:every\s+day|daily|weekly|monthly|har\s+din)\b|\bevery\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', content, re.I):
+            return ('Repeating (daily/weekly/monthly) post announcement se nahi banta; woh reminder ka kaam hai. '
+                    'Jaise: Kristy remind ... every day 9 PM. Kuch preview/save nahi hua.')
+        role_refusal = ('Announcement sirf @everyone ya quiet hota hai, kisi role ka ping nahi. '
+                        'Role ping wala scheduled message reminder/schedule se banao. Kuch preview/save nahi hua.')
+        if re.search(r'<@&\d+>', content):
+            return role_refusal
+        names = {getattr(r, 'name', '').casefold() for r in (getattr(message.guild, 'roles', None) or [])
+                 if not getattr(r, 'is_default', lambda: False)()}
+        if names:
+            spans = []
+            for m in re.finditer(r'\b(?:tag(?:ging|ged)?|ping(?:ing|ed)?)\b\s*[:,.\-]?\s*@?([\w.\-]+(?:\s+[\w.\-]+){0,4})', content, re.I):
+                spans.append(m[1])
+            for m in re.finditer(r'(?<![\w.])@?([\w.\-]+(?:\s+[\w.\-]+){0,4})\s+(?:ko\s+)?(?:tag|ping)\b', content, re.I):
+                spans.append(m[1])
+            for span in spans:
+                words = span.split()
+                for i in range(len(words)):
+                    for n in range(len(words) - i, 0, -1):
+                        if ' '.join(words[i:i + n]).casefold() in names:
+                            return role_refusal
+        return None
 
     def note_preview_sent(self, channel_id, message_id):
         """Bind the just-sent preview's message id for reply-based disambiguation."""
@@ -300,6 +442,8 @@ class Actions:
                 return plan
         scheduled=SCHEDULE_RE.fullmatch(reply or '')
         if scheduled:
+            blocked=self._announce_blocked(message)
+            if blocked:return blocked
             scope,channel,when,draft=scheduled.groups()
             try:due=self._announcement_due(message,when,getattr(message,'content',''))
             except ValueError as exc:return str(exc)
@@ -327,6 +471,8 @@ class Actions:
                 return self._reminder_list(message)
             if cmd.startswith('announce'):
                 if not self.is_owner(message):return 'announcement sirf server owner kara sakta hai.'
+                blocked=self._announce_blocked(message)
+                if blocked:return blocked
                 # An AI marker may not silently drop a requested posting time.
                 if re.search(r'\b(?:schedule|scheduled|at|baje|baad|tomorrow|kal|today|aaj)\b|\d{1,2}\s*(?:am|pm)\b',getattr(message,'content',''),re.I):
                     return 'Posting time clear karo: Kristy announce schedule tomorrow 9 PM | quiet | #channel | announcement text. Event time aur posting time alag hain; abhi kuch save/post nahi hua.'
@@ -538,11 +684,4 @@ class Actions:
         self._ledger_stash_preview(ident, self.pending[ident])
         self.last_preview = (message.channel.id, ident)
         channel_name = getattr(target, 'name', '?')
-        return ('announcement preview (abhi post NAHI hua):\n'
-                f'channel: #{channel_name}\n'
-                f'ping: {"everyone" if ping else "none (quiet post)"}\n'
-                + (f'posting time: {tm.shown(due)}; more than 2 minutes late = skip\n' if due is not None else 'posting time: now, after confirm\n') +
-                f'---\n{draft}\n---\n'
-                'bhejne ke liye: confirm\n'
-                'cancel ke liye: cancel\n'
-                'preview 5 minute mein expire ho jayega.')
+        return self._preview_text(self.pending[ident], channel_name)
