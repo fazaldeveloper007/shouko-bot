@@ -72,7 +72,10 @@ class CardTests(Base):
             self.assertEqual(gallery['media']['url'], 'attachment://' + ui.CARD_FILE)
             self.assertIn('Loading audio', gallery['description'])
             self.assertEqual(self.texts(view).count('[YouTube](https://www.youtube.com/watch?v=jNQXAC9IVRw)'), 1)  # clickable source line
-            sec = [c for c in comps if c['type'] == 9][0]
+            secs = [c for c in comps if c['type'] == 9]
+            self.assertEqual(secs[0]['accessory']['label'], 'Search')   # header Section, button at the right
+            self.assertIn('Music Player', secs[0]['components'][0]['content'])
+            sec = secs[1]
             self.assertIn('Requested by <@7>', sec['components'][0]['content'])
             self.assertEqual(sec['accessory']['label'], 'Autoplay: Off')   # autoplay button beside requester
             rows = [c for c in comps if c['type'] == 1]
@@ -163,6 +166,48 @@ class CardTests(Base):
         p = self.player(); p.current = track(); p.card_png = b'x'
         view = ui.player_panel(p.manager, p)
         self.assertLessEqual(sum(1 for _ in view.walk_children()) + 1, 40)
+
+class SearchButtonTests(Base):
+    def button(self, p):
+        view = ui.player_panel(p.manager, p)
+        return [c for c in view.walk_children() if getattr(c, 'label', None) == 'Search'][0]
+    def inter(self, vc_member=True, channel_id=20):
+        resp = types.SimpleNamespace(send_modal=AsyncMock(), is_done=lambda: False, send_message=AsyncMock())
+        user = types.SimpleNamespace(id=7, voice=types.SimpleNamespace(channel=self.vc) if vc_member else None)
+        return types.SimpleNamespace(user=user, channel=types.SimpleNamespace(id=channel_id), response=resp, followup=types.SimpleNamespace(send=AsyncMock()))
+    async def test_search_button_in_header_opens_modal_first(self):
+        p = self.player(); p.current = track(); p.card_png = b'x'
+        self.vc = p.channel
+        with patch.object(ui.discord, 'VoiceChannel', types.SimpleNamespace):
+            p.manager.search_handler = AsyncMock()
+            i = self.inter(); i.user.voice.channel = types.SimpleNamespace(id=20, guild=p.channel.guild)
+            await self.button(p).callback(i)
+        i.response.send_modal.assert_awaited_once()
+        self.assertIsInstance(i.response.send_modal.await_args.args[0], ui.SearchModal)
+    async def test_modal_submit_runs_same_search_handler_with_query(self):
+        handler = AsyncMock(); modal = ui.SearchModal(handler)
+        modal.query._value = '  slowed luz roja '
+        await modal.on_submit(types.SimpleNamespace())
+        handler.assert_awaited_once(); self.assertEqual(handler.await_args.args[1], 'slowed luz roja')
+    async def test_blank_query_is_refused_without_search(self):
+        handler = AsyncMock(); modal = ui.SearchModal(handler); modal.query._value = '   '
+        i = types.SimpleNamespace(response=types.SimpleNamespace(is_done=lambda: False, send_message=AsyncMock()))
+        await modal.on_submit(i)
+        handler.assert_not_awaited(); i.response.send_message.assert_awaited_once()
+    async def test_wrong_chat_or_no_vc_gets_same_error_and_no_modal(self):
+        p = self.player(); p.current = track(); p.card_png = b'x'; self.vc = p.channel
+        p.manager.search_handler = AsyncMock()
+        i = self.inter(vc_member=False)
+        await self.button(p).callback(i)
+        i.response.send_modal.assert_not_awaited(); i.response.send_message.assert_awaited_once()
+        self.assertIn('voice channel', i.response.send_message.await_args.kwargs.get('content', ''))
+    async def test_idle_card_has_search_button_too(self):
+        p = self.player(); await ui.prepare_card(p)
+        self.assertEqual(self.button(p).label, 'Search')
+    def test_integration_search_handler_calls_existing_search(self):
+        import inspect
+        from music import integration
+        self.assertIn("'search', query", inspect.getsource(integration.Music.__init__))
 
 class FinalPolishTests(Base):
     def blue(self, png):
