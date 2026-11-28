@@ -121,15 +121,35 @@ class CardTests(Base):
         with contextlib.redirect_stdout(buf), patch.object(card_image, 'fetch_art', AsyncMock(return_value=None)), \
              patch.object(card_image, 'render_block', return_value=None), patch.object(card_image, 'last_error', 'ValueError'):
             await ui.prepare_card(p)
-        self.assertEqual(buf.getvalue().strip(), 'MUSIC_CARD fallback RENDER_FAILED ValueError')
+        self.assertIn('MUSIC_CARD fallback RENDER_FAILED ValueError', buf.getvalue())
     async def test_no_pillow_means_native_fallback(self):
         p = self.player(); p.current = track()
         with patch.object(card_image, 'available', return_value=False):
             await ui.prepare_card(p)
         self.assertIsNone(p.card_png)
-    async def test_idle_has_no_image(self):
+    async def test_idle_keeps_card_design_no_old_header_or_footer(self):
         p = self.player(); await ui.prepare_card(p)
-        self.assertIsNone(p.card_png); self.assertIn('Ready.', self.texts(ui.player_panel(p.manager, p)))
+        self.assertTrue(p.card_png)
+        text = self.texts(ui.player_panel(p.manager, p))
+        self.assertIn('Music Player', text); self.assertNotIn('Audio player', text); self.assertNotIn('VC chat only', text)
+        self.assertIn('Up next', text)
+    async def test_failed_art_is_not_cached_so_playing_retries(self):
+        p = self.player(); p.current = track(); p.started = 0
+        f = AsyncMock(side_effect=[None, jpeg()])
+        with patch.object(card_image, 'fetch_art', f):
+            await ui.prepare_card(p); loading = p.card_png
+            p.started = 1; await ui.prepare_card(p)
+        self.assertEqual(f.await_count, 2)
+        self.assertEqual(Image.open(io.BytesIO(loading)).convert('RGB').getpixel((10, 160)), (128, 128, 128))
+        self.assertNotEqual(Image.open(io.BytesIO(p.card_png)).convert('RGB').getpixel((10, 160)), (128, 128, 128))
+    async def test_fetch_falls_back_to_second_transport_and_reports_reason(self):
+        with patch.object(card_image, '_fetch_aiohttp', AsyncMock(side_effect=OSError())), \
+             patch.object(card_image, '_fetch_sync', lambda url: b'x'):
+            self.assertEqual(await card_image.fetch_art('abcdefghijk'), b'x')
+        with patch.object(card_image, '_fetch_aiohttp', AsyncMock(side_effect=OSError())), \
+             patch.object(card_image, '_fetch_sync', lambda url: (_ for _ in ()).throw(ValueError())):
+            self.assertIsNone(await card_image.fetch_art('abcdefghijk'))
+        self.assertEqual(card_image.art_error, 'ValueError')
     async def test_art_cache_bounded(self):
         p = self.player()
         with patch.object(card_image, 'fetch_art', AsyncMock(return_value=jpeg())):
