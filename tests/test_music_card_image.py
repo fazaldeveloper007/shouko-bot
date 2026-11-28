@@ -161,6 +161,35 @@ class CardTests(Base):
         view = ui.player_panel(p.manager, p)
         self.assertLessEqual(sum(1 for _ in view.walk_children()) + 1, 40)
 
+class ArtDownloadTests(Base):
+    async def test_body_arriving_in_pieces_is_read_completely(self):
+        from aiohttp import web
+        body = jpeg(480, 360)
+        async def handler(request):
+            r = web.StreamResponse(headers={'Content-Length': str(len(body))}); await r.prepare(request)
+            for i in range(0, len(body), 500):
+                await r.write(body[i:i + 500]); await asyncio.sleep(0.01)   # pieces arrive over time
+            return r
+        app = web.Application(); app.router.add_get('/vi/{v}/x.jpg', handler)
+        runner = web.AppRunner(app); await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0); await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            with patch.object(card_image, 'ART_URLS', ['http://127.0.0.1:%d/vi/%%s/x.jpg' % port]):
+                data = await card_image.fetch_art('abcdefghijk')
+        finally: await runner.cleanup()
+        self.assertEqual(data, body)
+        card_image.art_error = None
+        self.assertTrue(card_image.render_block('t', 'm', data, 'Playing')); self.assertIsNone(card_image.art_error)
+    async def test_corrupt_art_is_logged_and_dropped_not_cached(self):
+        import contextlib
+        p = self.player(); p.current = track(); p.started = 1; ui._noted.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patch.object(card_image, 'fetch_art', AsyncMock(return_value=jpeg()[:300])):
+            await ui.prepare_card(p)
+        self.assertTrue(p.card_png); self.assertNotIn(p.current.id, p.art_cache)
+        self.assertIn('MUSIC_CARD fallback ART_DECODE_', buf.getvalue())
+
 class ArtTimingTests(Base):
     async def test_slow_art_does_not_block_and_refreshes_card_once(self):
         p = self.player(); p.current = track(); p.started = 0
@@ -188,7 +217,7 @@ class ArtTimingTests(Base):
             for _ in range(6):
                 await ui.prepare_card(p); await asyncio.sleep(0.08)
         self.assertEqual(p.art_tries[p.current.id], ui.ART_ATTEMPTS)
-        self.assertEqual(card_image.art_error, 'TIMEOUT'); self.assertFalse(p.art_jobs)
+        self.assertIn('ART_TIMEOUT', ui._noted); self.assertFalse(p.art_jobs)
     async def test_interrupt_reply_does_not_claim_playing(self):
         import inspect
         self.assertNotIn('Playing now', inspect.getsource(ui))
