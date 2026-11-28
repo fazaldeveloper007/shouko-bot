@@ -7,7 +7,7 @@ from discord import app_commands
 from .player import Manager, MusicError
 from .media import MediaError
 from . import natural
-from .ui import answer, callback_error, queue_embed, player_panel, Results, clean
+from .ui import answer, callback_error, queue_embed, player_panel, prepare_card, Results, clean
 
 log = logging.getLogger('kristy.music')
 
@@ -16,6 +16,7 @@ class Music:
         self.client = client
         self.manager = Manager(client)
         self.manager.panel_builder = lambda p, status: player_panel(self.manager, p, status)
+        self.manager.panel_prepare = prepare_card
         self.tree = app_commands.CommandTree(client)
         self.synced = False
         self.busy = set()
