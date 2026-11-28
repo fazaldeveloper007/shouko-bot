@@ -237,7 +237,7 @@ class FinalPolishTests(Base):
             faux = card_image.render_block('Bold title', '', None, 'Playing')
             font, stroke = card_image._title_font(42)
         self.assertGreater(stroke, 0); self.assertTrue(faux)
-        with patch.object(card_image, 'BOLD_FONTS', []), patch.object(card_image, '_title_font', lambda size: (card_image._font(size, False), 0)):
+        with patch.object(card_image, 'BOLD_FONTS', []), patch.object(card_image, '_title_font', lambda size, title=None: (card_image._font(size, False), 0)):
             plain = card_image.render_block('Bold title', '', None, 'Playing')
         self.assertGreater(dark_ink(faux), dark_ink(plain) * 1.1)
 
@@ -293,6 +293,32 @@ class BoldNamedRegularFaceTests(Base):
     def test_real_bold_style_face_is_used_without_stroke(self):
         font, stroke = card_image._title_font(42)
         self.assertEqual(stroke, 0); self.assertIn('bold', font.getname()[1].lower())
+
+class MontserratTitleTests(Base):
+    def test_bundled_font_is_montserrat_bold_and_intact(self):
+        import hashlib, base64
+        from music import montserrat
+        self.assertEqual(hashlib.sha256(base64.b64decode(montserrat._B64)).hexdigest(), montserrat.SUBSET_SHA256)
+        self.assertEqual(montserrat.load(42).getname(), ('Montserrat', 'Bold'))
+    def test_latin_title_uses_montserrat_without_stroke_even_when_system_font_is_a_regular_alias(self):
+        from PIL import ImageFont
+        real = ImageFont.truetype
+        def fake(path, size=10, *a, **k):
+            if isinstance(path, str) and path == '/system/fonts/DroidSans-Bold.ttf':
+                f = real('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', size); f.getname = lambda: ('Roboto', 'Regular'); return f
+            return real(path, size, *a, **k)
+        with patch.object(ImageFont, 'truetype', fake):
+            font, stroke = card_image._title_font(42, 'Oratrice Mecanique but the whole song is voicelines')
+        self.assertEqual(font.getname(), ('Montserrat', 'Bold')); self.assertEqual(stroke, 0)
+    def test_uncovered_characters_fall_back_to_system_path(self):
+        from music import montserrat
+        self.assertTrue(montserrat.covers('Caf\u00e9 \u2013 live'))
+        self.assertFalse(montserrat.covers('\u0939\u093f\u0902\u0926\u0940 song'))
+        font, stroke = card_image._title_font(42, '\u0939\u093f\u0902\u0926\u0940')
+        self.assertNotEqual(font.getname()[0], 'Montserrat')
+    def test_render_with_montserrat_gives_valid_png_for_long_title(self):
+        png = card_image.render_block('Montserrat ' * 20, '', None, 'Playing')
+        self.assertEqual(Image.open(io.BytesIO(png)).size, card_image.SIZE)
 
 class TitleWeightNoEffectTests(TitleWeightTests):
     def test_weight_axis_that_changes_nothing_still_gets_stroke(self):
