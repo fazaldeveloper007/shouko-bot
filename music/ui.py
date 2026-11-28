@@ -67,6 +67,32 @@ def player_text(player, status=None):
     lines.append(f"**Up next • {len(player.queue)}**\n" + ('\n'.join(clean(x.title, 90) for x in queued) or 'Queue is empty'))
     return '\n'.join(lines)
 
+class SearchModal(discord.ui.Modal, title='Search YouTube'):
+    """Opened from the player's Search button; submit runs the same path as /search."""
+    query = discord.ui.TextInput(label='YouTube title, video or link', max_length=200, required=True)
+    def __init__(self, handler):
+        super().__init__()
+        self.handler = handler
+    async def on_submit(self, interaction):
+        text = str(self.query.value or '').strip()
+        if not text:
+            await answer(interaction, 'Type a title or link to search.', ephemeral=True); return
+        await self.handler(interaction, text)
+    async def on_error(self, interaction, error):
+        await callback_error(interaction, error)
+
+def _search_button(manager):
+    button = discord.ui.Button(label='Search', emoji=_icon('MUSIC_ICON_SEARCH', '\U0001F50E'), style=discord.ButtonStyle.secondary)
+    async def on_search(interaction):
+        try:
+            manager.caller_channel(interaction.user, interaction.channel)   # same VC-chat rule as /search
+            handler = getattr(manager, 'search_handler', None)
+            if handler is None: raise MusicError('Search is not available right now')
+            await interaction.response.send_modal(SearchModal(handler))      # must be the first response
+        except Exception as exc: await callback_error(interaction, exc)
+    button.callback = on_search
+    return button
+
 CARD_FILE = 'kristy-card.png'
 
 _noted = set()
@@ -140,7 +166,7 @@ class Controls(discord.ui.LayoutView):
         self.card_png = getattr(player, 'card_png', None)
         if self.card_png:
             t = player.current
-            container.add_item(discord.ui.TextDisplay('## ♬\u2003Music Player\n-# Kristy'))
+            container.add_item(discord.ui.Section(discord.ui.TextDisplay('## ♬\u2003Music Player\n-# Kristy'), accessory=_search_button(manager)))
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
                                description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
             if t: container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
