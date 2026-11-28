@@ -161,6 +161,38 @@ class CardTests(Base):
         view = ui.player_panel(p.manager, p)
         self.assertLessEqual(sum(1 for _ in view.walk_children()) + 1, 40)
 
+class ArtTimingTests(Base):
+    async def test_slow_art_does_not_block_and_refreshes_card_once(self):
+        p = self.player(); p.current = track(); p.started = 0
+        gate = asyncio.Event()
+        async def slow(vid):
+            await gate.wait(); return jpeg()
+        with patch.object(card_image, 'fetch_art', slow), patch.object(ui, 'ART_WAIT', 0.05):
+            began = asyncio.get_running_loop().time()
+            await ui.prepare_card(p)
+            self.assertLess(asyncio.get_running_loop().time() - began, 0.5)
+            self.assertTrue(p.card_png)                       # posted with the placeholder, not stalled
+            p.manager.panel.assert_not_awaited()
+            gate.set(); await asyncio.sleep(0.05)
+        p.manager.panel.assert_awaited_once_with(p)           # single refresh when art arrived
+        self.assertIn(p.current.id, p.art_cache)
+    async def test_fast_art_gives_no_extra_refresh(self):
+        p = self.player(); p.current = track(); p.started = 0
+        with patch.object(card_image, 'fetch_art', AsyncMock(return_value=jpeg())):
+            await ui.prepare_card(p); await asyncio.sleep(0.02)
+        p.manager.panel.assert_not_awaited()
+    async def test_whole_download_is_capped_and_attempts_limited(self):
+        p = self.player(); p.current = track(); p.started = 0; ui._noted.clear()
+        async def hang(vid): await asyncio.sleep(30)
+        with patch.object(card_image, 'fetch_art', hang), patch.object(ui, 'ART_WAIT', 0.01), patch.object(ui, 'ART_TOTAL', 0.05):
+            for _ in range(6):
+                await ui.prepare_card(p); await asyncio.sleep(0.08)
+        self.assertEqual(p.art_tries[p.current.id], ui.ART_ATTEMPTS)
+        self.assertEqual(card_image.art_error, 'TIMEOUT'); self.assertFalse(p.art_jobs)
+    async def test_interrupt_reply_does_not_claim_playing(self):
+        import inspect
+        self.assertNotIn('Playing now', inspect.getsource(ui))
+
 class PanelLoopTests(Base):
     async def test_panel_loop_prepares_then_sends_file_and_survives_prepare_error(self):
         m = Manager(types.SimpleNamespace()); m.note = AsyncMock(); m.panel_interval = 0
