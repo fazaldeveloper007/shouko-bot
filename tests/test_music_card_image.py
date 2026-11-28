@@ -184,6 +184,43 @@ class FinalPolishTests(Base):
             plain = card_image.render_block('Bold title', '', None, 'Playing')
         self.assertGreater(dark_ink(faux), dark_ink(plain) * 1.1)
 
+class TitleWeightTests(Base):
+    def stub(self, axes):
+        calls = []
+        class F:
+            def get_variation_axes(self): return axes
+            def set_variation_by_axes(self, v): calls.append(v)
+        return F(), calls
+    def run_title(self, axes):
+        from PIL import ImageFont
+        font, calls = self.stub(axes)
+        font.getmask = lambda text: [1] * (100 if calls else 50)   # heavier once the weight axis was set
+        def fake(path, size):
+            if path in card_image.BOLD_FONTS: raise OSError()
+            return font
+        with patch.object(ImageFont, 'truetype', fake):
+            return card_image._title_font(42), calls
+    def test_variable_font_with_weight_axis_is_set_to_700_without_stroke(self):
+        (f, stroke), calls = self.run_title([{'name': b'Weight', 'minimum': 100, 'maximum': 900, 'default': 400}, {'name': b'Width', 'minimum': 75, 'maximum': 100, 'default': 100}])
+        self.assertEqual(stroke, 0); self.assertEqual(calls, [[700, 100]])
+    def test_unidentified_axis_or_regular_only_face_gets_visible_stroke(self):
+        (f, stroke), calls = self.run_title([{'name': b'Width', 'minimum': 75, 'maximum': 100, 'default': 100}])
+        self.assertEqual(stroke, card_image.FAUX_STROKE); self.assertEqual(calls, [])
+        (f, stroke), calls = self.run_title([])
+        self.assertEqual(stroke, card_image.FAUX_STROKE)
+
+class TitleWeightNoEffectTests(TitleWeightTests):
+    def test_weight_axis_that_changes_nothing_still_gets_stroke(self):
+        from PIL import ImageFont
+        font, calls = self.stub([{'name': b'Weight', 'minimum': 100, 'maximum': 900, 'default': 400}])
+        font.getmask = lambda text: [1] * 50                      # no heavier after the axis call
+        def fake(path, size):
+            if path in card_image.BOLD_FONTS: raise OSError()
+            return font
+        with patch.object(ImageFont, 'truetype', fake):
+            f, stroke = card_image._title_font(42)
+        self.assertEqual(stroke, card_image.FAUX_STROKE)
+
 class ArtDownloadTests(Base):
     async def test_body_arriving_in_pieces_is_read_completely(self):
         from aiohttp import web
