@@ -128,6 +128,15 @@ class CardTests(Base):
              patch.object(card_image, 'render_block', return_value=None), patch.object(card_image, 'last_error', 'ValueError'):
             await ui.prepare_card(p)
         self.assertIn('MUSIC_CARD fallback RENDER_FAILED ValueError', buf.getvalue())
+    async def test_native_fallback_has_own_header_section_with_search_and_thumbnail_section(self):
+        p = self.player(); p.current = track(); p.card_png = None
+        with patch.object(ui, 'thumbnail_url', return_value='https://i.ytimg.com/vi/x/hq.jpg'):
+            view = ui.player_panel(p.manager, p)
+        comps = view.to_components()[0]['components']
+        secs = [c for c in comps if c['type'] == 9]
+        self.assertEqual(secs[0]['accessory']['label'], 'Search'); self.assertIn('Audio player', secs[0]['components'][0]['content'])
+        self.assertEqual(secs[1]['accessory']['type'], 11)                   # thumbnail keeps its own Section
+        self.assertLessEqual(sum(1 for _ in view.walk_children()) + 1, 40)
     async def test_no_pillow_means_native_fallback(self):
         p = self.player(); p.current = track()
         with patch.object(card_image, 'available', return_value=False):
