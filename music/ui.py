@@ -204,7 +204,7 @@ class Controls(discord.ui.LayoutView):
             b.callback = on_click
             row.add_item(b)
         controls_row = row
-        toggle = discord.ui.Button(label='Autoplay: On' if player.autoplay else 'Autoplay: Off',
+        toggle = discord.ui.Button(label='Autoplay: On' if player.autoplay else 'Autoplay: Off', emoji=_icon('MUSIC_ICON_AUTOPLAY', None),
                                    style=discord.ButtonStyle.success if player.autoplay else discord.ButtonStyle.secondary)
         async def on_toggle(interaction):
             try:
