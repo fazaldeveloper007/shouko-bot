@@ -308,6 +308,7 @@ class Manager:
         self.guild_locks = {}
         self.voice_reservations = {}
         self.panel_builder = None
+        self.panel_prepare = None
         self.panel_interval = 1.0
 
     def caller_channel(self, user, text_channel):
@@ -378,12 +379,19 @@ class Manager:
             while player.panel_dirty and not player.closed:
                 status = player.panel_status; player.panel_status = None; player.panel_dirty = False
                 began = time.monotonic()
+                prepare = getattr(self, 'panel_prepare', None)
+                if prepare:
+                    try: await prepare(player, status)
+                    except Exception: player.card_png = None
                 view = self.panel_builder(player, status)
                 if player.panel_view: player.panel_view.stop()
                 player.panel_view = view
                 old, player.panel = player.panel, None
                 try:
-                    player.panel = await player.channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
+                    card_file = getattr(view, 'card_file', None)
+                    files = [f for f in [card_file() if callable(card_file) else None] if f]
+                    extra = {'files': files} if files else {}
+                    player.panel = await player.channel.send(view=view, allowed_mentions=discord.AllowedMentions.none(), **extra)
                     emit('PANEL','OK',elapsed=time.monotonic()-began)
                 except Exception:
                     player.panel = old
