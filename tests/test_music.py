@@ -154,6 +154,13 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emojis[0],{'id':111111111111111111,'name':'k_play'})
         self.assertEqual(emojis[1],{'id':222222222222222222,'name':'icon'})
         self.assertEqual(emojis[4]['name'],'👋')  # unset falls back
+    async def test_autoplay_button_icon_only_when_configured(self):
+        p=self.player()
+        find=lambda v:[b for b in v.walk_children() if isinstance(b,discord.ui.Button) and (b.label or '').startswith('Autoplay')][0]
+        self.assertIsNone(find(player_panel(p.manager,p)).emoji)   # unset: unchanged text-only button
+        with patch.dict(os.environ,{'MUSIC_ICON_AUTOPLAY':'kristy_autoplay:333333333333333333'}):
+            b=find(player_panel(p.manager,p))
+        self.assertEqual(b.emoji.id,333333333333333333); self.assertEqual(b.label,'Autoplay: Off')
     async def test_prefetch_downloads_next_during_playback(self):
         p=self.player();played=[];downloads=[];downloads_paths={}
         async def download(t,path,**kw):
