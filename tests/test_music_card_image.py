@@ -127,6 +127,9 @@ class CardTests(Base):
         with patch.object(card_image, 'available', return_value=False):
             await ui.prepare_card(p)
         self.assertIsNone(p.card_png)
+    async def test_header_has_space_between_note_and_title(self):
+        p = self.player(); p.current = track(); await ui.prepare_card(p)
+        self.assertIn('\u266c\u2003Music Player', self.texts(ui.player_panel(p.manager, p)))
     async def test_idle_keeps_card_design_no_old_header_or_footer(self):
         p = self.player(); await ui.prepare_card(p)
         self.assertTrue(p.card_png)
@@ -160,6 +163,26 @@ class CardTests(Base):
         p = self.player(); p.current = track(); p.card_png = b'x'
         view = ui.player_panel(p.manager, p)
         self.assertLessEqual(sum(1 for _ in view.walk_children()) + 1, 40)
+
+class FinalPolishTests(Base):
+    def blue(self, png):
+        im = Image.open(io.BytesIO(png)).convert('RGB'); w, h = im.size
+        return sum(1 for x in range(330, w) for y in range(h) if im.getpixel((x, y))[2] > 220 and im.getpixel((x, y))[0] < 160)
+    def test_source_and_duration_not_drawn_in_image_but_state_is(self):
+        png = card_image.render_block('Song', 'YouTube • 3:04', None, 'Playing')
+        self.assertEqual(self.blue(png), 0)
+        self.assertEqual(self.blue(card_image.render_block('Song', 'YouTube • 3:04', None, 'Loading audio...', loading=True)), 0)
+    def test_title_is_bold_even_without_a_bold_font(self):
+        def dark_ink(png):
+            im = Image.open(io.BytesIO(png)).convert('L'); return sum(1 for x in range(340, 900) for y in range(20, 90) if im.getpixel((x, y)) > 200)
+        bold = card_image.render_block('Bold title', '', None, 'Playing')
+        with patch.object(card_image, 'BOLD_FONTS', []):
+            faux = card_image.render_block('Bold title', '', None, 'Playing')
+            font, stroke = card_image._title_font(42)
+        self.assertGreater(stroke, 0); self.assertTrue(faux)
+        with patch.object(card_image, 'BOLD_FONTS', []), patch.object(card_image, '_title_font', lambda size: (card_image._font(size, False), 0)):
+            plain = card_image.render_block('Bold title', '', None, 'Playing')
+        self.assertGreater(dark_ink(faux), dark_ink(plain) * 1.1)
 
 class ArtDownloadTests(Base):
     async def test_body_arriving_in_pieces_is_read_completely(self):
