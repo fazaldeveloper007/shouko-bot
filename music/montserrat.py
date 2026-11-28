@@ -605,7 +605,12 @@ EAABAAAAAAEXArwAAAADAAEAAgEeAAAAAAABAAA=
 def covers(text):
     return all(any(lo <= ord(ch) <= hi for lo, hi in COVERED) for ch in text if ch not in "\n")
 
+_cache = {}
 def load(size):
+    if size not in _cache: _cache[size] = _load(size)
+    return _cache[size]
+
+def _load(size):
     """Pillow font object for Montserrat Bold at this size (from the embedded bytes, nothing written to disk)."""
     from PIL import ImageFont
     return ImageFont.truetype(io.BytesIO(base64.b64decode(_B64)), size)
