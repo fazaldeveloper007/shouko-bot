@@ -82,6 +82,22 @@ def _font(size, bold):
     try: return ImageFont.load_default(size)
     except Exception: return ImageFont.load_default()
 
+def _title_font(size):
+    """(font, stroke): real bold file if present, else a variable font at weight 700, else the regular font with a stroke
+    so the title is bold even on phones that only ship a regular Roboto."""
+    from PIL import ImageFont
+    env = os.getenv(FONT_ENV, '').strip()
+    for path in ([env] if env else []) + BOLD_FONTS:
+        try: return ImageFont.truetype(path, size), 0
+        except Exception: continue
+    for path in ([env] if env else []) + REG_FONTS:
+        try: font = ImageFont.truetype(path, size)
+        except Exception: continue
+        try:
+            font.set_variation_by_axes([700]); return font, 0
+        except Exception: return font, 2
+    return _font(size, False), 2
+
 def _wrap(draw, text, font, width, lines):
     words, out, line = str(text).split(), [], ''
     for word in words:
@@ -135,12 +151,11 @@ def render_block(title, meta, art, label, loading=False):
         else:
             _placeholder(draw, side)
         x = side + 36; width = w - x - 28
-        tf, mf, lf = _font(42, True), _font(30, False), _font(30, True)
-        lines = _wrap(draw, title, tf, width, 3)
+        (tf, stroke), lf = _title_font(42), _font(30, True)
+        lines = _wrap(draw, title, tf, width, 3) if not stroke else _wrap(draw, title, tf, width - 4, 3)
         y = 28
         for line in lines:
-            draw.text((x, y), line, font=tf, fill='white'); y += 54
-        draw.text((x, h - 112), meta, font=mf, fill=(120, 170, 255))
+            draw.text((x, y), line, font=tf, fill='white', stroke_width=stroke, stroke_fill='white'); y += 54
         draw.text((x, h - 64), label, font=lf, fill=(255, 196, 80) if loading else (200, 200, 205))
         out = io.BytesIO(); img.save(out, 'PNG', optimize=True)
         return out.getvalue()
