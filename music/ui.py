@@ -169,7 +169,6 @@ class Controls(discord.ui.LayoutView):
             container.add_item(discord.ui.Section(discord.ui.TextDisplay('## ♬\u2003Music Player\n-# Kristy'), accessory=_search_button(manager)))
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
                                description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
-            if t: container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
         else:
             text = discord.ui.TextDisplay(player_text(player, status))
             thumb = thumbnail_url(player.current) if player.current else None
@@ -214,7 +213,11 @@ class Controls(discord.ui.LayoutView):
             except Exception as exc: await callback_error(interaction, exc)
         toggle.callback = on_toggle
         if self.card_png:
-            container.add_item(discord.ui.Section(f'Requested by <@{player.current.requester}>' if player.current else 'Autoplay queues related tracks', accessory=toggle))
+            if player.current:
+                t = player.current   # both lines in one text block so they sit as close as Up next / Queue is empty
+                container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}\nRequested by <@{t.requester}>'))
+            autoplay_row = discord.ui.ActionRow(); autoplay_row.add_item(toggle)
+            container.add_item(autoplay_row)   # its own row: the normal gap between components separates it from the requester line
             container.add_item(controls_row)
             container.add_item(discord.ui.TextDisplay(f"**Up next • {len(player.queue)}**\n" + ('\n'.join(clean(x.title, 90) for x in list(player.queue)[:3]) or 'Queue is empty')))
             self.add_item(container)
