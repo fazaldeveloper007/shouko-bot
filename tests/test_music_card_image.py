@@ -75,11 +75,14 @@ class CardTests(Base):
             secs = [c for c in comps if c['type'] == 9]
             self.assertEqual(secs[0]['accessory']['label'], 'Search')   # header Section, button at the right
             self.assertIn('Music Player', secs[0]['components'][0]['content'])
-            sec = secs[1]
-            self.assertIn('Requested by <@7>', sec['components'][0]['content'])
-            self.assertEqual(sec['accessory']['label'], 'Autoplay: Off')   # autoplay button beside requester
+            self.assertEqual(len(secs), 1)                                      # only the header is a Section now
+            metas = [c['content'] for c in comps if c['type'] == 10 and 'Requested by' in c['content']]
+            self.assertEqual(metas, ['[YouTube](https://www.youtube.com/watch?v=jNQXAC9IVRw) \u2022 4:06\nRequested by <@7>'])  # one block, two close lines
             rows = [c for c in comps if c['type'] == 1]
-            self.assertEqual(len(rows), 1); self.assertEqual(len(rows[0]['components']), 5)
+            self.assertEqual([len(r['components']) for r in rows], [1, 5])      # Autoplay row, then the 5 controls
+            self.assertEqual(rows[0]['components'][0]['label'], 'Autoplay: Off')
+            order = [c['type'] for c in comps]
+            self.assertLess(order.index(10, 1), order.index(1))                 # metadata block comes before the Autoplay row
             self.assertIn('Up next', self.texts(view)); self.assertIn('Queue is empty', self.texts(view))
             self.assertIsNotNone(view.card_file())
             p.started = 12.0
