@@ -7,7 +7,7 @@ import re
 
 ART_URL = 'https://i.ytimg.com/vi/%s/hqdefault.jpg'
 ART_LIMIT = 1_000_000
-ART_TIMEOUT = 3
+ART_TIMEOUT = 5
 SIZE = (960, 320)
 last_error = None  # exception CLASS NAME of the latest render failure (never message text)
 BG = (52, 54, 60)
@@ -27,20 +27,41 @@ def available():
 def valid_id(video_id):
     return bool(re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id or ''))
 
+ART_URLS = ['https://i.ytimg.com/vi/%s/hqdefault.jpg', 'https://i.ytimg.com/vi/%s/mqdefault.jpg', 'https://img.youtube.com/vi/%s/hqdefault.jpg']
+art_error = None  # fixed reason word or exception class name of the latest artwork failure (never message text)
+
+def _fetch_sync(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=ART_TIMEOUT) as r:
+        data = r.read(ART_LIMIT + 1)
+    return data if 0 < len(data) <= ART_LIMIT else None
+
+async def _fetch_aiohttp(url):
+    import aiohttp
+    timeout = aiohttp.ClientTimeout(total=ART_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=False) as response:
+            if response.status != 200:
+                raise RuntimeError('HTTP_%s' % response.status)
+            data = await response.content.read(ART_LIMIT + 1)
+            return data if 0 < len(data) <= ART_LIMIT else None
+
 async def fetch_art(video_id):
-    """Download the YouTube still ourselves (fixed host, size and time capped). None on any failure."""
-    if not valid_id(video_id): return None
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=ART_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(ART_URL % video_id, allow_redirects=False) as response:
-                if response.status != 200: return None
-                if (response.content_length or 0) > ART_LIMIT: return None
-                data = await response.content.read(ART_LIMIT + 1)
-                return data if 0 < len(data) <= ART_LIMIT else None
-    except Exception:
-        return None
+    """Download the YouTube still ourselves (fixed hosts, size and time capped). None on any failure; art_error says why."""
+    global art_error
+    if not valid_id(video_id):
+        art_error = 'BAD_ID'; return None
+    for template in ART_URLS:
+        url = template % video_id
+        for name, call in (('aiohttp', lambda u: _fetch_aiohttp(u)), ('urllib', lambda u: asyncio.to_thread(_fetch_sync, u))):
+            try:
+                data = await call(url)
+                if data: return data
+                art_error = 'EMPTY'
+            except Exception as exc:
+                art_error = str(exc) if str(exc).startswith('HTTP_') else type(exc).__name__
+    return None
 
 def _font(size, bold):
     from PIL import ImageFont
@@ -95,7 +116,9 @@ def render_block(title, meta, art, label, loading=False):
         art_img = None
         if art:
             try: art_img = _art_square(art, side)
-            except Exception: art_img = None
+            except Exception as exc:
+                global art_error
+                art_error = 'DECODE_' + type(exc).__name__; art_img = None
         if art_img is not None:
             mask = Image.new('L', (side, side), 0); ImageDraw.Draw(mask).rounded_rectangle([0, 0, side, side], 28, fill=255)
             img.paste(art_img, (0, 0), mask)
