@@ -233,11 +233,11 @@ class FinalPolishTests(Base):
         def dark_ink(png):
             im = Image.open(io.BytesIO(png)).convert('L'); return sum(1 for x in range(340, 900) for y in range(20, 90) if im.getpixel((x, y)) > 200)
         bold = card_image.render_block('Bold title', '', None, 'Playing')
-        with patch.object(card_image, 'BOLD_FONTS', []):
+        with patch.object(card_image.montserrat, 'load', side_effect=OSError()), patch.object(card_image, 'BOLD_FONTS', []):
             faux = card_image.render_block('Bold title', '', None, 'Playing')
             font, stroke = card_image._title_font(42)
         self.assertGreater(stroke, 0); self.assertTrue(faux)
-        with patch.object(card_image, 'BOLD_FONTS', []), patch.object(card_image, '_title_font', lambda size, title=None: (card_image._font(size, False), 0)):
+        with patch.object(card_image.montserrat, 'load', side_effect=OSError()), patch.object(card_image, 'BOLD_FONTS', []), patch.object(card_image, '_title_font', lambda size, title=None: (card_image._font(size, False), 0)):
             plain = card_image.render_block('Bold title', '', None, 'Playing')
         self.assertGreater(dark_ink(faux), dark_ink(plain) * 1.1)
 
@@ -284,7 +284,7 @@ class BoldNamedRegularFaceTests(Base):
     def test_rendered_title_is_heavier_than_plain_regular(self):
         def ink(png):
             im = Image.open(io.BytesIO(png)).convert('L'); return sum(1 for x in range(340, 900) for y in range(20, 90) if im.getpixel((x, y)) > 200)
-        with self.regular_only():
+        with self.regular_only(), patch.object(card_image.montserrat, 'load', side_effect=OSError()):
             heavy = card_image.render_block('Bold title', '', None, 'Playing')
             with patch.object(card_image, 'FAUX_STROKE', 0):
                 plain = card_image.render_block('Bold title', '', None, 'Playing')
@@ -418,3 +418,15 @@ class PanelLoopTests(Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MixedScriptTitleTests(Base):
+    def test_latin_runs_use_montserrat_and_only_cjk_uses_fallback(self):
+        title = "GIMS - Est-ce que tu m'aimes / neuvillette ( \u611bxiao )"
+        parts = card_image._mixed_parts(title, 42)
+        self.assertEqual([t for _, _, t in parts], ["GIMS - Est-ce que tu m'aimes / neuvillette ( ", '\u611b', 'xiao )'])
+        self.assertEqual(parts[0][0].getname(), ('Montserrat', 'Bold')); self.assertEqual(parts[0][1], 0)
+        self.assertEqual(parts[2][0].getname(), ('Montserrat', 'Bold')); self.assertEqual(parts[2][1], 0)
+        self.assertNotEqual(parts[1][0].getname()[0], 'Montserrat')
+    def test_mixed_title_renders_and_is_not_whole_title_stroked(self):
+        self.assertTrue(card_image.render_block("GIMS - Est-ce que tu m'aimes ( \u611bxiao )", '', None, 'Loading audio...', loading=True))
