@@ -77,6 +77,37 @@ def _fallback_note(reason):
     _noted.add(reason)
     print('MUSIC_CARD fallback ' + reason, flush=True)
 
+ART_WAIT = 1.5      # most a panel waits for artwork before posting with the placeholder
+ART_TOTAL = 6       # hard cap for one whole artwork download (all hosts and transports)
+ART_ATTEMPTS = 3    # downloads per track id, so a dead network is never retried on every panel
+
+async def _art_job(player, vid):
+    art = None
+    try: art = await asyncio.wait_for(card_image.fetch_art(vid), ART_TOTAL)
+    except asyncio.TimeoutError: card_image.art_error = 'TIMEOUT'
+    except Exception as exc: card_image.art_error = type(exc).__name__
+    cache = player.art_cache
+    if art:
+        cache[vid] = art
+        while len(cache) > 6: cache.pop(next(iter(cache)))
+    else:
+        _fallback_note('ART_' + str(card_image.art_error or 'Unknown'))
+    late = vid in player.art_late
+    player.art_late.discard(vid); player.art_jobs.pop(vid, None)
+    if art and late and getattr(player.current, 'id', None) == vid and not player.closed:
+        await player.manager.panel(player)  # one refresh now that the artwork is here
+
+async def _art_wait(player, vid):
+    """Never blocks past ART_WAIT: a slow download continues in the background and refreshes the card once."""
+    if not hasattr(player, 'art_jobs'): player.art_jobs, player.art_late, player.art_tries = {}, set(), {}
+    job = player.art_jobs.get(vid)
+    if job is None:
+        if player.art_tries.get(vid, 0) >= ART_ATTEMPTS: return
+        player.art_tries[vid] = player.art_tries.get(vid, 0) + 1
+        job = player.art_jobs[vid] = asyncio.create_task(_art_job(player, vid))
+    try: await asyncio.wait_for(asyncio.shield(job), ART_WAIT)
+    except asyncio.TimeoutError: player.art_late.add(vid)  # still downloading: the job refreshes the card when done
+
 async def prepare_card(player, status=None):
     """Draw the upper card block for the current state. Sets player.card_png (None means: use native layout)."""
     player.card_png = None
@@ -89,13 +120,7 @@ async def prepare_card(player, status=None):
         return
     cache = getattr(player, 'art_cache', None)
     if cache is None: cache = player.art_cache = {}
-    if t.id not in cache:
-        art = await card_image.fetch_art(t.id)
-        if art:
-            cache[t.id] = art
-            while len(cache) > 6: cache.pop(next(iter(cache)))
-        else:
-            _fallback_note('ART_' + str(card_image.art_error or 'Unknown'))  # failures are never cached: the next panel retries
+    if t.id not in cache: await _art_wait(player, t.id)
     state = track_state(player)
     label = status or state
     player.card_png = await card_image.render_block_async(
@@ -216,7 +241,7 @@ class Results(discord.ui.LayoutView):
                         else:
                             await p.add(track, start=False)
                         emit('REQUEST','OK',elapsed=time.monotonic()-request_began)
-                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Playing now, interrupting the current track.' if action == 'Play' and was_playing else (' Loading audio...' if action == 'Play' else ' Use /play to start if idle.')))
+                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Switching tracks. Loading audio...' if action == 'Play' and was_playing else (' Loading audio...' if action == 'Play' else ' Use /play to start if idle.')))
                         await self.manager.panel(p)
                     except Exception as exc:
                         if claimed:
