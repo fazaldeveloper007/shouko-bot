@@ -96,7 +96,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(emojis,['⏸️','⏭️','📋','⏹️','👋'])
         self.assertTrue(all(not b.get('label') for b in rows[0]['components']))
         self.assertEqual([b.get('label') for b in rows[1]['components']],['Autoplay: Off'])
-        texts=[c for c in inner if c['type']==10]
+        texts=[c for c in inner if c['type']==10]+[x for c in inner if c['type']==9 for x in c['components']]
         self.assertTrue(any('Audio player' in t['content'] for t in texts))
         self.assertTrue(any('now playing' in t['content'] for t in texts))
         self.assertTrue(any(t['content'].startswith('-#') for t in texts))
@@ -104,6 +104,45 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         view=player_panel(p.manager,p)
         rows=[c for c in view.to_components()[0]['components'] if c['type']==1]
         self.assertEqual(rows[0]['components'][0]['emoji']['name'],'▶️')
+    def _card_texts(self,view):
+        inner=view.to_components()[0]['components']
+        sections=[c for c in inner if c['type']==9]
+        texts=[c for c in inner if c['type']==10]+[x for c in sections for x in c['components']]
+        return sections,'\n'.join(t['content'] for t in texts)
+    async def test_card_says_loading_until_audio_starts_then_playing(self):
+        p=self.player();p.current=track('Song X');p.started=0
+        _,txt=self._card_texts(player_panel(p.manager,p))
+        self.assertIn('Loading audio',txt);self.assertNotIn('**Playing**',txt)
+        # panel posted with no explicit status (e.g. right after the request reply) must still say Loading
+        p.started=123.4
+        _,txt=self._card_texts(player_panel(p.manager,p))
+        self.assertIn('**Playing**',txt);self.assertNotIn('Loading',txt)
+        p.paused=True
+        _,txt=self._card_texts(player_panel(p.manager,p))
+        self.assertIn('**Paused**',txt)
+    async def test_card_thumbnail_shown_while_loading_and_playing_and_absent_when_idle(self):
+        p=self.player();p.current=track('Song X')
+        for started in (0,50.0):
+            p.started=started
+            sections,_=self._card_texts(player_panel(p.manager,p))
+            self.assertEqual(len(sections),1)
+            acc=sections[0]['accessory']
+            self.assertEqual(acc['type'],11)
+            self.assertTrue(acc['media']['url'].startswith('https://i.ytimg.com/vi/'))
+            self.assertTrue(acc['media']['url'].endswith('/mqdefault.jpg'))
+        p.current=None
+        sections,txt=self._card_texts(player_panel(p.manager,p))
+        self.assertEqual(sections,[]);self.assertIn('Ready.',txt)
+    async def test_card_without_valid_video_id_has_no_thumbnail_but_keeps_loading_status(self):
+        from dataclasses import replace
+        p=self.player();p.current=replace(track('Song X'),id='bad');p.started=0
+        sections,txt=self._card_texts(player_panel(p.manager,p))
+        self.assertEqual(sections,[]);self.assertIn('Loading audio',txt)
+    async def test_controls_survive_thumbnail_section(self):
+        p=self.player();p.current=track('Song X');p.started=0
+        inner=player_panel(p.manager,p).to_components()[0]['components']
+        rows=[c for c in inner if c['type']==1]
+        self.assertEqual(len(rows),2);self.assertEqual(len(rows[0]['components']),5)
     async def test_player_custom_app_emoji_icons_from_env(self):
         p=self.player()
         env={'MUSIC_ICON_PLAY':'k_play:111111111111111111','MUSIC_ICON_SKIP':'222222222222222222'}
