@@ -245,10 +245,16 @@ class Proactive:
         want = _norm_channel_name("truth-dare")
         matches = [c for c in getattr(guild, "text_channels", [])
                    if _norm_channel_name(getattr(c, "name", "")) == want]
-        if len(matches) != 1:
-            log.error("proactive: expected exactly 1 truth-dare channel in guild %s, "
+        if len(matches) > 1:   # ambiguous target: still fail closed
+            log.error("proactive: expected at most 1 truth-dare channel in guild %s, "
                       "found %d; disabled", getattr(guild, "id", "?"), len(matches))
             return None
+        if not matches:
+            # the server was renamed/rebuilt: keep the two configured channels instead of switching everything off
+            log.warning("proactive: no truth-dare channel in guild %s; running with the %d configured channels only",
+                        getattr(guild, "id", "?"), len(channels))
+            log.info("proactive: scoped to guild %s channels %s", guild.id, {k: c.id for k, c in channels.items()})
+            return channels
         channels["truth-dare"] = matches[0]
         log.info("proactive: scoped to guild %s channels %s",
                  guild.id, {k: c.id for k, c in channels.items()})
