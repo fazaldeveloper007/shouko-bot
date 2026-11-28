@@ -35,6 +35,8 @@ def _fetch_sync(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=ART_TIMEOUT) as r:
         data = r.read(ART_LIMIT + 1)
+        expected = r.headers.get('Content-Length')
+    if expected and expected.isdigit() and len(data) != int(expected): raise RuntimeError('SHORT_BODY')
     return data if 0 < len(data) <= ART_LIMIT else None
 
 async def _fetch_aiohttp(url):
@@ -44,8 +46,16 @@ async def _fetch_aiohttp(url):
         async with session.get(url, allow_redirects=False) as response:
             if response.status != 200:
                 raise RuntimeError('HTTP_%s' % response.status)
-            data = await response.content.read(ART_LIMIT + 1)
-            return data if 0 < len(data) <= ART_LIMIT else None
+            # StreamReader.read(n) returns whatever has arrived, not the whole body: read to EOF, capped.
+            chunks, size = [], 0
+            async for chunk in response.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > ART_LIMIT: return None
+                chunks.append(chunk)
+            data = b''.join(chunks)
+            if response.content_length is not None and len(data) != response.content_length:
+                raise RuntimeError('SHORT_BODY')
+            return data if data else None
 
 async def fetch_art(video_id):
     """Download the YouTube still ourselves (fixed hosts, size and time capped). None on any failure; art_error says why."""
