@@ -123,8 +123,11 @@ async def prepare_card(player, status=None):
     if t.id not in cache: await _art_wait(player, t.id)
     state = track_state(player)
     label = status or state
+    card_image.art_error = None
     player.card_png = await card_image.render_block_async(
         clean(t.title, 120), f'YouTube • {duration(t.duration)}', cache.get(t.id), label, loading=state.startswith('Loading'))
+    if str(card_image.art_error or '').startswith('DECODE_') and cache.get(t.id):
+        cache.pop(t.id, None); _fallback_note('ART_' + card_image.art_error)  # corrupt bytes are dropped so the next panel refetches
     if not player.card_png:
         _fallback_note('RENDER_FAILED ' + str(card_image.last_error or 'Unknown'))
 
