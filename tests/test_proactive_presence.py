@@ -187,24 +187,19 @@ class ProactiveRules(unittest.TestCase):
         self.assertTrue(m.Proactive().quiet_now(morning))
         self.assertFalse(m.Proactive().quiet_now(noon))
 
-    def test_resolve_channels_fail_closed(self):
+    def test_resolve_channels_general_chat_only(self):
         m = self.load()
         ch = lambda cid, name: types.SimpleNamespace(id=cid, name=name)
         guild = types.SimpleNamespace(
             id=9,
-            text_channels=[ch(46, "gaming-chat"), ch(47, "clips-highlights"), ch(48, "truth-dare")],
-            get_channel=lambda cid: {46: ch(46, "gaming-chat"), 47: ch(47, "clips-highlights")}.get(cid))
+            text_channels=[ch(46, "general-chat"), ch(47, "clips-highlights"), ch(48, "truth-dare")],
+            get_channel=lambda cid: {46: ch(46, "general-chat"), 47: ch(47, "clips-highlights")}.get(cid))
         got = m.Proactive.resolve_channels(guild, "46", "47")
-        self.assertEqual(set(got), {"gaming-chat", "clips-highlights", "truth-dare"})
-        self.assertEqual(got["truth-dare"].id, 48)
-        # duplicate truth-dare -> fail closed
-        guild.text_channels.append(ch(49, "truth-dare"))
-        self.assertIsNone(m.Proactive.resolve_channels(guild, "46", "47"))
-        # no truth-dare at all (server rebuilt) -> keep the two configured channels, never any other
-        guild.text_channels = [c for c in guild.text_channels if c.id not in (48, 49)]
-        got = m.Proactive.resolve_channels(guild, "46", "47")
-        self.assertEqual(set(got), {"gaming-chat", "clips-highlights"})
-        # no guild -> fail closed
+        self.assertEqual(set(got), {"general-chat"})            # clips and truth-dare are out of scope
+        self.assertEqual(got["general-chat"].id, 46)
+        self.assertEqual(set(m.Proactive.resolve_channels(guild, "46", None)), {"general-chat"})
+        # configured chat channel missing, or no guild -> fail closed
+        self.assertIsNone(m.Proactive.resolve_channels(guild, "99", "47"))
         self.assertIsNone(m.Proactive.resolve_channels(None, "46", "47"))
 
 
