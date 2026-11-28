@@ -1,11 +1,13 @@
 """Discord components-v2 cards: buttons live inside the card; the player panel is re-posted at chat bottom on every change. Callbacks revalidate guild/VC membership every time."""
 import asyncio
 import os
+import re
 import time
 import discord
 from .player import MusicError
 from .media import MediaError
 from .diagnostics import emit
+from . import card_image
 
 ERROR_TEXT = 'Music request failed. Try again later; no API keys or session details are shown.'
 ACCENT = 0xB79AFF
@@ -41,17 +43,46 @@ async def callback_error(interaction, exc):
     text = str(exc) if isinstance(exc, (MusicError, MediaError)) else ERROR_TEXT
     await answer(interaction, text, ephemeral=True)
 
+def track_state(player):
+    # Derived from real playback state, never from which code path posted the panel:
+    # a current track whose audio has not started is Loading, not Playing.
+    if player.current is None: return 'Idle'
+    if not getattr(player, 'started', 0): return 'Loading audio...'
+    return 'Paused' if player.paused else 'Playing'
+
+def thumbnail_url(track):
+    # Deterministic YouTube still for the video id; Discord fetches it, the bot downloads nothing.
+    vid = getattr(track, 'id', '') or ''
+    return f'https://i.ytimg.com/vi/{vid}/mqdefault.jpg' if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid) else None
+
 def player_text(player, status=None):
     t = player.current
     lines = ['## Kristy • Audio player']
     if t:
         lines.append(f'**{clean(t.title)}**\n{duration(t.duration)} • [YouTube]({t.url})')
-        lines.append(f"**{status or ('Paused' if player.paused else 'Playing')}** • Requested by <@{t.requester}>")
+        lines.append(f"**{status or track_state(player)}** • Requested by <@{t.requester}>")
     else:
         lines.append('Ready. Search YouTube or use /play with a title or video link.')
     queued = list(player.queue)[:3]
     lines.append(f"**Up next • {len(player.queue)}**\n" + ('\n'.join(clean(x.title, 90) for x in queued) or 'Queue is empty'))
     return '\n'.join(lines)
+
+CARD_FILE = 'kristy-card.png'
+
+async def prepare_card(player, status=None):
+    """Draw the upper card block for the current state. Sets player.card_png (None means: use native layout)."""
+    player.card_png = None
+    t = player.current
+    if not t or not card_image.available(): return
+    cache = getattr(player, 'art_cache', None)
+    if cache is None: cache = player.art_cache = {}
+    if t.id not in cache:
+        cache[t.id] = await card_image.fetch_art(t.id) or False
+        while len(cache) > 6: cache.pop(next(iter(cache)))
+    state = track_state(player)
+    label = status or state
+    player.card_png = await card_image.render_block_async(
+        clean(t.title, 120), f'YouTube • {duration(t.duration)}', cache[t.id] or None, label, loading=state.startswith('Loading'))
 
 class Controls(discord.ui.LayoutView):
     """Player card: text and icon-only control buttons inside one container."""
@@ -59,7 +90,20 @@ class Controls(discord.ui.LayoutView):
         super().__init__(timeout=None)
         self.manager, self.player = manager, player
         container = discord.ui.Container(accent_color=ACCENT)
-        container.add_item(discord.ui.TextDisplay(player_text(player, status)))
+        self.card_png = getattr(player, 'card_png', None) if player.current else None
+        if self.card_png:
+            t = player.current
+            container.add_item(discord.ui.TextDisplay('## ♬ Music Player\n-# Kristy'))
+            container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
+                               description=f"{clean(t.title, 100)} - {status or track_state(player)}")))
+            container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
+        else:
+            text = discord.ui.TextDisplay(player_text(player, status))
+            thumb = thumbnail_url(player.current) if player.current else None
+            if thumb:
+                container.add_item(discord.ui.Section(text, accessory=discord.ui.Thumbnail(thumb, description='Song thumbnail')))
+            else:
+                container.add_item(text)
         row = discord.ui.ActionRow()
         playing = player.current and not player.paused
         buttons = [(_icon('MUSIC_ICON_PAUSE' if playing else 'MUSIC_ICON_PLAY', '⏸️' if playing else '▶️'), 'pause', discord.ButtonStyle.primary),
@@ -85,8 +129,7 @@ class Controls(discord.ui.LayoutView):
                 except Exception as exc: await callback_error(interaction, exc)
             b.callback = on_click
             row.add_item(b)
-        container.add_item(row)
-        toggle_row = discord.ui.ActionRow()
+        controls_row = row
         toggle = discord.ui.Button(label='Autoplay: On' if player.autoplay else 'Autoplay: Off',
                                    style=discord.ButtonStyle.success if player.autoplay else discord.ButtonStyle.secondary)
         async def on_toggle(interaction):
@@ -97,11 +140,23 @@ class Controls(discord.ui.LayoutView):
                 await p.set_autoplay(not p.autoplay)
             except Exception as exc: await callback_error(interaction, exc)
         toggle.callback = on_toggle
-        toggle_row.add_item(toggle)
+        if self.card_png:
+            container.add_item(discord.ui.Section(f'Requested by <@{player.current.requester}>', accessory=toggle))
+            container.add_item(controls_row)
+            container.add_item(discord.ui.TextDisplay(f"**Up next • {len(player.queue)}**\n" + ('\n'.join(clean(x.title, 90) for x in list(player.queue)[:3]) or 'Queue is empty')))
+            self.add_item(container)
+            return
+        container.add_item(controls_row)
+        toggle_row = discord.ui.ActionRow(); toggle_row.add_item(toggle)
         container.add_item(toggle_row)
         footer = PLAYER_FOOTER + (' • Autoplay on: related tracks play when the queue ends' if player.autoplay else '')
         container.add_item(discord.ui.TextDisplay('-# ' + footer))
         self.add_item(container)
+
+def _card_file(self):
+    import io
+    return discord.File(io.BytesIO(self.card_png), filename=CARD_FILE) if self.card_png else None
+Controls.card_file = _card_file
 
 class Results(discord.ui.LayoutView):
     """Search card: numbered results with their Play/Add to queue buttons inside one container."""
