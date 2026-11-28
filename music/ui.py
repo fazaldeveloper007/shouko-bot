@@ -170,7 +170,9 @@ class Controls(discord.ui.LayoutView):
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
                                description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
         else:
-            text = discord.ui.TextDisplay(player_text(player, status))
+            head, body = player_text(player, status).split('\n', 1)   # own header Section so Search works without Pillow too
+            container.add_item(discord.ui.Section(discord.ui.TextDisplay(head), accessory=_search_button(manager)))
+            text = discord.ui.TextDisplay(body)
             thumb = thumbnail_url(player.current) if player.current else None
             if thumb:
                 container.add_item(discord.ui.Section(text, accessory=discord.ui.Thumbnail(thumb, description='Song thumbnail')))
