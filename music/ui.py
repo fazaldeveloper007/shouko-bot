@@ -157,6 +157,13 @@ async def prepare_card(player, status=None):
     if not player.card_png:
         _fallback_note('RENDER_FAILED ' + str(card_image.last_error or 'Unknown'))
 
+def header_text():
+    """Header text of the player card. MUSIC_ICON_HEADER (name:id of an app emoji) replaces the plain note; the
+    note stays as fallback when it is unset or malformed."""
+    icon = _icon('MUSIC_ICON_HEADER', None)
+    mark = '<:%s:%d>' % (icon.name, icon.id) if icon is not None and getattr(icon, 'id', None) else '♬'
+    return '## ' + mark + '\u2003Music Player\n-# Kristy'
+
 class Controls(discord.ui.LayoutView):
     """Player card: text and icon-only control buttons inside one container."""
     def __init__(self, manager, player, status=None):
@@ -166,7 +173,7 @@ class Controls(discord.ui.LayoutView):
         self.card_png = getattr(player, 'card_png', None)
         if self.card_png:
             t = player.current
-            container.add_item(discord.ui.Section(discord.ui.TextDisplay('## ♬\u2003Music Player\n-# Kristy'), accessory=_search_button(manager)))
+            container.add_item(discord.ui.Section(discord.ui.TextDisplay(header_text()), accessory=_search_button(manager)))
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
                                description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
         else:
