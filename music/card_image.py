@@ -82,9 +82,28 @@ def _font(size, bold):
     try: return ImageFont.load_default(size)
     except Exception: return ImageFont.load_default()
 
+FAUX_STROKE = 2  # px at 42pt: clearly bold after Discord scales the 960px image down on a phone, letters still separate
+
+def _weight_axes(font):
+    """Axis values for a variable font with its weight axis at 700, or None if it has no identifiable weight axis."""
+    axes = font.get_variation_axes()
+    values, found = [], False
+    for axis in axes:
+        name = axis.get('name', b'')
+        name = name.decode('latin-1') if isinstance(name, bytes) else str(name)
+        if name.lower() in ('weight', 'wght'):
+            values.append(min(max(700, axis['minimum']), axis['maximum'])); found = True
+        else:
+            values.append(axis['default'])
+    return values if found else None
+
+def _ink(font):
+    mask = font.getmask('Hamburgefonstiv')
+    return sum(mask) if hasattr(mask, '__iter__') else 0
+
 def _title_font(size):
-    """(font, stroke): real bold file if present, else a variable font at weight 700, else the regular font with a stroke
-    so the title is bold even on phones that only ship a regular Roboto."""
+    """(font, stroke). Real bold file, or a variable font whose weight axis is set to 700; in any other case
+    (only a regular face available, or an axis we cannot identify) the regular font is drawn with a stroke."""
     from PIL import ImageFont
     env = os.getenv(FONT_ENV, '').strip()
     for path in ([env] if env else []) + BOLD_FONTS:
@@ -94,9 +113,14 @@ def _title_font(size):
         try: font = ImageFont.truetype(path, size)
         except Exception: continue
         try:
-            font.set_variation_by_axes([700]); return font, 0
-        except Exception: return font, 2
-    return _font(size, False), 2
+            values = _weight_axes(font)
+            if values:
+                ink_regular = _ink(font)
+                font.set_variation_by_axes(values)
+                if _ink(font) > ink_regular * 1.08: return font, 0   # only trust the axis if the glyphs really got heavier
+        except Exception: pass
+        return font, FAUX_STROKE
+    return _font(size, False), FAUX_STROKE
 
 def _wrap(draw, text, font, width, lines):
     words, out, line = str(text).split(), [], ''
@@ -152,7 +176,7 @@ def render_block(title, meta, art, label, loading=False):
             _placeholder(draw, side)
         x = side + 36; width = w - x - 28
         (tf, stroke), lf = _title_font(42), _font(30, True)
-        lines = _wrap(draw, title, tf, width, 3) if not stroke else _wrap(draw, title, tf, width - 4, 3)
+        lines = _wrap(draw, title, tf, width, 3) if not stroke else _wrap(draw, title, tf, width - 2 * stroke, 3)
         y = 28
         for line in lines:
             draw.text((x, y), line, font=tf, fill='white', stroke_width=stroke, stroke_fill='white'); y += 54
