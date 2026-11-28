@@ -1,0 +1,117 @@
+"""Upper block of the player card (artwork left, title/source/state right) drawn as one image.
+Pillow is optional: without it, or when anything here fails, the card falls back to native components."""
+import asyncio
+import io
+import os
+import re
+
+ART_URL = 'https://i.ytimg.com/vi/%s/hqdefault.jpg'
+ART_LIMIT = 1_000_000
+ART_TIMEOUT = 3
+SIZE = (960, 320)
+BG = (52, 54, 60)
+FONT_ENV = 'MUSIC_FONT'
+BOLD_FONTS = ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/system/fonts/Roboto-Bold.ttf',
+              '/system/fonts/NotoSans-Bold.ttf', '/system/fonts/DroidSans-Bold.ttf']
+REG_FONTS = ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/system/fonts/Roboto-Regular.ttf',
+             '/system/fonts/NotoSans-Regular.ttf', '/system/fonts/DroidSans.ttf']
+
+def available():
+    try:
+        import PIL  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def valid_id(video_id):
+    return bool(re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id or ''))
+
+async def fetch_art(video_id):
+    """Download the YouTube still ourselves (fixed host, size and time capped). None on any failure."""
+    if not valid_id(video_id): return None
+    try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=ART_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(ART_URL % video_id, allow_redirects=False) as response:
+                if response.status != 200: return None
+                if (response.content_length or 0) > ART_LIMIT: return None
+                data = await response.content.read(ART_LIMIT + 1)
+                return data if 0 < len(data) <= ART_LIMIT else None
+    except Exception:
+        return None
+
+def _font(size, bold):
+    from PIL import ImageFont
+    env = os.getenv(FONT_ENV, '').strip()
+    for path in ([env] if env else []) + (BOLD_FONTS if bold else REG_FONTS):
+        try: return ImageFont.truetype(path, size)
+        except Exception: continue
+    try: return ImageFont.load_default(size)
+    except Exception: return ImageFont.load_default()
+
+def _wrap(draw, text, font, width, lines):
+    words, out, line = str(text).split(), [], ''
+    for word in words:
+        trial = (line + ' ' + word).strip()
+        if draw.textlength(trial, font=font) <= width: line = trial; continue
+        if line: out.append(line)
+        line = word
+        while draw.textlength(line, font=font) > width and len(line) > 1:
+            cut = len(line) - 1
+            while cut > 1 and draw.textlength(line[:cut], font=font) > width: cut -= 1
+            out.append(line[:cut]); line = line[cut:]
+    if line: out.append(line)
+    if len(out) > lines:
+        out = out[:lines]; last = out[-1]
+        while last and draw.textlength(last + '…', font=font) > width: last = last[:-1]
+        out[-1] = last + '…'
+    return out
+
+def _art_square(data, side):
+    from PIL import Image
+    img = Image.open(io.BytesIO(data)).convert('RGB')
+    w, h = img.size
+    if w >= h * 1.25:  # 16:9 still padded to 4:3: drop the black bars first
+        pad = int(h * 0.125) if abs(w / h - 4 / 3) < .05 else 0
+        img = img.crop((0, pad, w, h - pad)); w, h = img.size
+    s = min(w, h); left, top = (w - s) // 2, (h - s) // 2
+    return img.crop((left, top, left + s, top + s)).resize((side, side))
+
+def _placeholder(draw, side):
+    draw.rounded_rectangle([0, 0, side, side], 28, fill=(128, 128, 128))
+    cx = cy = side / 2
+    draw.rounded_rectangle([cx - 70, cy - 50, cx + 70, cy + 50], 10, outline='white', width=9)
+    draw.polygon([(cx - 50, cy + 38), (cx - 12, cy - 8), (cx + 12, cy + 18), (cx + 30, cy + 2), (cx + 52, cy + 38)], fill='white')
+
+def render_block(title, meta, art, label, loading=False):
+    """PNG bytes, or None when Pillow is missing or drawing fails."""
+    try:
+        from PIL import Image, ImageDraw
+        w, h = SIZE
+        img = Image.new('RGB', SIZE, BG); draw = ImageDraw.Draw(img)
+        side = h
+        art_img = None
+        if art:
+            try: art_img = _art_square(art, side)
+            except Exception: art_img = None
+        if art_img is not None:
+            mask = Image.new('L', (side, side), 0); ImageDraw.Draw(mask).rounded_rectangle([0, 0, side, side], 28, fill=255)
+            img.paste(art_img, (0, 0), mask)
+        else:
+            _placeholder(draw, side)
+        x = side + 36; width = w - x - 28
+        tf, mf, lf = _font(42, True), _font(30, False), _font(30, True)
+        lines = _wrap(draw, title, tf, width, 3)
+        y = 28
+        for line in lines:
+            draw.text((x, y), line, font=tf, fill='white'); y += 54
+        draw.text((x, h - 112), meta, font=mf, fill=(120, 170, 255))
+        draw.text((x, h - 64), label, font=lf, fill=(255, 196, 80) if loading else (200, 200, 205))
+        out = io.BytesIO(); img.save(out, 'PNG', optimize=True)
+        return out.getvalue()
+    except Exception:
+        return None
+
+async def render_block_async(*args, **kwargs):
+    return await asyncio.to_thread(render_block, *args, **kwargs)
