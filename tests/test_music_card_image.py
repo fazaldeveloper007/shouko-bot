@@ -109,6 +109,19 @@ class CardTests(Base):
         self.assertIn('Loading audio', self.texts(view))
         rows = [c for c in view.to_components()[0]['components'] if c['type'] == 1]
         self.assertEqual(len(rows[0]['components']), 5)
+    async def test_fallback_reason_is_logged_once_without_message_text(self):
+        import contextlib
+        ui._noted.clear()
+        buf = io.StringIO()
+        p = self.player(); p.current = track()
+        with contextlib.redirect_stdout(buf), patch.object(card_image, 'available', return_value=False):
+            await ui.prepare_card(p); await ui.prepare_card(p)
+        self.assertEqual(buf.getvalue().strip(), 'MUSIC_CARD fallback NO_PILLOW')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), patch.object(card_image, 'fetch_art', AsyncMock(return_value=None)), \
+             patch.object(card_image, 'render_block', return_value=None), patch.object(card_image, 'last_error', 'ValueError'):
+            await ui.prepare_card(p)
+        self.assertEqual(buf.getvalue().strip(), 'MUSIC_CARD fallback RENDER_FAILED ValueError')
     async def test_no_pillow_means_native_fallback(self):
         p = self.player(); p.current = track()
         with patch.object(card_image, 'available', return_value=False):
