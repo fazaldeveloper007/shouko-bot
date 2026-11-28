@@ -266,6 +266,34 @@ class TitleWeightTests(Base):
         (f, stroke), calls = self.run_title([])
         self.assertEqual(stroke, card_image.FAUX_STROKE)
 
+class BoldNamedRegularFaceTests(Base):
+    """Seen on the phone: /system/fonts/DroidSans-Bold.ttf reports ('Roboto', 'Regular')."""
+    def regular_only(self):
+        from PIL import ImageFont
+        real = ImageFont.truetype
+        def fake(path, size=10, *a, **k):
+            if 'DejaVuSans.ttf' in path: return real(path, size, *a, **k)
+            if path == '/system/fonts/DroidSans-Bold.ttf':
+                f = real('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', size); f.getname = lambda: ('Roboto', 'Regular'); return f
+            raise OSError()
+        return patch.object(ImageFont, 'truetype', fake)
+    def test_bold_named_file_with_regular_face_gets_stroke(self):
+        with self.regular_only():
+            font, stroke = card_image._title_font(42)
+        self.assertEqual(font.getname(), ('Roboto', 'Regular')); self.assertEqual(stroke, card_image.FAUX_STROKE)
+    def test_rendered_title_is_heavier_than_plain_regular(self):
+        def ink(png):
+            im = Image.open(io.BytesIO(png)).convert('L'); return sum(1 for x in range(340, 900) for y in range(20, 90) if im.getpixel((x, y)) > 200)
+        with self.regular_only():
+            heavy = card_image.render_block('Bold title', '', None, 'Playing')
+            with patch.object(card_image, 'FAUX_STROKE', 0):
+                plain = card_image.render_block('Bold title', '', None, 'Playing')
+        open('/tmp/heavy.png', 'wb').write(heavy); open('/tmp/plain.png', 'wb').write(plain)
+        self.assertGreater(ink(heavy), ink(plain) * 1.2)
+    def test_real_bold_style_face_is_used_without_stroke(self):
+        font, stroke = card_image._title_font(42)
+        self.assertEqual(stroke, 0); self.assertIn('bold', font.getname()[1].lower())
+
 class TitleWeightNoEffectTests(TitleWeightTests):
     def test_weight_axis_that_changes_nothing_still_gets_stroke(self):
         from PIL import ImageFont
