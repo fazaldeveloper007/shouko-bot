@@ -81,18 +81,25 @@ async def prepare_card(player, status=None):
     """Draw the upper card block for the current state. Sets player.card_png (None means: use native layout)."""
     player.card_png = None
     t = player.current
-    if not t: return
     if not card_image.available():
         _fallback_note('NO_PILLOW'); return
+    if not t:
+        player.card_png = await card_image.render_block_async('Nothing playing', 'Use /play or search in this chat', None, 'Idle')
+        if not player.card_png: _fallback_note('RENDER_FAILED ' + str(card_image.last_error or 'Unknown'))
+        return
     cache = getattr(player, 'art_cache', None)
     if cache is None: cache = player.art_cache = {}
     if t.id not in cache:
-        cache[t.id] = await card_image.fetch_art(t.id) or False
-        while len(cache) > 6: cache.pop(next(iter(cache)))
+        art = await card_image.fetch_art(t.id)
+        if art:
+            cache[t.id] = art
+            while len(cache) > 6: cache.pop(next(iter(cache)))
+        else:
+            _fallback_note('ART_' + str(card_image.art_error or 'Unknown'))  # failures are never cached: the next panel retries
     state = track_state(player)
     label = status or state
     player.card_png = await card_image.render_block_async(
-        clean(t.title, 120), f'YouTube • {duration(t.duration)}', cache[t.id] or None, label, loading=state.startswith('Loading'))
+        clean(t.title, 120), f'YouTube • {duration(t.duration)}', cache.get(t.id), label, loading=state.startswith('Loading'))
     if not player.card_png:
         _fallback_note('RENDER_FAILED ' + str(card_image.last_error or 'Unknown'))
 
@@ -102,13 +109,13 @@ class Controls(discord.ui.LayoutView):
         super().__init__(timeout=None)
         self.manager, self.player = manager, player
         container = discord.ui.Container(accent_color=ACCENT)
-        self.card_png = getattr(player, 'card_png', None) if player.current else None
+        self.card_png = getattr(player, 'card_png', None)
         if self.card_png:
             t = player.current
             container.add_item(discord.ui.TextDisplay('## ♬ Music Player\n-# Kristy'))
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
-                               description=f"{clean(t.title, 100)} - {status or track_state(player)}")))
-            container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
+                               description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
+            if t: container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
         else:
             text = discord.ui.TextDisplay(player_text(player, status))
             thumb = thumbnail_url(player.current) if player.current else None
@@ -153,7 +160,7 @@ class Controls(discord.ui.LayoutView):
             except Exception as exc: await callback_error(interaction, exc)
         toggle.callback = on_toggle
         if self.card_png:
-            container.add_item(discord.ui.Section(f'Requested by <@{player.current.requester}>', accessory=toggle))
+            container.add_item(discord.ui.Section(f'Requested by <@{player.current.requester}>' if player.current else 'Autoplay queues related tracks', accessory=toggle))
             container.add_item(controls_row)
             container.add_item(discord.ui.TextDisplay(f"**Up next • {len(player.queue)}**\n" + ('\n'.join(clean(x.title, 90) for x in list(player.queue)[:3]) or 'Queue is empty')))
             self.add_item(container)
@@ -209,7 +216,7 @@ class Results(discord.ui.LayoutView):
                         else:
                             await p.add(track, start=False)
                         emit('REQUEST','OK',elapsed=time.monotonic()-request_began)
-                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Playing now, interrupting the current track.' if action == 'Play' and was_playing else (' Playing now.' if action == 'Play' else ' Use /play to start if idle.')))
+                        await answer(interaction, f'Added: {clean(track.title)}.' + (' Playing now, interrupting the current track.' if action == 'Play' and was_playing else (' Loading audio...' if action == 'Play' else ' Use /play to start if idle.')))
                         await self.manager.panel(p)
                     except Exception as exc:
                         if claimed:
