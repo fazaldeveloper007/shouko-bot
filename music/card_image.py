@@ -9,6 +9,7 @@ ART_URL = 'https://i.ytimg.com/vi/%s/hqdefault.jpg'
 ART_LIMIT = 1_000_000
 ART_TIMEOUT = 3
 SIZE = (960, 320)
+last_error = None  # exception CLASS NAME of the latest render failure (never message text)
 BG = (52, 54, 60)
 FONT_ENV = 'MUSIC_FONT'
 BOLD_FONTS = ['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/system/fonts/Roboto-Bold.ttf',
@@ -110,7 +111,9 @@ def render_block(title, meta, art, label, loading=False):
         draw.text((x, h - 64), label, font=lf, fill=(255, 196, 80) if loading else (200, 200, 205))
         out = io.BytesIO(); img.save(out, 'PNG', optimize=True)
         return out.getvalue()
-    except Exception:
+    except Exception as exc:
+        global last_error
+        last_error = type(exc).__name__
         return None
 
 async def render_block_async(*args, **kwargs):
