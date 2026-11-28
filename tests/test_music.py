@@ -106,8 +106,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['components'][0]['emoji']['name'],'▶️')
     def _card_texts(self,view):
         inner=view.to_components()[0]['components']
-        sections=[c for c in inner if c['type']==9]
-        texts=[c for c in inner if c['type']==10]+[x for c in sections for x in c['components']]
+        sections=[c for c in inner if c['type']==9 and c['accessory']['type']==11]   # thumbnail sections; the header Section holds Search
+        texts=[c for c in inner if c['type']==10]+[x for c in inner if c['type']==9 for x in c['components']]
+        _unused=[c for c in inner if c['type']==10]+[x for c in sections for x in c['components']]
         return sections,'\n'.join(t['content'] for t in texts)
     async def test_card_says_loading_until_audio_starts_then_playing(self):
         p=self.player();p.current=track('Song X');p.started=0
@@ -394,7 +395,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(p.autoplay)
         p.manager.panel.assert_awaited()
         view=player_panel(p.manager,p)
-        labels=[b.label for b in view.walk_children() if isinstance(b,discord.ui.Button) and b.label]
+        labels=[b.label for b in view.walk_children() if isinstance(b,discord.ui.Button) and b.label and b.label!='Search']
         self.assertEqual(labels,['Autoplay: On'])
         await p.manager.remove(p)
     async def test_command_tree_setup_no_sync_or_login(self):
