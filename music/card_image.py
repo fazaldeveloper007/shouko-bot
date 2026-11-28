@@ -133,21 +133,84 @@ def _title_font(size, title=None):
         return font, FAUX_STROKE
     return _font(size, False), FAUX_STROKE
 
-def _wrap(draw, text, font, width, lines):
+
+CJK_FONTS = ['/system/fonts/NotoSansCJK-Bold.ttc', '/system/fonts/NotoSansCJKjp-Bold.otf', '/system/fonts/NotoSansCJKsc-Bold.otf',
+             '/system/fonts/NotoSansCJK-Regular.ttc', '/system/fonts/NotoSansCJKjp-Regular.otf', '/system/fonts/NotoSansSC-Regular.otf',
+             '/system/fonts/DroidSansFallback.ttf', '/system/fonts/DroidSansFallbackFull.ttf', '/system/fonts/NotoSerifCJK-Regular.ttc',
+             '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf']
+
+def _runs(text):
+    """Split into [(is_montserrat, text)]: characters Montserrat covers stay together; only the rest go to a fallback font."""
+    out = []
+    for ch in str(text):
+        ok = montserrat.covers(ch)
+        if out and out[-1][0] == ok: out[-1][1] += ch
+        else: out.append([ok, ch])
+    return [(ok, t) for ok, t in out]
+
+def _has_glyphs(font, text):
+    try:
+        blank = font.getmask('\uFFFF').getbbox()
+        for ch in text:
+            if ch.isspace(): continue
+            mask = font.getmask(ch)
+            if mask.getbbox() is None or mask.getbbox() == blank and bytes(mask) == bytes(font.getmask('\uFFFF')): return False
+        return True
+    except Exception: return False
+
+_fallback_cache = {}
+def _fallback_font(size, text):
+    """(font, stroke) for characters Montserrat lacks. Only these runs use it; the stroke applies to them alone."""
+    from PIL import ImageFont
+    env = os.getenv(FONT_ENV, '').strip()
+    paths = ([env] if env else []) + CJK_FONTS + BOLD_FONTS + REG_FONTS
+    for path in paths:
+        key = (path, size)
+        if key not in _fallback_cache:
+            try: _fallback_cache[key] = ImageFont.truetype(path, size)
+            except Exception: _fallback_cache[key] = None
+        font = _fallback_cache[key]
+        if font is not None and _has_glyphs(font, text):
+            bold = any(k in _style(font) for k in ('bold', 'black', 'heavy'))
+            return font, (0 if bold else 1)
+    return None, 0
+
+def _mixed_parts(text, size):
+    """[(font, stroke, text)] with Montserrat for covered characters and a per-run fallback for the rest."""
+    parts = []
+    for ok, t in _runs(text):
+        if ok: parts.append((montserrat.load(size), 0, t))
+        else:
+            f, st = _fallback_font(size, t)
+            if f is None: f, st = montserrat.load(size), 0   # nothing has the glyph: Montserrat draws its own missing-glyph box
+            parts.append((f, st, t))
+    return parts
+
+def _mixed_width(text, size):
+    return sum(f.getlength(t) for f, _, t in _mixed_parts(text, size))
+
+def _draw_mixed(layer_draw, xy, text, size):
+    x, y = xy
+    for f, st, t in _mixed_parts(text, size):
+        layer_draw.text((x, y), t, font=f, fill=255, stroke_width=st, stroke_fill=255, anchor='ls')
+        x += f.getlength(t)
+
+def _wrap(draw, text, font, width, lines, measure=None):
+    m = measure or (lambda t: draw.textlength(t, font=font))
     words, out, line = str(text).split(), [], ''
     for word in words:
         trial = (line + ' ' + word).strip()
-        if draw.textlength(trial, font=font) <= width: line = trial; continue
+        if m(trial) <= width: line = trial; continue
         if line: out.append(line)
         line = word
-        while draw.textlength(line, font=font) > width and len(line) > 1:
+        while m(line) > width and len(line) > 1:
             cut = len(line) - 1
-            while cut > 1 and draw.textlength(line[:cut], font=font) > width: cut -= 1
+            while cut > 1 and m(line[:cut]) > width: cut -= 1
             out.append(line[:cut]); line = line[cut:]
     if line: out.append(line)
     if len(out) > lines:
         out = out[:lines]; last = out[-1]
-        while last and draw.textlength(last + '…', font=font) > width: last = last[:-1]
+        while last and m(last + '…') > width: last = last[:-1]
         out[-1] = last + '…'
     return out
 
@@ -186,21 +249,21 @@ def render_block(title, meta, art, label, loading=False):
         else:
             _placeholder(draw, side)
         x = side + 36; width = w - x - 28
-        (tf, stroke), lf = _title_font(42, title), _font(30, True)
+        lf = _font(30, True)
         y = 28
-        if not stroke:
-            lines = _wrap(draw, title, tf, width, 3)
-            for line in lines:
-                draw.text((x, y), line, font=tf, fill='white'); y += 54
-        else:
-            S = 2  # draw the title at 2x with an integer stroke, then scale down: gives a half-pixel stroke
-            tf2, _ = _title_font(42 * S, title)
-            lines = _wrap(draw, title, tf2, (width - 2 * int(stroke + 1)) * S, 3)
+        S = 2   # title drawn at 2x then scaled down (also keeps any fallback-run stroke at half pixels)
+        try:
+            lines = _wrap(draw, title, None, width * S, 3, measure=lambda t: _mixed_width(t, 42 * S))
             layer = Image.new('L', (width * S, 54 * S * 3 + 8 * S), 0); ld = ImageDraw.Draw(layer)
             for i, line in enumerate(lines):
-                ld.text((2 * S, i * 54 * S), line, font=tf2, fill=255, stroke_width=int(round(stroke * S)), stroke_fill=255)
+                _draw_mixed(ld, (2 * S, (i * 54 + 40) * S), line, 42 * S)
             layer = layer.resize((width, layer.height // S), Image.LANCZOS)
             img.paste((255, 255, 255), (x - 2, y), layer)
+        except Exception:
+            (tf, stroke) = _title_font(42, title)
+            lines = _wrap(draw, title, tf, width, 3)
+            for line in lines:
+                draw.text((x, y), line, font=tf, fill='white', stroke_width=int(stroke), stroke_fill='white'); y += 54
         draw.text((x, h - 64), label, font=lf, fill=(255, 196, 80) if loading else (200, 200, 205))
         out = io.BytesIO(); img.save(out, 'PNG', optimize=True)
         return out.getvalue()
