@@ -200,6 +200,10 @@ class ProactiveRules(unittest.TestCase):
         # duplicate truth-dare -> fail closed
         guild.text_channels.append(ch(49, "truth-dare"))
         self.assertIsNone(m.Proactive.resolve_channels(guild, "46", "47"))
+        # no truth-dare at all (server rebuilt) -> keep the two configured channels, never any other
+        guild.text_channels = [c for c in guild.text_channels if c.id not in (48, 49)]
+        got = m.Proactive.resolve_channels(guild, "46", "47")
+        self.assertEqual(set(got), {"gaming-chat", "clips-highlights"})
         # no guild -> fail closed
         self.assertIsNone(m.Proactive.resolve_channels(None, "46", "47"))
 
