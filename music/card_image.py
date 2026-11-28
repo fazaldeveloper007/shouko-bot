@@ -101,17 +101,24 @@ def _ink(font):
     mask = font.getmask('Hamburgefonstiv')
     return sum(mask) if hasattr(mask, '__iter__') else 0
 
+def _style(font):
+    try: return str(font.getname()[1]).lower()
+    except Exception: return ''
+
 def _title_font(size):
-    """(font, stroke). Real bold file, or a variable font whose weight axis is set to 700; in any other case
-    (only a regular face available, or an axis we cannot identify) the regular font is drawn with a stroke."""
+    """(font, stroke). The file NAME is never trusted (a file called *-Bold can hold a Regular face; seen on the phone).
+    A face counts as bold only if it reports a bold style. Otherwise a variable weight axis is set to 700 and kept only
+    if the glyphs really got heavier, else the face is drawn with a stroke."""
     from PIL import ImageFont
     env = os.getenv(FONT_ENV, '').strip()
-    for path in ([env] if env else []) + BOLD_FONTS:
-        try: return ImageFont.truetype(path, size), 0
+    paths = ([env] if env else []) + BOLD_FONTS + REG_FONTS
+    loaded = []
+    for path in paths:
+        try: loaded.append(ImageFont.truetype(path, size))
         except Exception: continue
-    for path in ([env] if env else []) + REG_FONTS:
-        try: font = ImageFont.truetype(path, size)
-        except Exception: continue
+    for font in loaded:
+        if any(k in _style(font) for k in ('bold', 'black', 'heavy')): return font, 0
+    for font in loaded:
         try:
             values = _weight_axes(font)
             if values:
