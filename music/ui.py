@@ -82,7 +82,7 @@ class SearchModal(discord.ui.Modal, title='Search YouTube'):
         await callback_error(interaction, error)
 
 def _search_button(manager):
-    button = discord.ui.Button(label='Search', emoji=_icon('MUSIC_ICON_SEARCH', '\U0001F50E'), style=discord.ButtonStyle.secondary)
+    button = discord.ui.Button(label='Search', emoji=_icon('MUSIC_ICON_SEARCH', '\U0001F50D'), style=discord.ButtonStyle.secondary)
     async def on_search(interaction):
         try:
             manager.caller_channel(interaction.user, interaction.channel)   # same VC-chat rule as /search
