@@ -217,7 +217,7 @@ def _guild_role(guild,role_id):
 class Commands:
     def __init__(self,store,resolver,owner_id='',ledger=None):
         self.store,self.resolver,self.owner_id=store,resolver,owner_id
-        self.pending={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
+        self.pending={};self.helper_addressed={};self.intent=None;self.health=lambda:'unknown';self.bot_id=None;self.client_for_access=None
         # Optional: recent same-channel lines [(author_name, author_id, text)].
         # Lets a 'set kardo' after Kristy's own restatement resolve instead of
         # re-asking everything; validation still uses only the user's own words.
@@ -280,6 +280,14 @@ class Commands:
         if ref is not None and getattr(ref,'message_id',None)==found[1][1]:return found
         if addressed:return found
         return None
+    def mark_helper_addressed(self,message,addressed):
+        # discord.Message uses __slots__: never set attributes on it. Remember by message id, bounded.
+        key=getattr(message,'id',None)
+        if key is None:key=('obj',id(message))
+        self.helper_addressed[key]=bool(addressed)
+        while len(self.helper_addressed)>500:self.helper_addressed.pop(next(iter(self.helper_addressed)))
+    def was_helper_addressed(self,message):
+        return bool(self.helper_addressed.get(getattr(message,'id',None) if getattr(message,'id',None) is not None else ('obj',id(message)),False))
     def followup(self,message,text,addressed=True):
         """A reply to our own clarification (same guild/channel/author, within
         2 minutes) - or a helper's addressed/reply completion of someone else's.
@@ -292,7 +300,7 @@ class Commands:
         found=self.helper_item(message,addressed)
         if found is not None:
             # handle() re-derives addressed-ness; carry this gate's answer.
-            message._sched_helper_addressed=bool(addressed)
+            self.mark_helper_addressed(message,addressed)
         return found is not None
     async def reply(self,message,text):
         return await message.reply(text,mention_author=False,allowed_mentions=discord.AllowedMentions.none())
@@ -827,7 +835,7 @@ class Commands:
         if not m:
             if INTENT.search(text) or self.pending_item(message):
                 return await self.ai_request(message,text,client)
-            found=self.helper_item(message,bool(getattr(message,'reference',None)) or bool(getattr(message,'_sched_helper_addressed',False)))
+            found=self.helper_item(message,bool(getattr(message,'reference',None)) or self.was_helper_addressed(message))
             if found is not None:
                 return await self.ai_request(message,text,client,pkey=found[0],helper=message.author)
             return False
