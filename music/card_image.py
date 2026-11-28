@@ -82,7 +82,7 @@ def _font(size, bold):
     try: return ImageFont.load_default(size)
     except Exception: return ImageFont.load_default()
 
-FAUX_STROKE = 2  # px at 42pt: clearly bold after Discord scales the 960px image down on a phone, letters still separate
+FAUX_STROKE = 1.5  # px at 42pt, drawn supersampled 2x so half pixels work: 2px clogged the letters on the phone, 1px is nearly regular
 
 def _weight_axes(font):
     """Axis values for a variable font with its weight axis at 700, or None if it has no identifiable weight axis."""
@@ -183,10 +183,20 @@ def render_block(title, meta, art, label, loading=False):
             _placeholder(draw, side)
         x = side + 36; width = w - x - 28
         (tf, stroke), lf = _title_font(42), _font(30, True)
-        lines = _wrap(draw, title, tf, width, 3) if not stroke else _wrap(draw, title, tf, width - 2 * stroke, 3)
         y = 28
-        for line in lines:
-            draw.text((x, y), line, font=tf, fill='white', stroke_width=stroke, stroke_fill='white'); y += 54
+        if not stroke:
+            lines = _wrap(draw, title, tf, width, 3)
+            for line in lines:
+                draw.text((x, y), line, font=tf, fill='white'); y += 54
+        else:
+            S = 2  # draw the title at 2x with an integer stroke, then scale down: gives a half-pixel stroke
+            tf2, _ = _title_font(42 * S)
+            lines = _wrap(draw, title, tf2, (width - 2 * int(stroke + 1)) * S, 3)
+            layer = Image.new('L', (width * S, 54 * S * 3 + 8 * S), 0); ld = ImageDraw.Draw(layer)
+            for i, line in enumerate(lines):
+                ld.text((2 * S, i * 54 * S), line, font=tf2, fill=255, stroke_width=int(round(stroke * S)), stroke_fill=255)
+            layer = layer.resize((width, layer.height // S), Image.LANCZOS)
+            img.paste((255, 255, 255), (x - 2, y), layer)
         draw.text((x, h - 64), label, font=lf, fill=(255, 196, 80) if loading else (200, 200, 205))
         out = io.BytesIO(); img.save(out, 'PNG', optimize=True)
         return out.getvalue()
