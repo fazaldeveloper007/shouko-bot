@@ -430,3 +430,15 @@ class MixedScriptTitleTests(Base):
         self.assertNotEqual(parts[1][0].getname()[0], 'Montserrat')
     def test_mixed_title_renders_and_is_not_whole_title_stroked(self):
         self.assertTrue(card_image.render_block("GIMS - Est-ce que tu m'aimes ( \u611bxiao )", '', None, 'Loading audio...', loading=True))
+
+
+class HeaderIconTests(unittest.TestCase):
+    def test_default_is_note_and_env_swaps_in_custom_emoji(self):
+        import os
+        from music import ui
+        with patch.dict(os.environ, {'MUSIC_ICON_HEADER': ''}):
+            self.assertEqual(ui.header_text(), '## \u266c\u2003Music Player\n-# Kristy')
+        with patch.dict(os.environ, {'MUSIC_ICON_HEADER': 'kristy_u_header:123456'}):
+            self.assertEqual(ui.header_text(), '## <:kristy_u_header:123456>\u2003Music Player\n-# Kristy')
+        with patch.dict(os.environ, {'MUSIC_ICON_HEADER': 'junk'}):
+            self.assertIn('\u266c', ui.header_text())
