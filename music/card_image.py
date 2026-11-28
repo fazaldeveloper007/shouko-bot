@@ -4,6 +4,7 @@ import asyncio
 import io
 import os
 import re
+from . import montserrat
 
 ART_URL = 'https://i.ytimg.com/vi/%s/hqdefault.jpg'
 ART_LIMIT = 1_000_000
@@ -105,11 +106,14 @@ def _style(font):
     try: return str(font.getname()[1]).lower()
     except Exception: return ''
 
-def _title_font(size):
+def _title_font(size, title=None):
     """(font, stroke). The file NAME is never trusted (a file called *-Bold can hold a Regular face; seen on the phone).
     A face counts as bold only if it reports a bold style. Otherwise a variable weight axis is set to 700 and kept only
     if the glyphs really got heavier, else the face is drawn with a stroke."""
     from PIL import ImageFont
+    if title is not None and montserrat.covers(title):
+        try: return montserrat.load(size), 0   # bundled Montserrat Bold 700 (Fazal's choice); no stroke needed
+        except Exception: pass
     env = os.getenv(FONT_ENV, '').strip()
     paths = ([env] if env else []) + BOLD_FONTS + REG_FONTS
     loaded = []
@@ -182,7 +186,7 @@ def render_block(title, meta, art, label, loading=False):
         else:
             _placeholder(draw, side)
         x = side + 36; width = w - x - 28
-        (tf, stroke), lf = _title_font(42), _font(30, True)
+        (tf, stroke), lf = _title_font(42, title), _font(30, True)
         y = 28
         if not stroke:
             lines = _wrap(draw, title, tf, width, 3)
@@ -190,7 +194,7 @@ def render_block(title, meta, art, label, loading=False):
                 draw.text((x, y), line, font=tf, fill='white'); y += 54
         else:
             S = 2  # draw the title at 2x with an integer stroke, then scale down: gives a half-pixel stroke
-            tf2, _ = _title_font(42 * S)
+            tf2, _ = _title_font(42 * S, title)
             lines = _wrap(draw, title, tf2, (width - 2 * int(stroke + 1)) * S, 3)
             layer = Image.new('L', (width * S, 54 * S * 3 + 8 * S), 0); ld = ImageDraw.Draw(layer)
             for i, line in enumerate(lines):
