@@ -140,7 +140,7 @@ class Controls(discord.ui.LayoutView):
         self.card_png = getattr(player, 'card_png', None)
         if self.card_png:
             t = player.current
-            container.add_item(discord.ui.TextDisplay('## ♬ Music Player\n-# Kristy'))
+            container.add_item(discord.ui.TextDisplay('## ♬\u2003Music Player\n-# Kristy'))
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem('attachment://' + CARD_FILE,
                                description=(f"{clean(t.title, 100)} - {status or track_state(player)}" if t else 'Nothing playing'))))
             if t: container.add_item(discord.ui.TextDisplay(f'[YouTube]({t.url}) • {duration(t.duration)}'))
