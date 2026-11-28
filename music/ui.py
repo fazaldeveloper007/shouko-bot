@@ -69,11 +69,21 @@ def player_text(player, status=None):
 
 CARD_FILE = 'kristy-card.png'
 
+_noted = set()
+
+def _fallback_note(reason):
+    # Once per process and reason; fixed words plus an exception class name, never message text.
+    if reason in _noted: return
+    _noted.add(reason)
+    print('MUSIC_CARD fallback ' + reason, flush=True)
+
 async def prepare_card(player, status=None):
     """Draw the upper card block for the current state. Sets player.card_png (None means: use native layout)."""
     player.card_png = None
     t = player.current
-    if not t or not card_image.available(): return
+    if not t: return
+    if not card_image.available():
+        _fallback_note('NO_PILLOW'); return
     cache = getattr(player, 'art_cache', None)
     if cache is None: cache = player.art_cache = {}
     if t.id not in cache:
@@ -83,6 +93,8 @@ async def prepare_card(player, status=None):
     label = status or state
     player.card_png = await card_image.render_block_async(
         clean(t.title, 120), f'YouTube • {duration(t.duration)}', cache[t.id] or None, label, loading=state.startswith('Loading'))
+    if not player.card_png:
+        _fallback_note('RENDER_FAILED ' + str(card_image.last_error or 'Unknown'))
 
 class Controls(discord.ui.LayoutView):
     """Player card: text and icon-only control buttons inside one container."""
