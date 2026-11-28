@@ -308,6 +308,7 @@ class Manager:
         self.guild_locks = {}
         self.voice_reservations = {}
         self.panel_builder = None
+        self.search_handler = None
         self.panel_prepare = None
         self.panel_interval = 1.0
 
