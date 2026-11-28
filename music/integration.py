@@ -17,6 +17,7 @@ class Music:
         self.manager = Manager(client)
         self.manager.panel_builder = lambda p, status: player_panel(self.manager, p, status)
         self.manager.panel_prepare = prepare_card
+        self.manager.search_handler = lambda interaction, query: self.execute(interaction, 'search', query)
         self.tree = app_commands.CommandTree(client)
         self.synced = False
         self.busy = set()
