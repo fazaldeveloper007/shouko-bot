@@ -1,4 +1,4 @@
-"""Kristy's proactive unanswered-help, scoped to Gaming Impact's text channels.
+"""Kristy's proactive unanswered-help, scoped to GENERAL-CHAT only (Fazal, Nov 28).
 
 OFF BY DEFAULT (PROACTIVE_ENABLED=1 to allow). When someone in an allowed
 channel asks a question or asks for a review/opinion and nobody answers,
@@ -225,37 +225,19 @@ class Proactive:
     # ---- channel resolution (fail-closed) ----
 
     @staticmethod
-    def resolve_channels(guild, gaming_chat_id, clips_id):
-        """The 3 allowed text channels, or None with a logged reason.
+    def resolve_channels(guild, chat_id, clips_id=None):
+        """Only GENERAL-CHAT (the configured chat channel), or None with a logged reason.
 
-        Guild comes from the established configured channels themselves;
-        Truth-Dare must match exactly one text channel by name in it.
+        Fazal narrowed autochat to this one channel (Nov 28): Clips-Highlights and Truth-Dare are not in scope.
+        clips_id is accepted for call compatibility and ignored.
         """
         if guild is None:
-            log.error("proactive: no guild resolved from configured channels; disabled")
+            log.error("proactive: no guild resolved from the configured chat channel; disabled")
             return None
-        channels = {}
-        for label, cid in (("gaming-chat", gaming_chat_id), ("clips-highlights", clips_id)):
-            ch = guild.get_channel(int(cid)) if cid else None
-            if ch is None:
-                log.error("proactive: configured %s channel %s not in guild %s; disabled",
-                          label, cid, getattr(guild, "id", "?"))
-                return None
-            channels[label] = ch
-        want = _norm_channel_name("truth-dare")
-        matches = [c for c in getattr(guild, "text_channels", [])
-                   if _norm_channel_name(getattr(c, "name", "")) == want]
-        if len(matches) > 1:   # ambiguous target: still fail closed
-            log.error("proactive: expected at most 1 truth-dare channel in guild %s, "
-                      "found %d; disabled", getattr(guild, "id", "?"), len(matches))
+        ch = guild.get_channel(int(chat_id)) if chat_id else None
+        if ch is None:
+            log.error("proactive: configured chat channel %s not in guild %s; disabled",
+                      chat_id, getattr(guild, "id", "?"))
             return None
-        if not matches:
-            # the server was renamed/rebuilt: keep the two configured channels instead of switching everything off
-            log.warning("proactive: no truth-dare channel in guild %s; running with the %d configured channels only",
-                        getattr(guild, "id", "?"), len(channels))
-            log.info("proactive: scoped to guild %s channels %s", guild.id, {k: c.id for k, c in channels.items()})
-            return channels
-        channels["truth-dare"] = matches[0]
-        log.info("proactive: scoped to guild %s channels %s",
-                 guild.id, {k: c.id for k, c in channels.items()})
-        return channels
+        log.info("proactive: scoped to guild %s channel general-chat %s", guild.id, ch.id)
+        return {"general-chat": ch}
